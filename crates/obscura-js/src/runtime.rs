@@ -4362,6 +4362,53 @@ mod tests {
     }
 
     #[test]
+    fn character_data_uses_webidl_ranges_and_rejects_children() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                (function() {
+                  const errorName = callback => {
+                    try { callback(); return null; } catch (error) { return error.name; }
+                  };
+                  const data = document.createTextNode("test");
+                  data.data = undefined;
+                  const undefinedData = data.data;
+                  data.data = null;
+
+                  const appended = document.createTextNode("a");
+                  appended.appendData(null);
+                  const inserted = document.createTextNode("test");
+                  inserted.insertData(-0x100000000 + 2, "X");
+                  const deleted = document.createTextNode("test");
+                  deleted.deleteData(2, -1);
+                  const replaced = document.createTextNode("test");
+                  replaced.replaceData(2, -1, "yo");
+                  const substring = document.createTextNode("test");
+
+                  return [
+                    undefinedData, data.data, appended.data, inserted.data,
+                    deleted.data, replaced.data,
+                    substring.substringData(-0x100000000 + 2, 1),
+                    errorName(() => substring.substringData(5, 0)),
+                    errorName(() => substring.substringData()),
+                    errorName(() => substring.splitText(5)),
+                    errorName(() => substring.appendChild(document.createComment("child")))
+                  ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "undefined", "", "anull", "teXst", "te", "teyo", "s",
+                "IndexSizeError", "TypeError", "IndexSizeError", "HierarchyRequestError"
+            ])
+        );
+    }
+
+    #[test]
     fn document_title_setter_creates_missing_title_element() {
         let mut rt = setup_runtime("<html><body><main>content</main></body></html>");
         let result = rt

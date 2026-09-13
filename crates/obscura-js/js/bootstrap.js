@@ -2024,6 +2024,12 @@ class Node {
   }
   appendChild(c) {
     if (!c) return c;
+    if (this instanceof CharacterData) {
+      throw new DOMException(
+        "Failed to execute 'appendChild' on 'Node': This node type cannot have children.",
+        "HierarchyRequestError",
+      );
+    }
     if (c instanceof DocumentFragment) {
       const children = Array.from(c.childNodes);
       for (const child of children) this.appendChild(child);
@@ -2287,27 +2293,46 @@ class CharacterData extends Node {
   }
   set data(v) {
     const oldValue = _domParse("text_content", this._nid) ?? "";
-    _dom("set_text_content", this._nid, String(v ?? ""));
+    _dom("set_text_content", this._nid, v === null ? "" : String(v));
     if (globalThis.__mutationObservers?.length) {
       globalThis.__notifyMutation('characterData', this._nid, [], [], null, oldValue);
     }
   }
   get length() { return this.data.length; }
   substringData(offset, count) {
-    return this.data.substring(offset, offset + count);
-  }
-  appendData(s) { this.data += s; }
-  insertData(offset, s) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.substringData requires 2 arguments");
     const d = this.data;
-    this.data = d.slice(0, offset) + s + d.slice(offset);
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    return d.slice(offset, offset + count);
+  }
+  appendData(s) {
+    if (arguments.length < 1) throw new TypeError("CharacterData.appendData requires 1 argument");
+    this.data = this.data + String(s);
+  }
+  insertData(offset, s) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.insertData requires 2 arguments");
+    const d = this.data;
+    offset = offset >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    this.data = d.slice(0, offset) + String(s) + d.slice(offset);
   }
   deleteData(offset, count) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.deleteData requires 2 arguments");
     const d = this.data;
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
     this.data = d.slice(0, offset) + d.slice(offset + count);
   }
   replaceData(offset, count, s) {
+    if (arguments.length < 3) throw new TypeError("CharacterData.replaceData requires 3 arguments");
     const d = this.data;
-    this.data = d.slice(0, offset) + s + d.slice(offset + count);
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    this.data = d.slice(0, offset) + String(s) + d.slice(offset + count);
   }
 }
 
@@ -2317,8 +2342,10 @@ class Text extends CharacterData {
   get wholeText() { return this.data; }
   splitText(offset) {
     const d = this.data;
-    const tail = d.substring(offset);
-    this.data = d.substring(0, offset);
+    offset = offset >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    const tail = d.slice(offset);
+    this.data = d.slice(0, offset);
     const newNid = +_dom("create_text_node", tail);
     const parent = this.parentNode;
     if (parent) {
