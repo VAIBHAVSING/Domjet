@@ -6760,7 +6760,11 @@ globalThis.fetch = async (input, init = {}) => {
       url = new URL(url, base).href;
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
-  const method = init.method || (input instanceof Request ? input.method : "GET");
+  // Normalize the method to uppercase, matching the Request constructor, so
+  // fetch(url, {method:"delete"}) and new Request(url, {method:"delete"}) agree
+  // and lowercase standard methods are not rejected by the case-sensitive CORS
+  // checks (#969).
+  const method = String(init.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
   let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
   const body = _serializeBody(init.body, _h);
   const hdrs = JSON.stringify(_h);
