@@ -1,18 +1,18 @@
-# obscura
+# obscura (Domjet native API)
 
-Embeddable Rust API for the [Obscura](https://github.com/h4ckf0r0day/obscura)
+Embeddable Rust API for the [Domjet](https://github.com/VAIBHAVSING/domjet)
 headless browser. Drive a real V8 + DOM browser (`Browser`, `Page`, `Element`,
 `CookieStore`) directly from Rust, with no separate process or CDP round-trips.
 
 ## Install
 
 This crate is not published to crates.io, so depend on it via git. Building it
-compiles Obscura from source, including its embedded V8 (`deno_core`), so the
+compiles the native engine from source, including its embedded V8 (`deno_core`), so the
 first build is large and slow.
 
 ```toml
 [dependencies]
-obscura = { git = "https://github.com/h4ckf0r0day/obscura", features = ["api"] }
+obscura = { git = "https://github.com/VAIBHAVSING/domjet", branch = "wasm-node-migration", features = ["api"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 anyhow = "1"
 ```

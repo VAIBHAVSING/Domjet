@@ -132,8 +132,8 @@ pub struct ObscuraState {
     pub network_response_body_order: VecDeque<String>,
     pub network_response_body_counter: u64,
     // Absolute URLs requested via JS fetch() / XHR (op_fetch_url), in request
-    // order. Surfaced by `--dump assets` so resources pulled in by script, not
-    // just static DOM attributes, are listed (issue #301).
+    // order. Exposed through the runtime inspection API so resources pulled
+    // in by script, not just static DOM attributes, can be listed (issue #301).
     pub fetched_urls: Vec<String>,
     // Network events for script-initiated requests (fetch/XHR/dynamic resource),
     // drained by the Page into its network_events so the CDP layer emits
@@ -1855,7 +1855,7 @@ fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
     }
 }
 
-// Fallback cache for runtimes that have no owning ObscuraHttpClient, such as
+// Fallback cache for runtimes that have no owning HTTP client, such as
 // a standalone module loader. Browser pages use their context-scoped client
 // below so sequential V8 runtimes never share an async network pool (#453).
 static FETCH_CLIENT_CACHE: std::sync::OnceLock<
@@ -2011,9 +2011,9 @@ async fn op_fetch_url(
                 .to_string());
             }
         }
-        // Record the resource the page pulled in via fetch()/XHR so `--dump
-        // assets` can list it (issue #301). URL is already absolute here, since
-        // reqwest needs an absolute URL to send the request.
+        // Record the resource the page pulled in via fetch()/XHR so runtime
+        // inspection can list it (issue #301). URL is already absolute here,
+        // since reqwest needs an absolute URL to send the request.
         gs.fetched_urls.push(url.clone());
         let jar = gs.cookie_jar.clone();
         let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
@@ -3339,17 +3339,7 @@ fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &
 #[op2]
 #[buffer]
 fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8> {
-    use sha1::Digest as _;
-    let alg = algorithm.to_ascii_uppercase();
-    match alg.as_str() {
-        "SHA-1" => sha1::Sha1::digest(data).to_vec(),
-        "SHA-256" => sha2::Sha256::digest(data).to_vec(),
-        "SHA-384" => sha2::Sha384::digest(data).to_vec(),
-        "SHA-512" => sha2::Sha512::digest(data).to_vec(),
-        "SHA-512/224" => sha2::Sha512_224::digest(data).to_vec(),
-        "SHA-512/256" => sha2::Sha512_256::digest(data).to_vec(),
-        _ => vec![],
-    }
+    obscura_platform::subtle_digest(algorithm, data)
 }
 
 // ---------------------------------------------------------------------------
@@ -3377,21 +3367,7 @@ fn op_subtle_hmac(
     #[buffer] key: &[u8],
     #[buffer] data: &[u8],
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    use hmac::{Hmac, Mac};
-    macro_rules! run {
-        ($d:ty) => {{
-            let mut mac = Hmac::<$d>::new_from_slice(key).map_err(crypto_err)?;
-            mac.update(data);
-            mac.finalize().into_bytes().to_vec()
-        }};
-    }
-    Ok(match hash {
-        "SHA-1" => run!(sha1::Sha1),
-        "SHA-256" => run!(sha2::Sha256),
-        "SHA-384" => run!(sha2::Sha384),
-        "SHA-512" => run!(sha2::Sha512),
-        _ => return Err(crypto_err("unsupported HMAC hash")),
-    })
+    obscura_platform::subtle_hmac(hash, key, data).map_err(crypto_err)
 }
 
 /// AES-GCM encrypt/decrypt. WebCrypto's ciphertext carries the auth tag
@@ -3407,38 +3383,7 @@ fn op_subtle_aes_gcm(
     #[buffer] aad: &[u8],
     #[buffer] data: &[u8],
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    use aes_gcm::aes::{Aes192, Aes256};
-    use aes_gcm::{AesGcm, Nonce};
-    type Aes192Gcm = AesGcm<Aes192, aes_gcm::aead::consts::U12>;
-    type Aes256Gcm = AesGcm<Aes256, aes_gcm::aead::consts::U12>;
-
-    if iv.len() != 12 {
-        return Err(crypto_err("AES-GCM requires a 96-bit (12-byte) IV"));
-    }
-    let nonce = Nonce::from_slice(iv);
-    macro_rules! run {
-        ($ty:ty) => {{
-            let cipher = <$ty>::new_from_slice(key).map_err(crypto_err)?;
-            if encrypt {
-                cipher
-                    .encrypt(nonce, Payload { msg: data, aad })
-                    .map_err(|_| crypto_err("AES-GCM encryption failed"))?
-            } else {
-                cipher
-                    .decrypt(nonce, Payload { msg: data, aad })
-                    .map_err(|_| {
-                        crypto_err("AES-GCM decryption failed: authentication tag mismatch")
-                    })?
-            }
-        }};
-    }
-    Ok(match key.len() {
-        16 => run!(aes_gcm::Aes128Gcm),
-        24 => run!(Aes192Gcm),
-        32 => run!(Aes256Gcm),
-        _ => return Err(crypto_err("AES-GCM key must be 128, 192, or 256 bits")),
-    })
+    obscura_platform::subtle_aes_gcm(encrypt, key, iv, aad, data).map_err(crypto_err)
 }
 
 /// AES-CBC encrypt/decrypt with PKCS#7 padding (the only padding WebCrypto
@@ -3451,33 +3396,7 @@ fn op_subtle_aes_cbc(
     #[buffer] iv: &[u8],
     #[buffer] data: &[u8],
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    use cbc::cipher::block_padding::Pkcs7;
-    use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-    use cbc::{Decryptor, Encryptor};
-
-    if iv.len() != 16 {
-        return Err(crypto_err("AES-CBC requires a 16-byte IV"));
-    }
-    macro_rules! run {
-        ($cipher:ty) => {{
-            if encrypt {
-                Encryptor::<$cipher>::new_from_slices(key, iv)
-                    .map_err(crypto_err)?
-                    .encrypt_padded_vec_mut::<Pkcs7>(data)
-            } else {
-                Decryptor::<$cipher>::new_from_slices(key, iv)
-                    .map_err(crypto_err)?
-                    .decrypt_padded_vec_mut::<Pkcs7>(data)
-                    .map_err(|_| crypto_err("AES-CBC decryption failed: invalid padding"))?
-            }
-        }};
-    }
-    Ok(match key.len() {
-        16 => run!(aes::Aes128),
-        24 => run!(aes::Aes192),
-        32 => run!(aes::Aes256),
-        _ => return Err(crypto_err("AES-CBC key must be 128, 192, or 256 bits")),
-    })
+    obscura_platform::subtle_aes_cbc(encrypt, key, iv, data).map_err(crypto_err)
 }
 
 /// AES-CTR. Encrypt and decrypt are the same keystream XOR. `counter_length` is
@@ -3491,40 +3410,7 @@ fn op_subtle_aes_ctr(
     counter_length: u32,
     #[buffer] data: &[u8],
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    use ctr::cipher::{KeyIvInit, StreamCipher};
-
-    if counter.len() != 16 {
-        return Err(crypto_err("AES-CTR requires a 16-byte counter block"));
-    }
-    let mut buf = data.to_vec();
-    macro_rules! run {
-        ($ty:ty) => {{
-            <$ty>::new_from_slices(key, counter)
-                .map_err(crypto_err)?
-                .apply_keystream(&mut buf);
-        }};
-    }
-    macro_rules! by_key {
-        ($flavor:ident) => {
-            match key.len() {
-                16 => run!(ctr::$flavor<aes::Aes128>),
-                24 => run!(ctr::$flavor<aes::Aes192>),
-                32 => run!(ctr::$flavor<aes::Aes256>),
-                _ => return Err(crypto_err("AES-CTR key must be 128, 192, or 256 bits")),
-            }
-        };
-    }
-    match counter_length {
-        128 => by_key!(Ctr128BE),
-        64 => by_key!(Ctr64BE),
-        32 => by_key!(Ctr32BE),
-        _ => {
-            return Err(crypto_err(
-                "AES-CTR supports counter lengths of 32, 64, or 128 bits",
-            ))
-        }
-    }
-    Ok(buf)
+    obscura_platform::subtle_aes_ctr(key, counter, counter_length, data).map_err(crypto_err)
 }
 
 /// PBKDF2 key derivation. `length` is the derived-bits output in bytes.
@@ -3537,16 +3423,8 @@ fn op_subtle_pbkdf2(
     iterations: u32,
     length: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    use pbkdf2::pbkdf2_hmac;
-    let mut dk = vec![0u8; length as usize];
-    match hash {
-        "SHA-1" => pbkdf2_hmac::<sha1::Sha1>(password, salt, iterations, &mut dk),
-        "SHA-256" => pbkdf2_hmac::<sha2::Sha256>(password, salt, iterations, &mut dk),
-        "SHA-384" => pbkdf2_hmac::<sha2::Sha384>(password, salt, iterations, &mut dk),
-        "SHA-512" => pbkdf2_hmac::<sha2::Sha512>(password, salt, iterations, &mut dk),
-        _ => return Err(crypto_err("unsupported PBKDF2 hash")),
-    }
-    Ok(dk)
+    obscura_platform::subtle_pbkdf2(hash, password, salt, iterations, length)
+        .map_err(crypto_err)
 }
 
 /// HKDF key derivation. `length` is the output length in bytes. An empty salt
@@ -3561,23 +3439,7 @@ fn op_subtle_hkdf(
     #[buffer] info: &[u8],
     length: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    use hkdf::Hkdf;
-    let mut okm = vec![0u8; length as usize];
-    macro_rules! run {
-        ($d:ty) => {
-            Hkdf::<$d>::new(Some(salt), ikm)
-                .expand(info, &mut okm)
-                .map_err(|_| crypto_err("HKDF: requested key length is too long"))?
-        };
-    }
-    match hash {
-        "SHA-1" => run!(sha1::Sha1),
-        "SHA-256" => run!(sha2::Sha256),
-        "SHA-384" => run!(sha2::Sha384),
-        "SHA-512" => run!(sha2::Sha512),
-        _ => return Err(crypto_err("unsupported HKDF hash")),
-    }
-    Ok(okm)
+    obscura_platform::subtle_hkdf(hash, ikm, salt, info, length).map_err(crypto_err)
 }
 
 /// Fill `len` bytes from the OS CSPRNG. Backs `crypto.getRandomValues`,
@@ -3587,47 +3449,8 @@ fn op_subtle_hkdf(
 #[op2]
 #[buffer]
 fn op_random_bytes(len: u32) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    let mut buf = vec![0u8; len as usize];
-    getrandom::getrandom(&mut buf).map_err(|e| crypto_err(format!("getrandom failed: {e}")))?;
-    Ok(buf)
-}
-
-/// Serialize a parsed URL into the WHATWG IDL component shape consumed by the
-/// `URL` class in bootstrap.js. Getters read these fields directly so no op
-/// call happens per property access.
-fn url_components(u: &url::Url) -> serde_json::Value {
-    let port = u.port().map(|p| p.to_string()).unwrap_or_default();
-    let hostname = u.host_str().unwrap_or("").to_string();
-    let host = if hostname.is_empty() {
-        String::new()
-    } else if port.is_empty() {
-        hostname.clone()
-    } else {
-        format!("{hostname}:{port}")
-    };
-    // WHATWG search/hash getters return "" for a null OR empty component.
-    let search = match u.query() {
-        Some(q) if !q.is_empty() => format!("?{q}"),
-        _ => String::new(),
-    };
-    let hash = match u.fragment() {
-        Some(f) if !f.is_empty() => format!("#{f}"),
-        _ => String::new(),
-    };
-    serde_json::json!({
-        "ok": true,
-        "href": u.as_str(),
-        "protocol": format!("{}:", u.scheme()),
-        "username": u.username(),
-        "password": u.password().unwrap_or(""),
-        "host": host,
-        "hostname": hostname,
-        "port": port,
-        "pathname": u.path(),
-        "search": search,
-        "hash": hash,
-        "origin": u.origin().ascii_serialization(),
-    })
+    obscura_platform::random_bytes_with(len, getrandom::getrandom)
+        .map_err(|error| crypto_err(format!("getrandom failed: {error}")))
 }
 
 /// Parse `href` (optionally resolved against `base`) with the WHATWG-compliant
@@ -3636,114 +3459,17 @@ fn url_components(u: &url::Url) -> serde_json::Value {
 #[op2]
 #[string]
 fn op_url_parse(#[string] href: &str, #[string] base: &str) -> String {
-    // The url crate can panic on a few pathological inputs (internal range
-    // slicing); catch it so a bad URL never aborts the process.
-    std::panic::catch_unwind(|| {
-        let parsed = if base.is_empty() {
-            url::Url::parse(href)
-        } else {
-            url::Url::parse(base).and_then(|b| b.join(href))
-        };
-        match parsed {
-            Ok(u) => url_components(&u).to_string(),
-            Err(_) => "{\"ok\":false}".to_string(),
-        }
-    })
-    .unwrap_or_else(|_| "{\"ok\":false}".to_string())
-}
-
-/// Apply a WHATWG URL setter (`part` = href/protocol/username/password/host/
-/// hostname/port/pathname/search/hash) to `href` and return the new components.
-fn url_set_inner(href: &str, part: &str, value: &str) -> Option<serde_json::Value> {
-    let mut u = url::Url::parse(href).ok()?;
-    match part {
-        "href" => {
-            let nu = url::Url::parse(value).ok()?;
-            return Some(url_components(&nu));
-        }
-        "protocol" => {
-            let _ = u.set_scheme(value.trim_end_matches(':'));
-        }
-        "username" => {
-            let _ = u.set_username(value);
-        }
-        "password" => {
-            let _ = u.set_password(if value.is_empty() { None } else { Some(value) });
-        }
-        "host" => set_host_port(&mut u, value),
-        "hostname" => {
-            if !value.is_empty() {
-                let _ = u.set_host(Some(value));
-            }
-        }
-        "port" => {
-            if value.is_empty() {
-                let _ = u.set_port(None);
-            } else if let Ok(p) = value.parse::<u16>() {
-                let _ = u.set_port(Some(p));
-            }
-        }
-        "pathname" => u.set_path(value),
-        "search" => {
-            let q = value.strip_prefix('?').unwrap_or(value);
-            u.set_query(if q.is_empty() { None } else { Some(q) });
-        }
-        "hash" => {
-            let f = value.strip_prefix('#').unwrap_or(value);
-            u.set_fragment(if f.is_empty() { None } else { Some(f) });
-        }
-        _ => {}
-    }
-    Some(url_components(&u))
+    obscura_platform::parse_url(href, base)
+        .and_then(|components| serde_json::to_string(&components).ok())
+        .unwrap_or_else(|| "{\"ok\":false}".to_string())
 }
 
 #[op2]
 #[string]
 fn op_url_set(#[string] href: &str, #[string] part: &str, #[string] value: &str) -> String {
-    // Some url-crate setters panic on pathological inputs (the url-setters WPT
-    // tests exercise these). Catch the unwind and treat it as a no-op setter,
-    // returning the URL unchanged, which matches WHATWG "do nothing on invalid".
-    match std::panic::catch_unwind(|| url_set_inner(href, part, value)) {
-        Ok(Some(v)) => v.to_string(),
-        _ => match url::Url::parse(href) {
-            Ok(u) => url_components(&u).to_string(),
-            Err(_) => "{\"ok\":false}".to_string(),
-        },
-    }
-}
-
-/// Best-effort `host` setter: split `host[:port]` (handling bracketed IPv6) and
-/// apply hostname and port separately, since `url::Url::set_host` rejects a port.
-fn set_host_port(u: &mut url::Url, value: &str) {
-    // IPv6 literals are bracketed; never split inside the brackets.
-    if value.starts_with('[') {
-        if let Some(close) = value.find(']') {
-            let host = &value[..=close];
-            let rest = &value[close + 1..];
-            if u.set_host(Some(host)).is_ok() {
-                if let Some(p) = rest.strip_prefix(':') {
-                    if let Ok(pn) = p.parse::<u16>() {
-                        let _ = u.set_port(Some(pn));
-                    }
-                }
-            }
-            return;
-        }
-    }
-    if let Some(idx) = value.rfind(':') {
-        let (h, p) = (&value[..idx], &value[idx + 1..]);
-        if p.is_empty() || p.chars().all(|c| c.is_ascii_digit()) {
-            if u.set_host(Some(h)).is_ok() {
-                if p.is_empty() {
-                    let _ = u.set_port(None);
-                } else if let Ok(pn) = p.parse::<u16>() {
-                    let _ = u.set_port(Some(pn));
-                }
-            }
-            return;
-        }
-    }
-    let _ = u.set_host(Some(value));
+    obscura_platform::set_url_part(href, part, value)
+        .and_then(|components| serde_json::to_string(&components).ok())
+        .unwrap_or_else(|| "{\"ok\":false}".to_string())
 }
 
 /// Resolve `href` against optional `base` and return only the serialized
@@ -3753,15 +3479,7 @@ fn set_host_port(u: &mut url::Url, value: &str) {
 #[op2]
 #[string]
 fn op_url_resolve(#[string] href: &str, #[string] base: &str) -> String {
-    std::panic::catch_unwind(|| {
-        let parsed = if base.is_empty() {
-            url::Url::parse(href)
-        } else {
-            url::Url::parse(base).and_then(|b| b.join(href))
-        };
-        parsed.map(|u| u.as_str().to_string()).unwrap_or_default()
-    })
-    .unwrap_or_default()
+    obscura_platform::resolve_url(href, base).unwrap_or_default()
 }
 
 /// Canonicalize and validate a `document.domain` assignment.
@@ -3778,30 +3496,7 @@ fn op_url_resolve(#[string] href: &str, #[string] base: &str) -> String {
 #[op2]
 #[string]
 fn op_document_domain_candidate(#[string] current: &str, #[string] input: &str) -> String {
-    let canonical = match url::Host::parse(input) {
-        Ok(host) => host.to_string().to_ascii_lowercase(),
-        Err(_) => return String::new(),
-    };
-    let current = current.to_ascii_lowercase();
-
-    // Gecko permits assigning the exact current host, including IP literals
-    // and single-label hosts.  Neither can be relaxed to a parent.
-    if canonical == current {
-        return canonical;
-    }
-    if current.parse::<std::net::IpAddr>().is_ok()
-        || canonical.parse::<std::net::IpAddr>().is_ok()
-        || !current.ends_with(&format!(".{canonical}"))
-    {
-        return String::new();
-    }
-
-    // `domain_str` is the eTLD+1.  A candidate shorter than it is a public
-    // suffix and must not become an effective domain.
-    match psl::domain_str(&current) {
-        Some(registrable) if canonical.len() >= registrable.len() => canonical,
-        _ => String::new(),
-    }
+    obscura_platform::document_domain_candidate(current, input).unwrap_or_default()
 }
 
 #[op2]
@@ -3832,7 +3527,7 @@ fn op_add_import_map(
 #[op2]
 #[string]
 fn op_encoding_for_label(#[string] label: &str) -> String {
-    obscura_net::label_name(label).unwrap_or_default()
+    obscura_platform::encoding_for_label(label).unwrap_or_default()
 }
 
 /// Decode bytes with a legacy/explicit encoding via encoding_rs. Returns
@@ -3846,7 +3541,7 @@ fn op_text_decode(
     fatal: bool,
     ignore_bom: bool,
 ) -> String {
-    match obscura_net::decode_with_label(label, bytes, fatal, ignore_bom) {
+    match obscura_platform::decode_with_label(label, bytes, fatal, ignore_bom) {
         Some(s) => serde_json::json!({ "ok": true, "v": s }).to_string(),
         None => "{\"ok\":false}".to_string(),
     }
@@ -3861,7 +3556,8 @@ fn op_text_decode(
 #[op2]
 #[string]
 fn op_url_encode_query(#[string] query: &str, #[string] label: &str, special: bool) -> String {
-    obscura_net::url_encode_query(query, label, special).unwrap_or_else(|| query.to_string())
+    obscura_platform::url_encode_query(query, label, special)
+        .unwrap_or_else(|| query.to_string())
 }
 
 #[cfg(feature = "render")]
@@ -4233,20 +3929,8 @@ fn op_waapi_control(
 
 #[cfg(feature = "render")]
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
-    let document_url = url::Url::parse(&state.url).ok()?;
-    let base_href = state.dom.as_ref().and_then(|dom| {
-        dom.query_selector("base[href]")
-            .ok()
-            .flatten()
-            .and_then(|id| {
-                dom.get_node(id)
-                    .and_then(|node| node.get_attribute("href").map(str::to_string))
-            })
-    });
-    match base_href {
-        Some(href) => document_url.join(&href).ok().map(|url| url.to_string()),
-        None => Some(document_url.to_string()),
-    }
+    let dom = state.dom.as_ref()?;
+    obscura_dom::resolve_document_base_url(dom, &state.url).map(|url| url.to_string())
 }
 
 #[cfg(feature = "render")]
@@ -4571,7 +4255,8 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
 
 /// Compatibility path for standalone render runtimes which deliberately
 /// install an in-memory `RenderResourceLoader` but have no owning page
-/// transport. Browser pages always install `ObscuraHttpClient` before page
+/// transport. Browser pages always install the compatibility-named
+/// `ObscuraHttpClient` before page
 /// script runs and never enter this synchronous loader.
 #[cfg(feature = "render")]
 fn load_image_metadata_without_page_transport(gs: &mut ObscuraState, node_id: NodeId) -> String {

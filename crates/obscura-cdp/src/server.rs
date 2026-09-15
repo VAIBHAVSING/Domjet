@@ -49,7 +49,7 @@ const SHUTDOWN_DRAIN_MS: u64 = 3_000;
 // retry rather than a bare connection reset.
 const CONNECTION_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
     Content-Length: 0\r\nConnection: close\r\n\
-    X-Obscura-Reason: max-connections\r\n\r\n";
+    X-Domjet-Reason: max-connections\r\n\r\n";
 use crate::types::CdpRequest;
 
 struct CdpMessage {
@@ -187,7 +187,7 @@ pub async fn start_with_serve_options_and_limit(
         .set_nonblocking(false)
         .map_err(|e| anyhow::anyhow!("set_nonblocking: {}", e))?;
 
-    info!("Obscura CDP server listening on ws://{}:{}", host, port);
+    info!("Domjet CDP server listening on ws://{}:{}", host, port);
     info!(
         "DevTools endpoint: ws://{}:{}/devtools/browser",
         host, port
@@ -712,7 +712,7 @@ async fn cdp_processor(
     // `notify_waiters()` wakes this processor even while it is mid-dispatch.
     let mut shutdown = Box::pin(shutdown_notify.notified());
     // Chromium's PageHandler receives compositor video frames continuously.
-    // Obscura has no separate compositor thread yet, so active screencasts get
+    // Domjet has no separate compositor thread yet, so active screencasts get
     // a bounded 30 Hz opportunity on this connection's owning LocalSet.
     let mut screencast_tick = tokio::time::interval(tokio::time::Duration::from_millis(33));
     screencast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1701,7 +1701,7 @@ mod tests {
 
                 // This is deliberately host/client time. No CDP message is sent
                 // while the timeout becomes due; Chrome's renderer still runs,
-                // and Obscura's connection-owned page pump must do the same.
+                // and Domjet's connection-owned page pump must do the same.
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
 
                 send(json!({

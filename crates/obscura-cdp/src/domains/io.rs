@@ -1,138 +1,7 @@
-use std::collections::{HashMap, VecDeque};
-
-use base64::Engine as _;
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
-
-// Default chunk size when the client does not pass `size`. Chrome uses a similar
-// order of magnitude; keeping chunks bounded is the point of streaming (issue
-// #360), so we never return the whole body in one IO.read.
-const DEFAULT_CHUNK: usize = 1 << 20; // 1 MiB
-const MAX_READ_CHUNK: usize = 4 << 20; // 4 MiB
-
-fn io_stream_max_entries() -> usize {
-    std::env::var("OBSCURA_IO_STREAM_MAX_ENTRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(32)
-}
-
-fn io_stream_max_bytes() -> usize {
-    std::env::var("OBSCURA_IO_STREAM_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256 * 1024 * 1024)
-}
-
-/// Bounded store of the response bodies handed out by
-/// Fetch.takeResponseBodyAsStream. Streaming exists to keep large downloads out
-/// of memory (issue #360), but each taken body is moved out of the page's
-/// LRU-bounded cache into this map, which lives for the whole server lifetime.
-/// A client that opens streams and never calls IO.close, or simply disconnects
-/// mid-download, would otherwise pin every taken body forever and reintroduce
-/// exactly the unbounded accumulation streaming was meant to avoid. Cap the
-/// number of open streams and their total bytes, evicting the oldest first, so
-/// memory stays bounded regardless of client behavior. Reading an evicted
-/// handle fails cleanly (the client re-takes or gives up), which is the right
-/// trade against an OOM.
-pub struct IoStreamStore {
-    streams: HashMap<String, (Vec<u8>, usize)>,
-    order: VecDeque<String>,
-    total_bytes: usize,
-    counter: u64,
-    max_entries: usize,
-    max_bytes: usize,
-}
-
-impl Default for IoStreamStore {
-    fn default() -> Self {
-        Self::with_limits(io_stream_max_entries(), io_stream_max_bytes())
-    }
-}
-
-impl IoStreamStore {
-    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
-        Self {
-            streams: HashMap::new(),
-            order: VecDeque::new(),
-            total_bytes: 0,
-            counter: 0,
-            max_entries: max_entries.max(1),
-            max_bytes,
-        }
-    }
-
-    /// Store a body and return its handle, evicting the oldest streams if this
-    /// would push the store past its entry or byte cap. A single body larger
-    /// than the byte cap is rejected rather than becoming an unbounded
-    /// exception to the store's memory contract.
-    pub fn insert(&mut self, bytes: Vec<u8>) -> Result<String, String> {
-        if bytes.len() > self.max_bytes {
-            return Err(format!(
-                "IO stream body is {} bytes, exceeding the {}-byte per-context limit",
-                bytes.len(),
-                self.max_bytes,
-            ));
-        }
-
-        while !self.order.is_empty()
-            && (self.order.len() >= self.max_entries
-                || self
-                    .total_bytes
-                    .checked_add(bytes.len())
-                    .is_none_or(|total| total > self.max_bytes))
-        {
-            if let Some(oldest) = self.order.pop_front() {
-                if let Some((body, _)) = self.streams.remove(&oldest) {
-                    self.total_bytes = self.total_bytes.saturating_sub(body.len());
-                }
-            }
-        }
-
-        let handle = format!("stream-{}", self.counter);
-        self.counter = self
-            .counter
-            .checked_add(1)
-            .ok_or("IO stream handle space exhausted")?;
-        self.total_bytes = self
-            .total_bytes
-            .checked_add(bytes.len())
-            .ok_or("IO stream byte accounting overflow")?;
-        self.streams.insert(handle.clone(), (bytes, 0));
-        self.order.push_back(handle.clone());
-        Ok(handle)
-    }
-
-    /// Read up to `size` bytes from the stream, advancing its cursor. Returns
-    /// the base64 chunk and whether EOF was reached, or None for an unknown or
-    /// already-freed handle.
-    pub fn read(
-        &mut self,
-        handle: &str,
-        offset: Option<usize>,
-        size: usize,
-    ) -> Option<(String, bool)> {
-        let (bytes, cursor) = self.streams.get_mut(handle)?;
-        if let Some(offset) = offset {
-            *cursor = offset.min(bytes.len());
-        }
-        let size = size.min(MAX_READ_CHUNK);
-        let start = (*cursor).min(bytes.len());
-        let end = start.saturating_add(size).min(bytes.len());
-        let data = base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]);
-        *cursor = end;
-        Some((data, end >= bytes.len()))
-    }
-
-    /// Free a stream's buffer (IO.close). A no-op for an unknown handle.
-    pub fn remove(&mut self, handle: &str) {
-        if let Some((b, _)) = self.streams.remove(handle) {
-            self.total_bytes -= b.len();
-            self.order.retain(|h| h != handle);
-        }
-    }
-}
+pub use crate::io::{IoStreamStore, DEFAULT_CHUNK, MAX_READ_CHUNK};
 
 /// CDP IO domain. Streams a response body handed out by
 /// Fetch.takeResponseBodyAsStream: IO.read returns the next base64 chunk and
@@ -187,6 +56,8 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::*;
 
     fn decode(s: &str) -> Vec<u8> {

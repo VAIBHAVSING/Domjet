@@ -4,33 +4,136 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+default = ["native-server"]
+# Transport-free surface for the portable/WASM CDP implementation. The
+# legacy native dispatcher and server are deliberately not part of this
+# feature; they are enabled explicitly through `native-engine` and
+# `native-server` below while the domain handlers are migrated.
+portable = []
+# Keep the existing Page/BrowserContext based CDP implementation available as
+# a separately selectable adapter. This feature has no socket or listener
+# dependencies, so embedders can reuse the native engine without the server.
+native-engine = [
+    "dep:obscura-browser",
+    "dep:obscura-js",
+    "dep:obscura-net",
+    "dep:tokio",
+    "dep:uuid",
+]
+# Legacy TCP/WebSocket transport. Pulling this feature also pulls the engine
+# because server.rs owns native Pages and dispatches through CdpContext.
+native-server = [
+    "native-engine",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+]
 # Enable Page.captureScreenshot via obscura-render. Propagates render to
 # obscura-browser so Page::screenshot is available.
-render = ["obscura-browser/render", "dep:image", "dep:png"]
+render = [
+    "native-engine",
+    "obscura-browser/render",
+    "dep:image",
+    "dep:png",
+]
 
 [dependencies]
 obscura-dom = { workspace = true }
-obscura-browser = { workspace = true }
-obscura-js = { workspace = true }
-tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
+obscura-browser = { workspace = true, optional = true }
+obscura-js = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, optional = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
-futures-util = "0.3"
-obscura-net = { workspace = true }
+futures-util = { version = "0.3", optional = true }
+obscura-net = { workspace = true, optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 png = { version = "0.18", optional = true }
 
 [target.'cfg(target_env = "gnu")'.dependencies]
 libc = "0.2"
 
-[dev-dependencies]
-tokio-tungstenite = { workspace = true }
-futures-util = "0.3"
+# Existing integration tests exercise the native Page/BrowserContext adapter.
+# Keep them out of the transport-free portable test graph; protocol/action
+# unit tests remain available under the portable feature.
+[[test]]
+name = "cdp_click_submit_parity"
+path = "tests/cdp_click_submit_parity.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "concurrent_connections_heavy_page"
+path = "tests/concurrent_connections_heavy_page.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "concurrent_navigations"
+path = "tests/concurrent_navigations.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "concurrent_navigations_with_fetch"
+path = "tests/concurrent_navigations_with_fetch.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "control_plane_unblocked"
+path = "tests/control_plane_unblocked.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "dynamic_script_onload_fires"
+path = "tests/dynamic_script_onload_fires.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "dynamic_stylesheet_onload_fires"
+path = "tests/dynamic_stylesheet_onload_fires.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "execution_context_pruned_on_navigation"
+path = "tests/execution_context_pruned_on_navigation.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "form_submit_method_bypasses_listener"
+path = "tests/form_submit_method_bypasses_listener.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "iframe_event_dispatch"
+path = "tests/iframe_event_dispatch.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "input_key_event_escaping"
+path = "tests/input_key_event_escaping.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "input_mouse_event_parity"
+path = "tests/input_mouse_event_parity.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "js_fetch_emits_network_events"
+path = "tests/js_fetch_emits_network_events.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "max_connections_cap"
+path = "tests/max_connections_cap.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "nodefilter_constants"
+path = "tests/nodefilter_constants.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "scroll_event_on_assignment"
+path = "tests/scroll_event_on_assignment.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "structured_clone_crypto_parity"
+path = "tests/structured_clone_crypto_parity.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "treewalker_document_order"
+path = "tests/treewalker_document_order.rs"
+required-features = ["native-engine"]
+[[test]]
+name = "window_conformance_parity"
+path = "tests/window_conformance_parity.rs"
+required-features = ["native-engine"]

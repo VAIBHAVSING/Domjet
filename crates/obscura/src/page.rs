@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::error::Error;
 
-/// Read a DOM node id from a JS `evaluate` result. obscura serializes JS numbers
+/// Read a DOM node id from a JS `evaluate` result. Domjet serializes JS numbers
 /// as f64, so `Value::as_u64` returns None for an integer-valued result; accept
 /// either an integer or a non-negative finite float. null / non-numbers -> None.
 fn nid_from_value(v: &Value) -> Option<u64> {

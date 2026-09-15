@@ -1,6 +1,6 @@
-//! obscura-render: the optional scoped render layer for Obscura.
+//! obscura-render: the optional scoped render layer for Domjet.
 //!
-//! Obscura's default build has no layout or paint engine, which is the source
+//! Domjet's default native build has no layout or paint engine, which is the source
 //! of its speed and low memory. This crate adds a render layer behind a feature
 //! flag: real CSS box geometry (so getBoundingClientRect, elementFromPoint, and
 //! IntersectionObserver return true values) and, with the paint feature,
@@ -96,8 +96,12 @@ mod image_capability_tests {
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
+pub use obscura_dom::resolve_document_base_url;
+#[cfg(feature = "paint")]
 pub use paint::{
-    image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
+    encode_png_owned,
+    css_resource_requests, css_resource_urls, image_intrinsic_dimensions, paint_dom,
+    paint_dom_scrolled, CssResourceKind, CssResourceRequest,
     paint_dom_scrolled_at_animation_time,
     paint_dom_scrolled_at_animation_time_with_surface_color, paint_prepared,
     paint_prepared_region_with_scroll, paint_prepared_region_with_scroll_and_surface_color,
@@ -128,6 +132,14 @@ pub use paint::{
     CanvasSurface, CanvasSurfaceSource, ImageRequestProfile, PreparedRender, RenderResourceCache, RenderResourceLoader,
     ResolvedScrollState, SelectedImage,
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
+};
+
+#[cfg(feature = "paint")]
+pub mod pdf;
+#[cfg(feature = "paint")]
+pub use pdf::{
+    raster_pdf_from_png_capture, RasterPdfError, RasterPdfOptions, RasterPdfPageRange,
+    MAX_PDF_OUTPUT_BYTES, MAX_PDF_PAGES,
 };
 
 // Real inline text layout (cosmic-text) lives behind the paint feature; the
@@ -1421,7 +1433,7 @@ pub struct LayoutStyle {
     pub animation_local_time_ms: f32,
     /// `vertical-align` for a table cell's content. Cells effectively default
     /// to `middle` in browsers (the HTML UA sheet sets it on row groups and
-    /// cells inherit it); obscura applies it as main-axis alignment of the
+    /// cells inherit it); Domjet applies it as main-axis alignment of the
     /// cell's flex-column stand-in. `None` on non-cell elements.
     pub vertical_align: Option<VerticalAlign>,
     /// `z-index` on a positioned element. `None` is `auto` (tree order). A

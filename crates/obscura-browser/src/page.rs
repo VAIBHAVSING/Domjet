@@ -278,7 +278,7 @@ pub struct Page {
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
     preload_scripts: Vec<String>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
-    /// is suspended for CDP/MCP tab switching.  These are restored only when
+    /// is suspended for CDP/client tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
     suspended_started_script_ids: Vec<u32>,
     /// Passive on_request/on_response callbacks, scoped to this page (issue
@@ -486,174 +486,6 @@ fn rebase_css_urls(css: &str, base: &url::Url) -> String {
     out
 }
 
-/// Extract network-backed `url(...)` assets while respecting CSS comments and
-/// strings. Linked sheets have already been rebased before materialization;
-/// inline declarations are resolved against the document base here.
-fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
-    let mut urls = Vec::new();
-    let mut index = 0usize;
-    while index < css.len() {
-        let rest = &css[index..];
-        if rest.starts_with("/*") {
-            if let Some(end) = rest[2..].find("*/") {
-                index += end + 4;
-            } else {
-                break;
-            }
-            continue;
-        }
-        // `@import url(...)` is a stylesheet dependency, not a paint asset.
-        // It is fetched by the bounded stylesheet graph above. Letting the
-        // generic image/font warmup rediscover it issues a second request with
-        // the wrong ResourceType::Image classification.
-        if let Some(length) = css_import_rule_len(rest) {
-            index += length;
-            continue;
-        }
-        let Some(first) = rest.chars().next() else {
-            break;
-        };
-        if first == '"' || first == '\'' {
-            let quote = first;
-            let mut escaped = false;
-            let mut length = quote.len_utf8();
-            for ch in rest[quote.len_utf8()..].chars() {
-                length += ch.len_utf8();
-                if escaped {
-                    escaped = false;
-                } else if ch == '\\' {
-                    escaped = true;
-                } else if ch == quote {
-                    break;
-                }
-            }
-            index += length;
-            continue;
-        }
-        if !rest
-            .get(..4)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("url("))
-        {
-            index += first.len_utf8();
-            continue;
-        }
-        let mut quote = None;
-        let mut escaped = false;
-        let mut end = None;
-        for (offset, ch) in rest[4..].char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            match quote {
-                Some(open) if ch == open => quote = None,
-                Some(_) => {}
-                None if ch == '"' || ch == '\'' => quote = Some(ch),
-                None if ch == ')' => {
-                    end = Some(4 + offset);
-                    break;
-                }
-                None => {}
-            }
-        }
-        let Some(end) = end else { break };
-        let raw = rest[4..end].trim();
-        let value = if raw.len() >= 2
-            && ((raw.starts_with('"') && raw.ends_with('"'))
-                || (raw.starts_with('\'') && raw.ends_with('\'')))
-        {
-            &raw[1..raw.len() - 1]
-        } else {
-            raw
-        };
-        if !value.is_empty()
-            && !value.starts_with('#')
-            && !value.starts_with("data:")
-            && !value.contains("var(")
-        {
-            if let Ok(mut url) = base.join(value) {
-                url.set_fragment(None);
-                if matches!(url.scheme(), "http" | "https") {
-                    urls.push(url.to_string());
-                }
-            }
-        }
-        index += end + 1;
-    }
-    urls
-}
-
-/// Return the byte length of a leading CSS `@import` rule, including its
-/// terminating semicolon. Semicolons inside quoted URLs, comments, or `url()`
-/// parentheses do not end the rule. A malformed import is left to the normal
-/// scanner so this helper cannot swallow following declarations.
-fn css_import_rule_len(css: &str) -> Option<usize> {
-    let prefix = css.get(..7)?;
-    if !prefix.eq_ignore_ascii_case("@import") {
-        return None;
-    }
-    if css[7..]
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-    {
-        return None;
-    }
-
-    let bytes = css.as_bytes();
-    let mut index = 7usize;
-    let mut quote = None;
-    let mut escaped = false;
-    let mut paren_depth = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if let Some(open) = quote {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == open {
-                quote = None;
-            }
-            index += 1;
-            continue;
-        }
-        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
-            let Some(end) = css[index + 2..].find("*/") else {
-                return None;
-            };
-            index += end + 4;
-            continue;
-        }
-        match byte {
-            b'\'' | b'"' => quote = Some(byte),
-            b'(' => paren_depth += 1,
-            b')' => paren_depth = paren_depth.saturating_sub(1),
-            b';' if paren_depth == 0 => return Some(index + 1),
-            b'{' if paren_depth == 0 => return None,
-            _ => {}
-        }
-        index += 1;
-    }
-    None
-}
-
-fn render_resource_type(url: &url::Url) -> ResourceType {
-    let path = url.path().to_ascii_lowercase();
-    if [".woff", ".woff2", ".ttf", ".otf", ".eot"]
-        .iter()
-        .any(|extension| path.ends_with(extension))
-    {
-        ResourceType::Font
-    } else {
-        ResourceType::Image
-    }
-}
-
 /// Pull leading `@import` rules out of a stylesheet. Returns each import target
 /// URL with its optional media condition plus the CSS with those `@import`
 /// statements removed. Browsers fetch media-gated imports even when they do
@@ -830,7 +662,7 @@ fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
 }
 
 /// Discover fetchable `@import` rules in inline author sheets. The source
-/// index excludes Obscura's own materialized sheets so it remains stable while
+/// index excludes Domjet's own materialized sheets so it remains stable while
 /// imports are inserted before their source nodes.
 fn inline_stylesheet_import_requests(dom: &DomTree) -> Vec<(usize, StylesheetImport)> {
     let style_ids = dom.query_selector_all("style").unwrap_or_default();
@@ -871,8 +703,8 @@ impl Page {
         let stealth_client = if context.stealth {
             // The wreq client backing StealthHttpClient does not speak SOCKS5.
             // Callers must validate the proxy scheme up front and fail loudly
-            // (see obscura-cli) rather than silently rewriting socks5:// to
-            // http://, which only works when the upstream happens to be a
+            // rather than silently rewriting socks5:// to http://, which only
+            // works when the upstream happens to be a
             // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
             // like `ssh -ND` (#160).
             Some(Arc::new(StealthHttpClient::with_proxy(
@@ -1025,7 +857,7 @@ impl Page {
 
     /// Set the screenshot surface density without changing CSS layout. CDP
     /// uses zero to disable its override, which restores the native 1x surface
-    /// in Obscura's headless-only model.
+    /// in Domjet's headless-only model.
     pub fn set_device_scale_factor(&mut self, device_scale_factor: f32) {
         if !device_scale_factor.is_finite() || device_scale_factor < 0.0 {
             return;
@@ -1168,19 +1000,13 @@ impl Page {
     /// Falls back to self.url when no <base href> exists.
     fn resolve_base_url(&self) -> Option<url::Url> {
         let doc_url = self.url.as_ref()?;
-        let base_href: Option<String> = self.js.as_ref().and_then(|js| {
-            js.with_dom(|dom| match dom.query_selector("base[href]") {
-                Ok(Some(nid)) => dom
-                    .get_node(nid)
-                    .and_then(|n| n.get_attribute("href").map(|s| s.to_string())),
-                _ => None,
+        self.js
+            .as_ref()
+            .and_then(|js| {
+                js.with_dom(|dom| obscura_js::resolve_document_base_url(dom, doc_url.as_str()))
+                    .flatten()
             })
-            .flatten()
-        });
-        match base_href {
-            Some(href) => doc_url.join(&href).ok(),
-            None => Some(doc_url.clone()),
-        }
+            .or_else(|| Some(doc_url.clone()))
     }
 
     async fn fetch_stylesheets(&mut self) -> Vec<(AuthorStylesheetTarget, String)> {
@@ -2311,7 +2137,7 @@ impl Page {
     }
 
     /// Pump the event loop and retain the full requested wall-clock delay.
-    /// The CLI uses this for an explicitly supplied `--wait`; callers asking
+    /// Callers use this for an explicitly supplied wait duration; callers asking
     /// for a fixed capture delay should not be silently shortened by adaptive
     /// readiness heuristics.
     pub async fn settle_for_duration(&mut self, duration_ms: u64) {
@@ -2821,9 +2647,12 @@ impl Page {
                 })
                 .unwrap_or_default();
             for css in css_sources {
-                for raw in css_resource_urls(&css, &base_url) {
-                    if let Ok(mut url) = url::Url::parse(&raw) {
-                        let kind = render_resource_type(&url);
+                for request in obscura_js::css_resource_requests(&css, &base_url) {
+                    if let Ok(mut url) = url::Url::parse(&request.url) {
+                        let kind = match request.kind {
+                            obscura_js::CssResourceKind::Image => ResourceType::Image,
+                            obscura_js::CssResourceKind::Font => ResourceType::Font,
+                        };
                         url.set_fragment(None);
                         candidates.insert((url.to_string(), None), kind);
                     }
@@ -3738,7 +3567,7 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
+        linked_stylesheet_requests, materialize_linked_stylesheet_script,
         materialize_stylesheet_graph, navigation_referrer, navigation_timeout_from_env_value,
         parse_import_url, rebase_css_urls, script_response_is_executable, split_css_imports,
         truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
@@ -3769,6 +3598,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "render")]
     fn css_resource_discovery_ignores_strings_comments_data_and_fragments() {
         let base = url::Url::parse("https://example.test/css/app/main.css").unwrap();
         let css = r#"
@@ -3782,7 +3612,7 @@ mod tests {
             .local { mask: url(#local); }
         "#;
         assert_eq!(
-            css_resource_urls(css, &base),
+            obscura_js::css_resource_urls(css, &base),
             vec![
                 "https://example.test/css/img/hero.png".to_string(),
                 "https://cdn.test/icon.svg".to_string(),

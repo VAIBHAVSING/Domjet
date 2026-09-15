@@ -4887,7 +4887,7 @@ pub(crate) fn parse_color(value: &str) -> Option<[u8; 4]> {
 fn parse_color_for_scheme(value: &str, dark_scheme: bool) -> Option<[u8; 4]> {
     let raw = value.trim();
     // CSS Color 5 `light-dark(light, dark)` selects by the used color scheme.
-    // Obscura currently exposes the default/light scheme, so return the first
+    // Domjet currently exposes the default/light scheme, so return the first
     // branch. Both branches still have to be complete valid colors: accepting
     // a valid light arm beside malformed dark syntax would keep a declaration
     // that Chromium rejects at parse time.

@@ -150,7 +150,8 @@ impl StealthHttpClient {
         // feeds `add_root_certificate`, so a private CA works there. This client did not, which
         // made the *better-fingerprinted* transport the only one unable to reach hosts behind a
         // private/national CA (measured against a Brazilian government portal whose leaf is
-        // issued by an ICP-Brasil intermediate: `--stealth` failed with CERTIFICATE_VERIFY_FAILED
+        // issued by an ICP-Brasil intermediate: the stealth transport failed with
+        // CERTIFICATE_VERIFY_FAILED
         // while the reqwest path, with SSL_CERT_FILE set, completed the handshake).
         //
         // Two deliberate constraints:

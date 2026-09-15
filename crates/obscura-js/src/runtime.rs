@@ -192,6 +192,17 @@ const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
 const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 
 impl ObscuraJsRuntime {
+    /// Initialize the process-wide V8 platform before constructing runtimes on
+    /// worker threads. Embedders should call this on their main thread.
+    pub fn init_platform() {
+        JsRuntime::init_platform(None, false);
+    }
+
+    /// Report the V8 version linked into this process.
+    pub fn embedded_v8_version() -> &'static str {
+        deno_core::v8::V8::get_version()
+    }
+
     /// Freeze the document timeline for one JavaScript task. Browser timelines
     /// update at task/rendering boundaries, not on each forced style or layout
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
@@ -2000,8 +2011,8 @@ impl ObscuraJsRuntime {
         let started = tokio::time::Instant::now();
         let deadline = started + budget;
         // A one-second grace covers the common load -> fetch -> framework
-        // commit path (and matches the CLI's established one-second useful
-        // hydration window), but it is intentionally independent of a larger
+        // commit path (and provides a one-second useful hydration window), but
+        // it is intentionally independent of a larger
         // caller budget. Requests which remain pending after this point are no
         // longer readiness evidence by themselves. Their eventual connected
         // DOM mutation is still observed during the bounded activity tail.
@@ -2103,8 +2114,8 @@ impl ObscuraJsRuntime {
         }
     }
 
-    /// Like [`Self::evaluate`] but bounded by a V8 watchdog, so a `--eval`
-    /// expression that loops forever (or awaits a promise that never settles in
+    /// Like [`Self::evaluate`] but bounded by a V8 watchdog, so an expression
+    /// that loops forever (or awaits a promise that never settles in
     /// synchronous form) cannot hang the process.
     pub fn evaluate_with_timeout(
         &mut self,
@@ -2117,19 +2128,63 @@ impl ObscuraJsRuntime {
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let token = self.arm_watchdog(timeout);
-        let result = self.runtime.execute_script("<eval>", wrapped);
-        let fired = self.disarm_watchdog(token);
-        match result {
-            Ok(v) if !fired => self.v8_to_json(v),
-            Ok(_) => Err("eval timed out".to_string()),
-            Err(e) => {
-                let msg = e.to_string();
-                if fired || msg.contains("execution terminated") {
-                    Err("eval timed out".to_string())
-                } else {
-                    Err(format!("JS error: {}", msg))
-                }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match self.runtime.execute_script("<eval>", wrapped) {
+                Ok(value) => self.v8_to_json(value),
+                Err(error) => Err(format!("JS error: {}", error)),
             }
+        }));
+        let fired = self.disarm_watchdog(token);
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        match result {
+            Err(error) if fired || error.contains("execution terminated") => {
+                Err("eval timed out".to_string())
+            }
+            Ok(_) if fired => Err("eval timed out".to_string()),
+            other => other,
+        }
+    }
+
+    /// Evaluate an expression and return its intrinsic V8 JSON serialization.
+    /// The watchdog remains armed through serialization and UTF-8 conversion,
+    /// since getters and proxies may execute JavaScript during stringify.
+    pub fn evaluate_json_with_timeout(
+        &mut self,
+        expression: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        if timeout.is_zero() {
+            self.begin_javascript_task();
+            let wrapped = Self::wrap_expression(expression);
+            let result = self
+                .runtime
+                .execute_script("<eval>", wrapped)
+                .map_err(|error| format!("JS error: {}", error))?;
+            return self.v8_to_json_text(result);
+        }
+        self.begin_javascript_task();
+        let wrapped = Self::wrap_expression(expression);
+        let token = self.arm_watchdog(timeout);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match self.runtime.execute_script("<eval>", wrapped) {
+                Ok(value) => self.v8_to_json_text(value),
+                Err(error) => Err(format!("JS error: {}", error)),
+            }
+        }));
+        let fired = self.disarm_watchdog(token);
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        match result {
+            Err(error) if fired || error.contains("execution terminated") => {
+                Err("eval timed out".to_string())
+            }
+            Ok(_) if fired => Err("eval timed out".to_string()),
+            other => other,
         }
     }
 
@@ -2244,7 +2299,8 @@ impl ObscuraJsRuntime {
     }
 
     /// Absolute URLs the page requested via fetch()/XHR, in request order
-    /// (issue #301). Backs `--dump assets`.
+    /// (issue #301). Exposed to browser integrations that inspect network
+    /// resources.
     pub fn fetched_urls(&self) -> Vec<String> {
         self.state.borrow().fetched_urls.clone()
     }
@@ -2393,46 +2449,55 @@ impl ObscuraJsRuntime {
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
         let scope = &mut self.runtime.handle_scope();
-        let local = deno_core::v8::Local::new(scope, result);
+        let try_catch = &mut deno_core::v8::TryCatch::new(scope);
+        let local = deno_core::v8::Local::new(try_catch, result);
 
         if local.is_undefined() || local.is_null() {
             return Ok(serde_json::Value::Null);
         }
         if local.is_boolean() {
-            return Ok(serde_json::Value::Bool(local.boolean_value(scope)));
+            return Ok(serde_json::Value::Bool(local.boolean_value(try_catch)));
         }
         if local.is_number() {
-            let n = local.number_value(scope).unwrap_or(0.0);
-            return Ok(serde_json::json!(n));
+            let number = local.number_value(try_catch).unwrap_or(0.0);
+            return Ok(serde_json::json!(number));
         }
         if local.is_string() {
-            let s = local.to_rust_string_lossy(scope);
-            return Ok(serde_json::Value::String(s));
+            return Ok(serde_json::Value::String(
+                local.to_rust_string_lossy(try_catch),
+            ));
         }
 
-        let global = scope.get_current_context().global(scope);
-        let json_obj_str = deno_core::v8::String::new(scope, "JSON").unwrap();
-        if let Some(json_obj) = global.get(scope, json_obj_str.into()) {
-            if let Some(json_obj) = json_obj.to_object(scope) {
-                let stringify_str = deno_core::v8::String::new(scope, "stringify").unwrap();
-                if let Some(stringify_fn) = json_obj.get(scope, stringify_str.into()) {
-                    if let Ok(stringify_fn) =
-                        deno_core::v8::Local::<deno_core::v8::Function>::try_from(stringify_fn)
-                    {
-                        let args = [local];
-                        if let Some(result) = stringify_fn.call(scope, json_obj.into(), &args) {
-                            let json_str = result.to_rust_string_lossy(scope);
-                            if let Ok(val) = serde_json::from_str(&json_str) {
-                                return Ok(val);
-                            }
-                        }
-                    }
-                }
+        let Some(json) = deno_core::v8::json::stringify(try_catch, local) else {
+            if try_catch.has_terminated() {
+                return Err("eval timed out".to_string());
             }
+            return Err("failed to serialize evaluation result as JSON".to_string());
+        };
+        serde_json::from_str(&json.to_rust_string_lossy(try_catch))
+            .map_err(|error| format!("failed to decode evaluation result: {}", error))
+    }
+
+    fn v8_to_json_text(
+        &mut self,
+        result: deno_core::v8::Global<deno_core::v8::Value>,
+    ) -> Result<String, String> {
+        let scope = &mut self.runtime.handle_scope();
+        let try_catch = &mut deno_core::v8::TryCatch::new(scope);
+        let local = deno_core::v8::Local::new(try_catch, result);
+
+        // Match the historical API contract for an undefined completion value.
+        if local.is_undefined() {
+            return Ok("null".to_string());
         }
 
-        let s = local.to_rust_string_lossy(scope);
-        Ok(serde_json::Value::String(s))
+        let Some(json) = deno_core::v8::json::stringify(try_catch, local) else {
+            if try_catch.has_terminated() {
+                return Err("eval timed out".to_string());
+            }
+            return Err("failed to serialize evaluation result as JSON".to_string());
+        };
+        Ok(json.to_rust_string_lossy(try_catch))
     }
 
     fn info_from_json(value: &serde_json::Value) -> RemoteObjectInfo {
@@ -2547,6 +2612,49 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn bounded_evaluation_preserves_primitives_and_uses_intrinsic_json() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let timeout = std::time::Duration::from_millis(100);
+
+        assert_eq!(
+            rt.evaluate_with_timeout("0", timeout).unwrap(),
+            serde_json::json!(0.0)
+        );
+        rt.evaluate("(JSON.stringify = () => '\"spoofed\"', null)")
+            .unwrap();
+        assert_eq!(
+            rt.evaluate_with_timeout("({ answer: 6 * 7 })", timeout)
+                .unwrap(),
+            serde_json::json!({ "answer": 42 })
+        );
+        assert_eq!(
+            rt.evaluate_json_with_timeout("({ answer: 6 * 7 })", timeout)
+                .unwrap(),
+            r#"{"answer":42}"#
+        );
+    }
+
+    #[test]
+    fn bounded_json_serialization_timeout_leaves_runtime_reusable() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let started_at = std::time::Instant::now();
+        let error = rt
+            .evaluate_json_with_timeout(
+                "({ get value() { while (true) {} } })",
+                std::time::Duration::from_millis(25),
+            )
+            .unwrap_err();
+
+        assert_eq!(error, "eval timed out");
+        assert!(started_at.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            rt.evaluate_json_with_timeout("6 * 7", std::time::Duration::from_secs(1))
+                .unwrap(),
+            "42"
+        );
     }
 
     #[test]
@@ -2726,6 +2834,99 @@ mod tests {
             rt.evaluate("__taskOrder").unwrap(),
             serde_json::json!(["sync", "microtask", "timer"])
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeout_and_interval_clear_functions_share_one_timer_registry() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "cross-kind-timer-cancellation",
+            r#"
+                globalThis.__crossTimerState = {
+                    intervalTicks: 0,
+                    intervalDelayCoercions: 0,
+                    timeoutRan: false,
+                };
+                const timeoutId = setTimeout(() => {
+                    __crossTimerState.timeoutRan = true;
+                }, 20);
+                clearInterval(timeoutId);
+
+                const intervalDelay = {
+                    valueOf() {
+                        __crossTimerState.intervalDelayCoercions++;
+                        return 0;
+                    }
+                };
+                const intervalId = setInterval(() => {
+                    __crossTimerState.intervalTicks++;
+                    clearTimeout(intervalId);
+                }, intervalDelay);
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__crossTimerState").unwrap(),
+            serde_json::json!({
+                "intervalTicks": 1,
+                "intervalDelayCoercions": 1,
+                "timeoutRan": false,
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queue_microtask_validates_synchronously_and_runs_before_timer_tasks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "queue-microtask-contract",
+            r#"
+                globalThis.__queueMicrotaskState = { order: ["sync"], errors: [] };
+                for (const value of [undefined, null, 1, "callback"]) {
+                    try { queueMicrotask(value); }
+                    catch (error) { __queueMicrotaskState.errors.push(error.name); }
+                }
+                __queueMicrotaskState.returned = queueMicrotask(() => {
+                    __queueMicrotaskState.order.push("microtask");
+                }) === undefined;
+                setTimeout(() => __queueMicrotaskState.order.push("timer"), 0);
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__queueMicrotaskState").unwrap(),
+            serde_json::json!({
+                "order": ["sync", "microtask", "timer"],
+                "errors": ["TypeError", "TypeError", "TypeError", "TypeError"],
+                "returned": true,
+            }),
+        );
+    }
+
+    #[test]
+    fn browser_task_ids_are_positive_bounded_and_unique_while_live() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt
+            .evaluate(
+                r#"(() => {
+                    const timeoutId = setTimeout(() => {}, 1000);
+                    const intervalId = setInterval(() => {}, 1000);
+                    const animationId = requestAnimationFrame(() => {});
+                    const ids = [timeoutId, intervalId, animationId];
+                    const valid = ids.every(id => Number.isInteger(id) && id > 0 && id <= 0x7fffffff);
+                    const unique = new Set(ids).size === ids.length;
+                    clearTimeout(timeoutId);
+                    clearInterval(intervalId);
+                    cancelAnimationFrame(animationId);
+                    return [valid, unique];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(value, serde_json::json!([true, true]));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3524,6 +3725,33 @@ mod tests {
             .evaluate("(function(){var s=document.createElementNS('http://www.w3.org/2000/svg','svg'); s.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#g'); s.removeAttributeNS('http://www.w3.org/1999/xlink','href'); return s.getAttributeNS('http://www.w3.org/1999/xlink','href');})()")
             .unwrap();
         assert_eq!(v, serde_json::json!(null));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn namespace_attribute_mutations_invalidate_computed_style_snapshots() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let calls = rt
+            .evaluate(
+                r#"(function(){
+                    const element = document.createElement('div');
+                    const nativeComputedStyle = Deno.core.ops.op_computed_style;
+                    let calls = 0;
+                    Deno.core.ops.op_computed_style = (...args) => {
+                        calls++;
+                        return nativeComputedStyle(...args);
+                    };
+                    void getComputedStyle(element).display;
+                    void getComputedStyle(element).display;
+                    element.setAttributeNS(null, 'data-state', 'set');
+                    void getComputedStyle(element).display;
+                    element.removeAttributeNS(null, 'data-state');
+                    void getComputedStyle(element).display;
+                    return calls;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(calls.as_f64(), Some(3.0));
     }
 
     #[test]
@@ -11058,7 +11286,7 @@ mod tests {
 
     /// Regression test for #147: a TypeError in one script must not poison
     /// the runtime so that subsequent scripts (or DOM queries) collapse to
-    /// empty. The reporter saw `--dump text` return 1 byte after offside.js
+    /// empty. The reporter saw text extraction return 1 byte after offside.js
     /// crashed; that cascade should never happen.
     #[test]
     fn script_typeerror_does_not_poison_subsequent_execution() {
@@ -13571,6 +13799,53 @@ mod tests {
         assert_eq!(result.as_str().unwrap(), "B");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn platform_crypto_ops_keep_native_wire_contract() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const hex = bytes => Array.from(new Uint8Array(bytes))
+                        .map(byte => byte.toString(16).padStart(2, "0"))
+                        .join("");
+                    const data = new TextEncoder().encode("abc");
+                    const digest = await crypto.subtle.digest("SHA-256", data);
+                    const key = await crypto.subtle.importKey(
+                        "raw",
+                        new TextEncoder().encode("key"),
+                        { name: "HMAC", hash: "SHA-256" },
+                        false,
+                        ["sign"],
+                    );
+                    const signature = await crypto.subtle.sign("HMAC", key, data);
+                    const random = crypto.getRandomValues(new Uint16Array(4));
+                    const uuid = crypto.randomUUID();
+                    return {
+                        digest: hex(digest),
+                        signature: hex(signature),
+                        randomLength: random.byteLength,
+                        uuidShape: /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "digest": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "signature": "9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab",
+                "randomLength": 8,
+                "uuidShape": true,
+            })
+        );
+    }
+
     #[test]
     fn test_document_doctype() {
         let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
@@ -13582,6 +13857,96 @@ mod tests {
 
         let node_type = rt.evaluate("document.doctype.nodeType").unwrap();
         assert_eq!(node_type.as_f64().unwrap() as i64, 10);
+    }
+
+    #[test]
+    fn processing_instruction_uses_native_node_data_and_wrapping() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const pi = document.createProcessingInstruction('xml-stylesheet', 'href="a.css"');
+                    const clone = pi.cloneNode();
+                    const nativeCloneId = +Deno.core.ops.op_dom('clone_node', String(pi._nid), 'false');
+                    const wrapped = globalThis._wrap(nativeCloneId);
+                    pi.nodeValue = 'href="b.css"';
+                    return [
+                        pi.nodeType,
+                        Deno.core.ops.op_dom('node_type', String(pi._nid), ''),
+                        JSON.parse(Deno.core.ops.op_dom('pi_target', String(pi._nid), '')),
+                        pi.target,
+                        pi.data,
+                        clone.nodeType,
+                        clone.target,
+                        clone.data,
+                        wrapped instanceof ProcessingInstruction,
+                        wrapped.target,
+                        wrapped.data,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                7,
+                "7",
+                "xml-stylesheet",
+                "xml-stylesheet",
+                "href=\"b.css\"",
+                7,
+                "xml-stylesheet",
+                "href=\"a.css\"",
+                true,
+                "xml-stylesheet",
+                "href=\"a.css\""
+            ])
+        );
+    }
+
+    #[test]
+    fn created_document_type_uses_native_node_data_and_wrapping() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const doctype = document.implementation.createDocumentType(
+                        'svg', '-//W3C//DTD SVG 1.1//EN', 'svg11.dtd'
+                    );
+                    const nativeCloneId = +Deno.core.ops.op_dom(
+                        'clone_node', String(doctype._nid), 'false'
+                    );
+                    const wrapped = globalThis._wrap(nativeCloneId);
+                    return [
+                        doctype.nodeType,
+                        Deno.core.ops.op_dom('node_type', String(doctype._nid), ''),
+                        JSON.parse(Deno.core.ops.op_dom('doctype_name', String(doctype._nid), '')),
+                        JSON.parse(Deno.core.ops.op_dom('doctype_public_id', String(doctype._nid), '')),
+                        doctype.name,
+                        doctype.publicId,
+                        doctype.systemId,
+                        wrapped instanceof DocumentType,
+                        wrapped.name,
+                        wrapped.publicId,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                10,
+                "10",
+                "svg",
+                "-//W3C//DTD SVG 1.1//EN",
+                "svg",
+                "-//W3C//DTD SVG 1.1//EN",
+                "svg11.dtd",
+                true,
+                "svg",
+                "-//W3C//DTD SVG 1.1//EN"
+            ])
+        );
     }
 
     #[test]

@@ -392,7 +392,7 @@ pub async fn handle(
 }
 
 /// Reject `Runtime.{evaluate,callFunctionOn}` calls that target an execution
-/// context Obscura has not advertised. Returns `Ok(())` when the parameter is
+/// context Domjet has not advertised. Returns `Ok(())` when the parameter is
 /// absent (defaulting to the page's default context) or when the id matches
 /// one of `ctx.valid_context_ids`. Logs a debug trace on accept for #51.
 fn validate_context_id(
@@ -576,7 +576,7 @@ mod tests {
 
     /// Regression for #122 item 7: puppeteer-extra's FrameManager.initialize
     /// fires Runtime.enable on the browser-level WebSocket BEFORE any page
-    /// target exists. Real Chrome replies with `{}`; before the fix Obscura
+    /// target exists. Real Chrome replies with `{}`; before the fix Domjet
     /// returned `{"error":{"code":-32601,"message":"No page"}}` and the
     /// puppeteer connect flow died.
     #[tokio::test]

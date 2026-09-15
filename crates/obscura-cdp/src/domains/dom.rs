@@ -222,7 +222,7 @@ pub async fn handle(
         "setAttributeValue" => Ok(json!({})),
         "removeNode" => Ok(json!({})),
         "focus" => {
-            // No layout engine, but obscura's JS focus() sets document.activeElement,
+            // No layout engine, but Domjet's JS focus() sets document.activeElement,
             // which Input.dispatchKeyEvent targets. CDP clients (browser-use) focus an
             // input via DOM.focus before typing; without this their keystrokes land on
             // nothing and the field stays empty.
@@ -239,7 +239,7 @@ pub async fn handle(
         "scrollIntoViewIfNeeded" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let node_id = resolve_node_id(page, params)?;
-            // Obscura has no layout viewport to move, but the JS shim records
+            // Domjet has no layout viewport to move, but the JS shim records
             // this element for the hit testing used by subsequent input events.
             let code = format!(
                 "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
