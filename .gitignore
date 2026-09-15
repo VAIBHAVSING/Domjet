@@ -1,2 +1,6 @@
 target/
+node_modules/
+packages/*/dist/
 .DS_Store
+packages/browser/LICENSE
+packages/browser/NOTICE
