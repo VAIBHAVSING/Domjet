@@ -1,18 +1,25 @@
-Obscura is a workspace of nine crates.
+Domjet is a workspace of Rust engine crates plus a Node.js package.
 
 ```
-obscura-cli       CLI entry point. fetch, serve, scrape, mcp.
 obscura-cdp       Chrome DevTools Protocol server. WebSocket, dispatch, domain handlers.
 obscura-browser   Page type, navigation, lifecycle events.
 obscura-js        V8 runtime via deno_core. bootstrap.js + Rust ops.
 obscura-dom       DOM tree implementation.
 obscura-net       HTTP client, stealth client, cookie jar, robots cache, tracker blocklist.
-obscura-mcp       Model Context Protocol server.
 obscura-render    CSS cascade, retained layout, text shaping, and CPU paint.
 obscura           Embeddable Rust library API (Browser, Page, Element, CookieStore).
+domjet           Embedded WASM browser and Node.js integrations.
 ```
 
-## Request flow
+## Node/WASM request flow
+
+The `domjet` package runs `packages/browser/src/cdp-server.mts` in Node. Page
+commands cross the Worker bridge in `packages/runtime/src/worker.mts` to the
+WASM core. Node supplies V8 and networking; `obscura-wasm` owns portable page
+state and invokes the Rust DOM and renderer. It does not execute the native
+`obscura-browser` / `deno_core` navigation path below.
+
+## Native Rust request flow
 
 A `Page.navigate` from a CDP client:
 
@@ -45,7 +52,7 @@ The dispatcher emits CDP events (`Network.requestWillBeSent`, `Page.frameNavigat
 ## Rendering flow
 
 `obscura-render` consumes the shared DOM and computed style state. Taffy
-provides the flex/grid foundation; Obscura adds browser formatting behavior,
+provides the flex/grid foundation; Domjet adds browser formatting behavior,
 text shaping, intrinsic replaced-element sizing, retained geometry, scrolling,
 and CPU-backed paint. `obscura-js` exposes renderer-owned geometry to DOM APIs,
 `obscura-browser` prepares resources and owns capture, and `obscura-cdp` maps
@@ -73,7 +80,7 @@ This is why `Target.createTarget` from many concurrent clients works: each `newP
 
 ## Robustness
 
-One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8 termination watchdog (`arm_watchdog`, `run_event_loop_bounded`) that terminates the isolate from a separate thread when synchronous work overruns a budget, because `tokio::time::timeout` cannot preempt synchronous V8. It bounds the post-load settle, the navigation event-loop pumps, and `--eval`. `obscura-js/cdp_watchdog.rs` is a single shared watchdog the dispatcher arms around every CDP command, so a runaway page cannot hold the V8 lock and wedge other sessions (tunable via `OBSCURA_CDP_COMMAND_TIMEOUT_MS`). `op_dom` is wrapped in `catch_unwind` so a DOM-op panic degrades to a null result instead of aborting the process through V8's FFI frame, and `obscura-dom/tree.rs` rejects cyclic reparenting that would make tree walks loop forever. Scripted `fetch()`/XHR and module loads are timeout-bounded (`OBSCURA_FETCH_TIMEOUT_MS`), and the one-shot `fetch` CLI has a process-level hard deadline as a final backstop.
+One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8 termination watchdog (`arm_watchdog`, `run_event_loop_bounded`) that terminates the isolate from a separate thread when synchronous work overruns a budget, because `tokio::time::timeout` cannot preempt synchronous V8. `obscura-js/cdp_watchdog.rs` is a single shared watchdog the dispatcher arms around every CDP command, so a runaway page cannot hold the V8 lock and wedge other sessions. `op_dom` is wrapped in `catch_unwind` so a DOM-op panic degrades to a null result instead of aborting the process through V8's FFI frame, and `obscura-dom/tree.rs` rejects cyclic reparenting that would make tree walks loop forever. Scripted `fetch()`/XHR and module loads are timeout-bounded.
 
 ## JS bridge
 
@@ -112,11 +119,15 @@ init → commit → domcontentloaded → load → networkidle2 → networkidle0
 
 ## Storage
 
-`--storage-dir` persists cookies (`cookies.json`) and localStorage (`localStorage/<origin>.json`). Reads on process start, writes on every navigation and on graceful shutdown.
+The Rust API and `domjet` package provide profile persistence for
+cookies and localStorage. The exact storage format is owned by each API layer.
 
 ## Stealth
 
-`--stealth` swaps the default `reqwest` client for `obscura-net/wreq_client.rs`, which presents a real browser's TLS ClientHello, ALPN, and cipher order (a consistent Chrome fingerprint, not a randomized one) so the TLS layer matches the User-Agent and JS surfaces. It also applies the bundled tracker blocklist before any request leaves the process. Scripted `fetch()`/XHR go through the same stealth client, so subresource requests carry the same fingerprint as the navigation. `--stealth` is a global CLI flag that applies to `fetch`, `serve`, `scrape`, and `mcp`.
+The optional stealth feature swaps the default `reqwest` client for
+`obscura-net/wreq_client.rs`, which presents a consistent browser TLS
+fingerprint and applies the bundled tracker blocklist. Scripted `fetch()`/XHR
+use the same client as navigation.
 
 ## Workspace conventions
 

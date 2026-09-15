@@ -4,16 +4,15 @@ The `obscura` crate embeds the engine in a Rust program with a `Browser` / `Page
 
 ```toml
 [dependencies]
-obscura = { git = "https://github.com/h4ckf0r0day/obscura" }
+obscura = { git = "https://github.com/VAIBHAVSING/domjet", branch = "wasm-node-migration", features = ["api"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 anyhow = "1"
 ```
 
-The first build compiles V8 from source, so it is slow and needs the same build tools as [Build from source](Build-from-source.md). Pin a tag for reproducible builds:
-
-```toml
-obscura = { git = "https://github.com/h4ckf0r0day/obscura", tag = "v0.1.7" }
-```
+The first build compiles V8 from source and needs the native build tools in
+[Build from source](Build-from-source.md). Pin a reviewed Git revision for
+reproducible builds. The Rust crate keeps its `obscura` name; `domjet` is the npm
+package name.
 
 ## Quickstart
 
@@ -120,7 +119,7 @@ page.goto("https://example.com").await?;
 page.settle(2000).await;
 ```
 
-A `Continue` with `url: Some(...)` rewrites the target. The new URL is re-checked against the SSRF / private-network gate, so a rewrite cannot reach an internal address that would otherwise need `--allow-private-network`.
+A `Continue` with `url: Some(...)` rewrites the target. The new URL is re-checked against the SSRF / private-network gate, so a rewrite cannot reach an internal address unless the embedding configuration explicitly permits it.
 
 ### Preload scripts
 
@@ -138,5 +137,7 @@ page.goto("https://example.com").await?;
 
 - Embedding the engine in a Rust service: this crate.
 - Driving from Node/Python with existing Puppeteer/Playwright code: the [CDP server](Connect-Puppeteer-or-Playwright.md).
-- Giving an AI agent browser tools: the [MCP server](Use-the-MCP-server.md).
-- One-off fetches and scraping from the shell: the [CLI](CLI-reference.md).
+- Giving an AI agent browser tools: build an integration on top of
+  `BrowserContext` and `Page`, or use the Node.js browser package.
+- One-off evaluation and capture from the shell: use the
+  `domjet` utility from `domjet`.

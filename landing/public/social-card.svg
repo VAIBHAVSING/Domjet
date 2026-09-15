@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <pattern id="grid" width="52" height="52" patternUnits="userSpaceOnUse">
+      <path d="M52 0H0V52" fill="none" stroke="#111210" stroke-opacity=".06"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="630" fill="#f4f2ed"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+  <circle cx="1110" cy="-40" r="280" fill="none" stroke="#ff5b35" stroke-opacity=".38"/>
+  <g transform="translate(80 75)">
+    <rect width="56" height="56" rx="16" fill="#111210"/>
+    <path fill="#fffefb" d="M15 15h13c8.6 0 14 5.1 14 13.1S36.6 41 28 41H15V15Zm12.8 17.9c3.2 0 5.2-1.7 5.2-4.8s-2-4.8-5.2-4.8h-3.6v9.6h3.6Z"/>
+    <path fill="#ff5b35" d="M36 11h12l-8 8h-9.5l5.5-8Z"/>
+    <text x="72" y="41" fill="#111210" font-family="Inter,Arial,sans-serif" font-size="34" font-weight="750" letter-spacing="-1.5">domjet</text>
+  </g>
+  <text x="80" y="283" fill="#111210" font-family="Inter,Arial,sans-serif" font-size="72" font-weight="720" letter-spacing="-4">The lightweight browser</text>
+  <text x="80" y="367" fill="#ff5b35" font-family="Inter,Arial,sans-serif" font-size="72" font-weight="720" letter-spacing="-4">for AI agents.</text>
+  <text x="82" y="467" fill="#5f5f59" font-family="SFMono-Regular,Consolas,monospace" font-size="21">HEADLESS · NODE.JS · WEBASSEMBLY</text>
+  <rect x="80" y="523" width="235" height="2" fill="#111210"/>
+  <text x="80" y="568" fill="#111210" font-family="Inter,Arial,sans-serif" font-size="23" font-weight="650">domjet.dev</text>
+</svg>

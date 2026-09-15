@@ -1,0 +1,17 @@
+# Domjet
+
+> Domjet is a lightweight headless browser for AI agents, compiled from Rust to WebAssembly and embedded in Node.js 22+. Node supplies JavaScript execution, networking, timers, and filesystem access. The WebAssembly core owns page state, DOM, CSS, layout, paint, cookies, screenshots, PDF, browser contexts, and Chrome DevTools Protocol state.
+
+## Documentation
+
+- [Overview](https://domjet.dev/docs/): Product overview and first example.
+- [Get started](https://domjet.dev/docs/getting-started/): Installation and first browser workflow.
+- [Architecture](https://domjet.dev/docs/architecture/): Division of responsibilities between Node and the WebAssembly core.
+
+## Install
+
+```bash
+npm install domjet
+```
+
+- [Compatibility](https://domjet.dev/docs/compatibility/): Verified direct workflows and known Playwright/Puppeteer limitations.
