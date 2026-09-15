@@ -1,0 +1,106 @@
+{
+  "name": "domjet",
+  "version": "0.1.0",
+  "description": "Lightweight, secure embedded browser SDK for Node.js",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.mts",
+      "import": "./dist/src/index.mjs",
+      "default": "./dist/src/index.mjs"
+    },
+    "./cdp": {
+      "types": "./dist/src/cdp.d.mts",
+      "import": "./dist/src/cdp.mjs",
+      "default": "./dist/src/cdp.mjs"
+    },
+    "./storage": {
+      "types": "./dist/src/storage.d.mts",
+      "import": "./dist/src/storage.mjs",
+      "default": "./dist/src/storage.mjs"
+    },
+    "./s3": {
+      "types": "./dist/src/s3.d.mts",
+      "import": "./dist/src/s3.mjs",
+      "default": "./dist/src/s3.mjs"
+    },
+    "./transport": {
+      "types": "./dist/src/transport.d.mts",
+      "import": "./dist/src/transport.mjs",
+      "default": "./dist/src/transport.mjs"
+    },
+    "./playwright": {
+      "types": "./dist/src/playwright.d.mts",
+      "import": "./dist/src/playwright.mjs",
+      "default": "./dist/src/playwright.mjs"
+    },
+    "./puppeteer": {
+      "types": "./dist/src/puppeteer.d.mts",
+      "import": "./dist/src/puppeteer.mjs",
+      "default": "./dist/src/puppeteer.mjs"
+    },
+    "./profile-process": {
+      "types": "./dist/src/profile-process.d.mts",
+      "import": "./dist/src/profile-process.mjs",
+      "default": "./dist/src/profile-process.mjs"
+    }
+  },
+  "bin": {
+    "domjet": "./dist/bin/domjet.mjs"
+  },
+  "files": [
+    "dist",
+    "wasm/artifact.json",
+    "wasm/obscura_wasm.cjs",
+    "wasm/obscura_wasm.d.ts",
+    "wasm/obscura_wasm_bg.wasm",
+    "wasm/obscura_wasm_bg.wasm.d.ts",
+    "bootstrap.js",
+    "logo.svg",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node ./scripts/clean.mjs && tsx ./scripts/prepare-runtime.mts && tsc -p tsconfig.json && node ./scripts/finalize-build.mjs",
+    "test": "tsx --test ./test/*.test.mts",
+    "pretest": "npm run build",
+    "prepare:runtime": "tsx ./scripts/prepare-runtime.mts",
+    "prepare:wasm": "tsx ./scripts/prepare-wasm.mts",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "playwright-core": ">=1.45.0",
+    "puppeteer-core": ">=23.0.0"
+  },
+  "peerDependenciesMeta": {
+    "playwright-core": {
+      "optional": true
+    },
+    "puppeteer-core": {
+      "optional": true
+    }
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VAIBHAVSING/domjet.git",
+    "directory": "packages/browser"
+  },
+  "homepage": "https://domjet.dev",
+  "bugs": {
+    "url": "https://github.com/VAIBHAVSING/domjet/issues"
+  },
+  "keywords": [
+    "domjet",
+    "browser",
+    "headless",
+    "scraping",
+    "cdp",
+    "playwright",
+    "puppeteer"
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "name": "@domjet/browser-runtime",
+  "version": "0.0.0-private",
+  "private": true,
+  "type": "module",
+  "description": "Private Node Worker and V8 host runtime for domjet",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/src/client.d.mts",
+      "import": "./dist/src/client.mjs",
+      "default": "./dist/src/client.mjs"
+    }
+  },
+  "bin": {
+    "domjet-wasm-v8-harness": "./dist/bin/run.mjs"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "pretest": "npm run build",
+    "smoke": "tsx ./bin/run.mts --mode smoke",
+    "stress": "tsx ./bin/run.mts --mode stress",
+    "test": "tsx --test ./test/*.test.mts",
+    "test:artifacts": "DOMJET_REQUIRE_REAL_ARTIFACTS=1 tsx --test ./test/*.test.mts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "Apache-2.0"
+}
