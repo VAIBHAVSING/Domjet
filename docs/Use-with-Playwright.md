@@ -1,16 +1,16 @@
 ## Setup
 
 ```bash
-obscura serve --port 9222
-npm install playwright
+npm install domjet playwright-core
+npx domjet serve --port 9222 --json
 ```
 
 ## Connect
 
 ```js
-const { chromium } = require('playwright');
+import { chromium } from 'playwright-core';
 
-const browser = await chromium.connectOverCDP('ws://127.0.0.1:9222');
+const browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
 const context = browser.contexts()[0] || await browser.newContext();
 const page = await context.newPage();
 ```
@@ -25,7 +25,8 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 await page.goto('https://example.com', { waitUntil: 'networkidle' });
 ```
 
-Default is `domcontentloaded`. Other values: `load`, `networkidle`.
+Pass `waitUntil` explicitly when your workflow needs a particular readiness
+boundary. Common values are `domcontentloaded`, `load`, and `networkidle`.
 
 ## Evaluate
 
@@ -144,7 +145,7 @@ Frames are activity-driven page captures, not fixed-rate desktop video.
 ## Disconnect
 
 ```js
-await browser.close();  // closes the CDP connection, leaves obscura serve running
+await browser.close();  // closes the CDP connection, leaves the service running
 ```
 
 ## Current limits
@@ -152,8 +153,7 @@ await browser.close();  // closes the CDP connection, leaves obscura serve runni
 - Playwright `page.video()` and tracing artifacts that require desktop capture
   are not implemented. Use the raw CDP flow above for page frames.
 - `BrowserContext` storage-state save/restore remains limited; use
-  `--storage-dir` on `obscura serve`, as described in
-  [Persist cookies and storage](Persist-cookies-and-storage.md).
+  the profile persistence options in the `domjet` package.
 - Service workers, native media, some Web APIs, long-tail CSS, and compositor
   behavior remain incomplete relative to Chromium.
 - PDF text is not selectable/searchable and tagged PDF is not yet available.

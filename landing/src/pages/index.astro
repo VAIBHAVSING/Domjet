@@ -1,0 +1,578 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+
+const title = "Domjet — Lightweight headless browser for AI agents";
+const description =
+  "Domjet is a lightweight headless browser for AI agents. It runs inside Node.js, renders real pages, and ships without a Chromium download.";
+
+const steps = [
+  {
+    number: "1",
+    title: "Give Domjet a URL",
+    body: "Call it from your Node app using a small, familiar API.",
+    label: "Your code",
+  },
+  {
+    number: "2",
+    title: "Node runs the website",
+    body: "The page's real JavaScript executes through Node's V8 engine.",
+    label: "JavaScript",
+  },
+  {
+    number: "3",
+    title: "Domjet builds the page",
+    body: "The Rust and WebAssembly core handles DOM, CSS, layout, and paint.",
+    label: "Browser engine",
+  },
+  {
+    number: "4",
+    title: "Use the result",
+    body: "Read content, automate the page, or create screenshots and PDFs.",
+    label: "Your output",
+  },
+];
+
+const capabilities = [
+  {
+    label: "Install",
+    title: "No Chrome required",
+    body: "Install one npm package. There is no Chromium download, executable path, or browser process to supervise.",
+  },
+  {
+    label: "Run",
+    title: "It stays inside Node",
+    body: "Domjet loads as WebAssembly and runs with your application, keeping deployment compact and predictable.",
+  },
+  {
+    label: "Render",
+    title: "It renders real pages",
+    body: "DOM, CSS, layout, paint, screenshots, and PDF are built into the engine, not simulated with HTML shortcuts.",
+  },
+  {
+    label: "Connect",
+    title: "Your tools still fit",
+    body: "Start with the direct API, or use CDP adapters for familiar Playwright and Puppeteer workflows.",
+  },
+];
+
+const terms = [
+  { term: "V8", meaning: "Runs the JavaScript shipped by websites." },
+  { term: "WASM", meaning: "Lets the Rust browser core run inside Node." },
+  { term: "DOM", meaning: "The page tree your code can read and change." },
+  { term: "CDP", meaning: "The protocol used by browser automation tools." },
+];
+
+const questions = [
+  {
+    question: "Is Domjet another wrapper around Chrome?",
+    answer: "No. Domjet is its own browser engine. It does not launch Chrome or hide a Chromium process behind its API.",
+  },
+  {
+    question: "Does it run JavaScript from websites?",
+    answer: "Yes. Website JavaScript runs through the real V8 engine provided by Node, while Domjet owns the page and browser state.",
+  },
+  {
+    question: "Can I use Playwright or Puppeteer?",
+    answer: "Domjet includes experimental CDP adapters. Some Playwright and Puppeteer workflows have known limitations; start with the direct API and check the compatibility guide before choosing an adapter.",
+  },
+  {
+    question: "What is it useful for?",
+    answer: "Domjet is designed for web scraping, AI-agent browsing, browser automation, page inspection, screenshots, and PDF generation.",
+  },
+];
+
+const exampleCode = `import { createBrowser } from 'domjet';
+
+const browser = await createBrowser();
+const page = await browser.newPage();
+
+await page.goto('https://example.com');
+console.log(await page.evaluate(() => document.title));
+await page.screenshot({ path: 'page.png' });
+
+await browser.close();`;
+
+---
+
+<BaseLayout title={title} description={description}>
+  <header class="site-header">
+    <div class="shell header-inner">
+      <a class="brand" href="/" aria-label="Domjet home">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <rect width="32" height="32" rx="9"></rect>
+          <path d="M9 9h7.2c4.6 0 7.8 2.8 7.8 7s-3.2 7-7.8 7H9V9Zm7 9.5c1.8 0 2.9-.9 2.9-2.5s-1.1-2.5-2.9-2.5h-2v5h2Z"></path>
+          <path class="brand-flare" d="M20 7h6l-4 4h-5l3-4Z"></path>
+        </svg>
+        <span>domjet</span>
+      </a>
+
+      <nav class="site-nav" id="primary-navigation" aria-label="Primary navigation">
+        <a href="#compare">Compare</a>
+        <a href="#how">How it works</a>
+        <a href="#why">Why Domjet</a>
+        <a href="/docs/">Docs</a>
+      </nav>
+
+      <a class="header-cta" href="/docs/getting-started/">
+        Get started
+        <span aria-hidden="true">↗</span>
+      </a>
+
+      <button
+        class="menu-toggle"
+        type="button"
+        aria-expanded="false"
+        aria-controls="primary-navigation"
+        aria-label="Open navigation"
+      >
+        <span aria-hidden="true"></span>
+        <span aria-hidden="true"></span>
+      </button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="hero-grid" aria-hidden="true"></div>
+      <div class="shell hero-inner">
+        <div class="hero-copy">
+          <p class="eyebrow"><span></span> Headless browsing built for agents</p>
+          <h1>The lightweight browser for <em>AI agents.</em></h1>
+          <p class="hero-lede">
+            Domjet gives agents a real DOM, JavaScript, rendering, screenshots, and PDFs without
+            launching Chrome. It installs as an npm package and runs inside your Node app.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="/docs/getting-started/">
+              Start building
+              <span aria-hidden="true">→</span>
+            </a>
+            <a class="button button-secondary" href="#compare">Compare with Chrome</a>
+          </div>
+          <div class="install-line" aria-label="Install Domjet from npm">
+            <span aria-hidden="true">$</span>
+            <code id="hero-install-command">npm install domjet</code>
+            <button
+              class="copy-button copy-button-light"
+              type="button"
+              data-copy-target="hero-install-command"
+              aria-label="Copy npm install command"
+              aria-live="polite"
+            >Copy</button>
+          </div>
+        </div>
+
+        <div class="code-window" aria-label="Domjet code example">
+          <div class="window-bar">
+            <div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+            <span>crawl.mjs</span>
+            <div class="window-actions">
+              <span class="window-runtime">node</span>
+              <button
+                class="copy-button copy-button-dark"
+                type="button"
+                data-copy-target="hero-example-code"
+                aria-label="Copy code example"
+                aria-live="polite"
+              >Copy</button>
+            </div>
+          </div>
+          <pre><code id="hero-example-code">{exampleCode}</code></pre>
+          <div class="window-status">
+            <span><i></i> WASM engine ready</span>
+            <span>42ms</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="shell hero-foot">
+        <span><b>01</b> Navigate</span>
+        <span><b>02</b> Observe</span>
+        <span><b>03</b> Act</span>
+        <span><b>04</b> Capture</span>
+      </div>
+    </section>
+
+    <section class="section comparison" id="compare">
+      <div class="shell">
+        <div class="section-heading" data-reveal>
+          <p class="kicker">Chrome vs Domjet</p>
+          <h2>Both open web pages. They are built for different jobs.</h2>
+          <p>
+            Chrome is a complete consumer browser. Domjet is an independent, lightweight headless
+            browser made for AI agents and embedded Node automation.
+          </p>
+        </div>
+
+        <div class="comparison-table" data-reveal role="table" aria-label="Chrome and Domjet comparison">
+          <div class="comparison-row comparison-head" role="row">
+            <div role="columnheader"><span>Compare</span></div>
+            <div role="columnheader" class="chrome-column">
+              <span class="browser-dot chrome-dot" aria-hidden="true"></span>
+              Chrome
+            </div>
+            <div role="columnheader" class="domjet-column">
+              <svg class="comparison-logo" viewBox="0 0 32 32" aria-hidden="true">
+                <rect width="32" height="32" rx="9"></rect>
+                <path d="M9 9h7.2c4.6 0 7.8 2.8 7.8 7s-3.2 7-7.8 7H9V9Zm7 9.5c1.8 0 2.9-.9 2.9-2.5s-1.1-2.5-2.9-2.5h-2v5h2Z"></path>
+                <path class="brand-flare" d="M20 7h6l-4 4h-5l3-4Z"></path>
+              </svg>
+              Domjet
+            </div>
+          </div>
+          <div class="comparison-row" role="row">
+            <div role="rowheader">Installation</div>
+            <div role="cell">Downloads a full browser</div>
+            <div role="cell"><strong>Installs as an npm package</strong></div>
+          </div>
+          <div class="comparison-row" role="row">
+            <div role="rowheader">Runtime</div>
+            <div role="cell">Launches browser processes</div>
+            <div role="cell"><strong>Runs in your Node process</strong></div>
+          </div>
+          <div class="comparison-row" role="row">
+            <div role="rowheader">Page engine</div>
+            <div role="cell">Blink with Chrome's V8</div>
+            <div role="cell"><strong>Rust/WASM with Node's V8</strong></div>
+          </div>
+          <div class="comparison-row" role="row">
+            <div role="rowheader">Control</div>
+            <div role="cell">Automation over CDP</div>
+            <div role="cell"><strong>Direct API or CDP adapters</strong></div>
+          </div>
+          <div class="comparison-row comparison-choice" role="row">
+            <div role="rowheader">Choose it when</div>
+            <div role="cell">Exact Chrome behavior matters most</div>
+            <div role="cell"><strong>AI-agent browsing and embedded automation matter most</strong></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section explainer" id="how">
+      <div class="shell">
+        <div class="section-heading section-heading-centered" data-reveal>
+          <p class="kicker">How it works</p>
+          <h2>From a URL to useful output in four steps.</h2>
+          <p>
+            You write ordinary Node code. Domjet handles the browser work and gives the result
+            back to your application.
+          </p>
+        </div>
+
+        <ol class="flow" aria-label="How Domjet processes a page">
+          {steps.map((step, index) => (
+            <li class="flow-step" data-reveal style={`--reveal-delay: ${index * 80}ms`}>
+              <div class="flow-topline">
+                <span class="flow-number">{step.number}</span>
+                <span class="flow-label">{step.label}</span>
+              </div>
+              <h3>{step.title}</h3>
+              <p>{step.body}</p>
+              {index < steps.length - 1 && <span class="flow-arrow" aria-hidden="true">→</span>}
+            </li>
+          ))}
+        </ol>
+
+      </div>
+    </section>
+
+    <section class="section capabilities" id="why">
+      <div class="shell">
+        <div class="section-heading" data-reveal>
+          <p class="kicker">What you get</p>
+          <h2>The useful parts of a browser, packaged for Node.</h2>
+          <p>
+            Use a direct API for the smallest setup. Add browser contexts, stored profiles, CDP,
+            Playwright, or Puppeteer only when your workflow needs them.
+          </p>
+        </div>
+
+        <div class="capability-grid">
+          {capabilities.map((capability, index) => (
+            <article class="capability-card" data-reveal style={`--reveal-delay: ${index * 70}ms`}>
+              <span class="card-label">{capability.label}</span>
+              <div>
+                <h3>{capability.title}</h3>
+                <p>{capability.body}</p>
+              </div>
+            </article>
+          ))}
+        </div>
+      </div>
+    </section>
+
+    <section class="section architecture" id="architecture">
+      <div class="shell architecture-grid">
+        <div class="architecture-copy" data-reveal>
+          <p class="kicker kicker-light">Under the hood</p>
+          <h2>Two parts. One simple API.</h2>
+          <p>
+            Node does what Node is already good at: running JavaScript, fetching resources, and
+            accessing the filesystem. Domjet's Rust/WASM core does the browser work: page state,
+            DOM, CSS, layout, paint, cookies, screenshots, PDF, and CDP.
+          </p>
+          <a class="text-link" href="/docs/architecture/">Explore the architecture <span>→</span></a>
+        </div>
+
+        <div class="architecture-visual" data-reveal>
+          <div class="stack" aria-label="Domjet architecture layers">
+            <div class="stack-row stack-entry">
+              <span class="stack-label">Your automation code</span>
+              <div class="stack-chips">
+                <span>Direct API</span>
+                <span>Playwright</span>
+                <span>Puppeteer</span>
+              </div>
+            </div>
+            <div class="stack-arrow" aria-hidden="true">↓</div>
+            <div class="stack-row stack-node">
+              <span class="stack-label">Node host</span>
+              <p>Runs page JS · network · timers · files</p>
+            </div>
+            <div class="stack-arrow" aria-hidden="true">↓</div>
+            <div class="stack-row stack-core">
+              <span class="stack-label">Domjet WASM core</span>
+              <div class="stack-chips">
+                <span>Page state</span>
+                <span>DOM + CSS</span>
+                <span>Layout + paint</span>
+                <span>CDP</span>
+              </div>
+            </div>
+          </div>
+
+          <dl class="term-grid" aria-label="Technical terms explained">
+            {terms.map(({ term, meaning }) => (
+              <div>
+                <dt>{term}</dt>
+                <dd>{meaning}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      </div>
+    </section>
+
+    <section class="section workflow">
+      <div class="shell workflow-grid">
+        <div class="workflow-command" data-reveal>
+          <span class="command-prompt">$</span>
+          <code id="workflow-install-command">npm install domjet</code>
+          <span class="command-cursor" aria-hidden="true"></span>
+          <button
+            class="copy-button copy-button-dark"
+            type="button"
+            data-copy-target="workflow-install-command"
+            aria-label="Copy npm install command"
+            aria-live="polite"
+          >Copy</button>
+        </div>
+        <div class="workflow-copy" data-reveal>
+          <p class="kicker">Where it fits</p>
+          <h2>Made for agents that need to browse the web.</h2>
+          <p>
+            Use Domjet when your Node application needs to understand or render a real web page
+            without carrying a full browser installation alongside it.
+          </p>
+          <ul class="use-case-list" aria-label="Domjet use cases">
+            <li>Web scraping and extraction</li>
+            <li>AI agents that browse pages</li>
+            <li>Screenshot and PDF generation</li>
+            <li>Repeatable browser workflows</li>
+          </ul>
+          <a class="button button-primary" href="/docs/">Read the documentation <span>→</span></a>
+        </div>
+      </div>
+    </section>
+
+    <section class="section faq" id="questions">
+      <div class="shell faq-grid">
+        <div class="faq-heading" data-reveal>
+          <p class="kicker">Clear answers</p>
+          <h2>What developers usually ask first.</h2>
+          <p>No hidden browser process. No vague “browser-like” shortcuts.</p>
+        </div>
+        <div class="faq-list">
+          {questions.map(({ question, answer }, index) => (
+            <details data-reveal style={`--reveal-delay: ${index * 60}ms`}>
+              <summary>
+                <span>{question}</span>
+                <i aria-hidden="true"></i>
+              </summary>
+              <p>{answer}</p>
+            </details>
+          ))}
+        </div>
+      </div>
+    </section>
+
+    <section class="closing">
+      <div class="shell closing-inner">
+        <div>
+          <p class="kicker">Built for what comes next</p>
+          <h2>Put a browser engine inside your next Node workflow.</h2>
+        </div>
+        <a class="button button-inverse" href="/docs/getting-started/">
+          Get started with Domjet
+          <span aria-hidden="true">↗</span>
+        </a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="shell footer-inner">
+      <a class="brand" href="/" aria-label="Domjet home">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <rect width="32" height="32" rx="9"></rect>
+          <path d="M9 9h7.2c4.6 0 7.8 2.8 7.8 7s-3.2 7-7.8 7H9V9Zm7 9.5c1.8 0 2.9-.9 2.9-2.5s-1.1-2.5-2.9-2.5h-2v5h2Z"></path>
+          <path class="brand-flare" d="M20 7h6l-4 4h-5l3-4Z"></path>
+        </svg>
+        <span>domjet</span>
+      </a>
+      <p>The lightweight browser for AI agents.</p>
+      <nav aria-label="Footer navigation">
+        <a href="/docs/">Docs</a>
+        <a href="/docs/compatibility/">Compatibility</a>
+        <a href="/sitemap-index.xml">Sitemap</a>
+        <a href="https://github.com/VAIBHAVSING/domjet">Source</a>
+      </nav>
+      <small>Domjet · Apache-2.0 · Based on <a href="https://github.com/h4ckf0r0day/obscura">Obscura</a></small>
+    </div>
+  </footer>
+
+  <script is:inline>
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const revealItems = document.querySelectorAll("[data-reveal]");
+    const menuToggle = document.querySelector(".menu-toggle");
+    const primaryNavigation = document.querySelector("#primary-navigation");
+
+    const closeMenu = () => {
+      if (!(menuToggle instanceof HTMLButtonElement) || !(primaryNavigation instanceof HTMLElement)) return;
+      menuToggle.setAttribute("aria-expanded", "false");
+      menuToggle.setAttribute("aria-label", "Open navigation");
+      primaryNavigation.classList.remove("is-open");
+    };
+
+    if (menuToggle instanceof HTMLButtonElement && primaryNavigation instanceof HTMLElement) {
+      menuToggle.addEventListener("click", () => {
+        const isOpen = menuToggle.getAttribute("aria-expanded") === "true";
+        menuToggle.setAttribute("aria-expanded", String(!isOpen));
+        menuToggle.setAttribute("aria-label", isOpen ? "Open navigation" : "Close navigation");
+        primaryNavigation.classList.toggle("is-open", !isOpen);
+
+        if (!isOpen) {
+          primaryNavigation.querySelector("a")?.focus();
+        }
+      });
+
+      primaryNavigation.addEventListener("click", (event) => {
+        if (event.target instanceof HTMLAnchorElement) closeMenu();
+      });
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && menuToggle.getAttribute("aria-expanded") === "true") {
+          closeMenu();
+          menuToggle.focus();
+        }
+      });
+
+      document.addEventListener("click", (event) => {
+        if (
+          event.target instanceof Node &&
+          !primaryNavigation.contains(event.target) &&
+          !menuToggle.contains(event.target)
+        ) closeMenu();
+      });
+    }
+
+    const sectionLinks = document.querySelectorAll('.site-nav a[href^="#"]');
+    let sectionUpdateQueued = false;
+
+    const updateActiveSection = () => {
+      sectionUpdateQueued = false;
+      let currentId = "";
+
+      sectionLinks.forEach((link) => {
+        if (!(link instanceof HTMLAnchorElement)) return;
+        const section = document.querySelector(link.hash);
+        if (!(section instanceof HTMLElement)) return;
+        const bounds = section.getBoundingClientRect();
+        if (bounds.top <= window.innerHeight * 0.42 && bounds.bottom > 96) {
+          currentId = section.id;
+        }
+      });
+
+      sectionLinks.forEach((link) => {
+        if (!(link instanceof HTMLAnchorElement)) return;
+        const isCurrent = link.hash === `#${currentId}`;
+        link.classList.toggle("is-active", isCurrent);
+        if (isCurrent) link.setAttribute("aria-current", "true");
+        else link.removeAttribute("aria-current");
+      });
+    };
+
+    const queueSectionUpdate = () => {
+      if (sectionUpdateQueued) return;
+      sectionUpdateQueued = true;
+      requestAnimationFrame(updateActiveSection);
+    };
+
+    window.addEventListener("scroll", queueSectionUpdate, { passive: true });
+    window.addEventListener("resize", queueSectionUpdate);
+    updateActiveSection();
+
+    const copyText = async (text) => {
+      if (!navigator.clipboard || !window.isSecureContext) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+    };
+
+    document.querySelectorAll("[data-copy-target]").forEach((button) => {
+      if (!(button instanceof HTMLButtonElement)) return;
+
+      button.addEventListener("click", async () => {
+        const targetId = button.dataset.copyTarget;
+        const target = targetId ? document.getElementById(targetId) : null;
+        if (!target) return;
+
+        try {
+          await copyText(target.textContent?.trim() ?? "");
+          button.textContent = "Copied";
+          button.classList.add("is-copied");
+          window.setTimeout(() => {
+            button.textContent = "Copy";
+            button.classList.remove("is-copied");
+          }, 1800);
+        } catch {
+          const selection = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(target);
+          selection?.removeAllRanges();
+          selection?.addRange(range);
+          button.textContent = "Text selected";
+          window.setTimeout(() => {
+            button.textContent = "Copy";
+          }, 1800);
+        }
+      });
+    });
+
+    if (reducedMotion || !("IntersectionObserver" in window)) {
+      revealItems.forEach((item) => item.classList.add("is-visible"));
+    } else {
+      const observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (!entry.isIntersecting) return;
+            entry.target.classList.add("is-visible");
+            observer.unobserve(entry.target);
+          });
+        },
+        { threshold: 0.14, rootMargin: "0px 0px -48px" },
+      );
+
+      revealItems.forEach((item) => observer.observe(item));
+    }
+  </script>
+</BaseLayout>
