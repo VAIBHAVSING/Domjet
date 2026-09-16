@@ -10706,6 +10706,26 @@ mod tests {
         assert_eq!(result.as_f64().unwrap() as usize, 180_000);
     }
 
+    // #996: btoa maps each code unit to one Latin-1 byte and throws for code
+    // points above 0xFF — it must not UTF-8-encode the input.
+    #[test]
+    fn btoa_encodes_latin1_not_utf8() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // é (U+00E9) is the single byte 0xE9 -> "6Q==", not UTF-8's "w6k=".
+        assert_eq!(rt.evaluate("btoa('é')").unwrap(), serde_json::json!("6Q=="));
+        assert_eq!(
+            rt.evaluate("btoa('hello')").unwrap(),
+            serde_json::json!("aGVsbG8=")
+        );
+        // A code point above 0xFF must throw InvalidCharacterError.
+        let name = rt
+            .evaluate(
+                r#"(() => { try { btoa('\u{1F600}'); return 'no-throw'; } catch (e) { return e.name; } })()"#,
+            )
+            .unwrap();
+        assert_eq!(name, serde_json::json!("InvalidCharacterError"));
+    }
+
     #[test]
     fn navigation_api_updates_current_entry_state() {
         let mut rt = setup_runtime("<html><body></body></html>");
