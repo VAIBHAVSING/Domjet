@@ -2884,6 +2884,9 @@ mod tests {
             "queue-microtask-contract",
             r#"
                 globalThis.__queueMicrotaskState = { order: ["sync"], errors: [] };
+                globalThis.reportError = error => {
+                    __queueMicrotaskState.reported = error.message;
+                };
                 for (const value of [undefined, null, 1, "callback"]) {
                     try { queueMicrotask(value); }
                     catch (error) { __queueMicrotaskState.errors.push(error.name); }
@@ -2891,6 +2894,7 @@ mod tests {
                 __queueMicrotaskState.returned = queueMicrotask(() => {
                     __queueMicrotaskState.order.push("microtask");
                 }) === undefined;
+                queueMicrotask(() => { throw new Error("microtask boom"); });
                 setTimeout(() => __queueMicrotaskState.order.push("timer"), 0);
             "#,
         )
@@ -2902,6 +2906,7 @@ mod tests {
             serde_json::json!({
                 "order": ["sync", "microtask", "timer"],
                 "errors": ["TypeError", "TypeError", "TypeError", "TypeError"],
+                "reported": "microtask boom",
                 "returned": true,
             }),
         );

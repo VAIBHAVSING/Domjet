@@ -1781,7 +1781,11 @@ impl PortableCdp {
                                 .map(move |(session, connection)| (target_id.clone(), session, connection))
             })
             .collect::<Vec<_>>();
-        let response = obscura_cdp::portable_dispatch::dispatch_browser(&shared_request, &mut self.shared_state)?;
+        let response = obscura_cdp::portable_dispatch::dispatch_browser(
+            &shared_request,
+            &mut self.shared_state,
+            trusted_cookie_clock(),
+        )?;
         if response.error.is_none() {
             match request.method.as_str() {
                 "Target.createBrowserContext" => {
@@ -1923,17 +1927,7 @@ impl PortableCdp {
             .and_then(Value::as_str)
             .unwrap_or("default");
         let parsed_context = shared_context_id(context);
-        let now = match cookie_clock(&request.params) {
-            Ok(now) => now,
-            Err(message) => {
-                return Some(cdp_error_response(
-                    &request.id,
-                    -32602,
-                    message,
-                    request.session_id.as_deref(),
-                ))
-            }
-        };
+        let now = trusted_cookie_clock();
         if let Some(context) = parsed_context.filter(|context| self.shared_state.context(context).is_some()) {
             self.merge_context_cookie_mirrors(context, now);
         }
@@ -1946,6 +1940,7 @@ impl PortableCdp {
         let response = obscura_cdp::portable_storage::dispatch_browser(
             &shared_request,
             &mut self.shared_state,
+            now,
         );
         if response.error.is_none() && request.method == "Storage.setCookies" {
             if let Some(context) = parsed_context {
@@ -2054,7 +2049,7 @@ impl PortableCdp {
                 );
             }
         }
-        let now = cookie_clock(&request.params).unwrap_or(0);
+        let now = trusted_cookie_clock();
         if obscura_cdp::portable_storage::supports(&request.method) {
             let existing = self
                 .targets
@@ -2084,6 +2079,7 @@ impl PortableCdp {
                 &mut self.shared_state,
                 page_id,
                 shared_session,
+                now,
                 &mut backend,
             )?;
             (output.response, output.events)
@@ -2373,10 +2369,7 @@ impl PortableCdp {
                 let Some(target) = self.targets.get_mut(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
-                let now = match cookie_clock(&request.params) {
-                    Ok(value) => value,
-                    Err(error) => return cdp_error_response(&request.id, -32602, error, session),
-                };
+                let now = trusted_cookie_clock();
                 let raw = match target.core.cdp_all_cookies(now) {
                     Ok(value) => value,
                     Err(error) => return cdp_error_response(&request.id, -32000, error, session),
@@ -2392,10 +2385,7 @@ impl PortableCdp {
                 let Some(target) = self.targets.get_mut(&target_id) else {
                     return cdp_error_response(&request.id, -32000, "target is not known", session);
                 };
-                let now = match cookie_clock(&request.params) {
-                    Ok(value) => value,
-                    Err(error) => return cdp_error_response(&request.id, -32602, error, session),
-                };
+                let now = trusted_cookie_clock();
                 let import = match cdp_cookie_import(&request.params, &page_url) {
                     Ok(value) => value,
                     Err(error) => return cdp_error_response(&request.id, -32602, error, session),
@@ -3149,12 +3139,21 @@ const MAX_CDP_COOKIE_BYTES: usize = 64 * 1024;
 const MAX_EXTRA_HEADER_COUNT: usize = 128;
 const MAX_EXTRA_HEADER_BYTES: usize = 128 * 1024;
 
-fn cookie_clock(params: &Map<String, Value>) -> Result<u64, String> {
-    match params.get("_obscuraNowSecs") {
-        None => Ok(0),
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| "_obscuraNowSecs must be a non-negative integer".to_string()),
+fn trusted_cookie_clock() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let seconds = (js_sys::Date::now() / 1000.0).floor();
+        if seconds.is_finite() && seconds > 0.0 {
+            seconds.min(u64::MAX as f64) as u64
+        } else {
+            0
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs())
     }
 }
 
@@ -4110,12 +4109,12 @@ mod tests {
             .unwrap());
         let session = attached["result"]["sessionId"].as_str().unwrap();
         let set = format!(
-            r#"{{"id":2,"sessionId":"{session}","method":"Network.setCookies","params":{{"_obscuraNowSecs":100,"cookies":[{{"name":"sid","value":"abc","domain":"example.test","path":"/","httpOnly":true}}]}}}}"#
+            r#"{{"id":2,"sessionId":"{session}","method":"Network.setCookies","params":{{"cookies":[{{"name":"sid","value":"abc","domain":"example.test","path":"/","httpOnly":true}}]}}}}"#
         );
         assert_eq!(json(&cdp.cdp_request(connection, &set).unwrap())["result"], json!({}));
 
         let get = format!(
-            r#"{{"id":3,"sessionId":"{session}","method":"Network.getAllCookies","params":{{"_obscuraNowSecs":100}}}}"#
+            r#"{{"id":3,"sessionId":"{session}","method":"Network.getAllCookies","params":{{}}}}"#
         );
         let cookies = json(&cdp.cdp_request(connection, &get).unwrap());
         assert_eq!(cookies["result"]["cookies"][0]["name"], "sid");
@@ -4138,7 +4137,7 @@ mod tests {
             r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
         ).unwrap());
         let first_session = first["result"]["sessionId"].as_str().unwrap().to_string();
-        let set = format!(r#"{{"id":2,"sessionId":"{first_session}","method":"Storage.setCookies","params":{{"_obscuraNowSecs":100,"cookies":[{{"name":"ctx","value":"yes","domain":"example.test","path":"/"}}]}}}}"#);
+        let set = format!(r#"{{"id":2,"sessionId":"{first_session}","method":"Storage.setCookies","params":{{"cookies":[{{"name":"ctx","value":"yes","domain":"example.test","path":"/"}}]}}}}"#);
         assert_eq!(json(&cdp.cdp_request(connection, &set).unwrap())["result"], json!({}));
         let created = json(&cdp.cdp_request(
             connection,
@@ -4152,7 +4151,7 @@ mod tests {
         let second_session = second["result"]["sessionId"].as_str().unwrap();
         let get = json(&cdp.cdp_request(
             connection,
-            &format!(r#"{{"id":5,"sessionId":"{second_session}","method":"Network.getAllCookies","params":{{"_obscuraNowSecs":100}}}}"#),
+            &format!(r#"{{"id":5,"sessionId":"{second_session}","method":"Network.getAllCookies","params":{{}}}}"#),
         ).unwrap());
         assert_eq!(get["result"]["cookies"][0]["name"], "ctx");
     }

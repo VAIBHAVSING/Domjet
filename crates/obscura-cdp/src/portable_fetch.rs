@@ -140,7 +140,8 @@ fn resolve(
     payload: Value,
 ) -> CdpResponse {
     match state.queue_fetch_resolution(&page_id, request_id, payload) {
-        Ok(_) => CdpResponse::success(request.id, json!({}), request.session_id.clone()),
+        Ok(true) => CdpResponse::success(request.id, json!({}), request.session_id.clone()),
+        Ok(false) => error(request, -32602, "Invalid InterceptionId"),
         Err(error) => failure(request, error),
     }
 }
@@ -339,6 +340,13 @@ mod tests {
         let values = state.drain_fetch_resolutions(&page, 8);
         assert_eq!(values[0]["action"], "continue");
         assert!(state.drain_fetch_resolutions(&page, 8).is_empty());
+        let stale = dispatch(
+            &request(3, "Fetch.continueRequest", json!({"requestId": "req-1"}), wire_session),
+            &mut state,
+            page,
+            Some(session),
+        );
+        assert_eq!(stale.error.unwrap().code, -32602);
     }
 
     #[test]

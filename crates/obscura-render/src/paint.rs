@@ -340,14 +340,15 @@ pub fn css_resource_requests(css: &str, base: &url::Url) -> Vec<CssResourceReque
         }
         let Some(end) = end else { break };
         let raw = rest[4..end].trim();
-        let value = if raw.len() >= 2
+        let value = (if raw.len() >= 2
             && ((raw.starts_with('"') && raw.ends_with('"'))
                 || (raw.starts_with('\'') && raw.ends_with('\'')))
         {
             &raw[1..raw.len() - 1]
         } else {
             raw
-        };
+        })
+        .trim();
         if !value.is_empty()
             && !value.starts_with('#')
             && !value.starts_with("data:")
@@ -17242,9 +17243,6 @@ mod tests {
             vec![
                 "http://insecure.test/img.png".to_string(),
                 "https://secure.test/img.png".to_string(),
-                // The URL parser trims an all-whitespace reference and joins
-                // the resulting empty relative URL to the stylesheet base.
-                "https://example.test/style.css".to_string(),
                 "https://example.test/unquoted.png".to_string(),
                 "https://example.test/spaced.png".to_string(),
             ]

@@ -338,6 +338,12 @@ pub struct HostActionWireView<'a> {
     pub metadata: HostActionMetadata<'a>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct EventQueue {
+    entries: VecDeque<(CdpEvent, usize)>,
+    bytes: usize,
+}
+
 struct ByteCounter(usize);
 
 impl Write for ByteCounter {
@@ -375,7 +381,7 @@ pub struct BrowserState {
     sessions: BTreeMap<SessionId, PageId>,
     session_connections: BTreeMap<SessionId, ConnectionId>,
     #[serde(skip)]
-    events: BTreeMap<ConnectionId, VecDeque<CdpEvent>>,
+    events: BTreeMap<ConnectionId, EventQueue>,
     actions: BTreeMap<ActionId, PendingAction>,
     #[serde(skip)]
     ready_host_actions: Option<VecDeque<ActionId>>,
@@ -722,7 +728,7 @@ impl BrowserState {
     }
 
     pub fn event_count(&self, connection: ConnectionId) -> usize {
-        self.events.get(&connection).map_or(0, VecDeque::len)
+        self.events.get(&connection).map_or(0, |queue| queue.entries.len())
     }
 
     /// Queue one bounded event for a live connection. Oldest events are
@@ -736,16 +742,16 @@ impl BrowserState {
         if event_bytes.len() > MAX_EVENT_BYTES_PER_CONNECTION {
             return Err(CdpFailure::invalid_argument("CDP event exceeds the byte limit"));
         }
+        let event_size = event_bytes.len();
         let queue = self.events.entry(connection).or_default();
-        queue.push_back(event);
-        while queue.len() > MAX_EVENTS_PER_CONNECTION
-            || queue
-                .iter()
-                .map(|event| serde_json::to_vec(event).map_or(usize::MAX, |bytes| bytes.len()))
-                .sum::<usize>()
-                > MAX_EVENT_BYTES_PER_CONNECTION
+        queue.bytes = queue.bytes.saturating_add(event_size);
+        queue.entries.push_back((event, event_size));
+        while queue.entries.len() > MAX_EVENTS_PER_CONNECTION
+            || queue.bytes > MAX_EVENT_BYTES_PER_CONNECTION
         {
-            if queue.pop_front().is_none() {
+            if let Some((_, removed_size)) = queue.entries.pop_front() {
+                queue.bytes = queue.bytes.saturating_sub(removed_size);
+            } else {
                 break;
             }
         }
@@ -780,20 +786,24 @@ impl BrowserState {
         let mut bytes = 0usize;
         let mut drained = Vec::new();
         while drained.len() < max_items.min(MAX_EVENTS_PER_CONNECTION) {
-            let Some(event) = queue.front() else {
+            let Some((_, serialized_size)) = queue.entries.front() else {
                 break;
             };
-            let event_size = serde_json::to_vec(event)
-                .ok()
-                .and_then(|value| value.len().checked_add(frame_overhead))
+            let event_size = serialized_size
+                .checked_add(frame_overhead)
                 .unwrap_or(usize::MAX);
             if event_size > max_bytes || bytes.saturating_add(event_size) > max_bytes {
                 break;
             }
             bytes = bytes.saturating_add(event_size);
-            drained.push(queue.pop_front().expect("event queue front remains present"));
+            let (event, serialized_size) = queue
+                .entries
+                .pop_front()
+                .expect("event queue front remains present");
+            queue.bytes = queue.bytes.saturating_sub(serialized_size);
+            drained.push(event);
         }
-        if queue.is_empty() {
+        if queue.entries.is_empty() {
             self.events.remove(&connection);
         }
         drained
@@ -801,8 +811,11 @@ impl BrowserState {
 
     pub fn discard_session_events(&mut self, connection: ConnectionId, session: &str) {
         if let Some(queue) = self.events.get_mut(&connection) {
-            queue.retain(|event| event.session_id.as_deref() != Some(session));
-            if queue.is_empty() {
+            queue
+                .entries
+                .retain(|(event, _)| event.session_id.as_deref() != Some(session));
+            queue.bytes = queue.entries.iter().map(|(_, size)| *size).sum();
+            if queue.entries.is_empty() {
                 self.events.remove(&connection);
             }
         }

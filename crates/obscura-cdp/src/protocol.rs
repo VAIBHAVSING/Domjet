@@ -106,8 +106,10 @@ pub fn parse_request(bytes: &[u8]) -> Result<CdpRequest, ProtocolError> {
     if bytes.len() > MAX_MESSAGE_BYTES {
         return Err(ProtocolError { code: -32000, message: format!("CDP command exceeds {MAX_MESSAGE_BYTES} bytes") });
     }
-    let request: crate::types::CdpRequest = serde_json::from_slice(bytes)
+    let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| ProtocolError::parse_error(format!("Invalid CDP JSON: {error}")))?;
+    let request: CdpRequest = serde_json::from_value(value)
+        .map_err(|error| ProtocolError::invalid_request(format!("Invalid CDP request: {error}")))?;
     if request.method.is_empty() || request.method.len() > MAX_METHOD_BYTES {
         return Err(ProtocolError::invalid_request("CDP command method must be a bounded string"));
     }
@@ -159,6 +161,10 @@ mod tests {
         assert_eq!(request.method, "Runtime.enable");
         let error = parse_request(br#"{"id":1,"method":""}"#).unwrap_err();
         assert_eq!(error.code, -32600);
+        let error = parse_request(br#"{"id":"bad","method":"Runtime.enable"}"#).unwrap_err();
+        assert_eq!(error.code, -32600);
+        let error = parse_request(br#"{"id":1,"method":"Runtime.enable"#).unwrap_err();
+        assert_eq!(error.code, -32700);
     }
 
     #[test]

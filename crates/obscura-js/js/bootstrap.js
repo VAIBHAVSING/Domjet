@@ -1043,7 +1043,7 @@ globalThis.queueMicrotask = function queueMicrotask(callback) {
   }
   // Do not return the Promise: queueMicrotask returns undefined. The host's
   // end-of-task checkpoint drains this reaction before the next browser task.
-  _resolvedMicrotaskPromise.then(callback);
+  _resolvedMicrotaskPromise.then(callback).catch((error) => globalThis.reportError(error));
 };
 
 // Browser posted tasks need an event-loop boundary but no clock delay. Tokio's

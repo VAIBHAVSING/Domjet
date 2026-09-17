@@ -14,12 +14,12 @@ for f in "$DIR"/*.html; do
   fixture_url="$($PYTHON - "$f" <<'PY'
 import pathlib
 import sys
-import urllib.parse
 
-print("data:text/html," + urllib.parse.quote(pathlib.Path(sys.argv[1]).read_text(), safe=""))
+print(pathlib.Path(sys.argv[1]).resolve().as_uri())
 PY
 )"
-  if ! timeout 60 "$BIN" screenshot "$fixture_url" "$OUT/$n.obscura.png" \
+  if ! OBSCURA_SHOT_W=900 OBSCURA_SHOT_H=1000 OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
+    timeout 60 "$BIN" screenshot "$fixture_url" "$OUT/$n.obscura.png" \
       --timeout 30000 >"$OUT/$n.obscura.log" 2>&1 || [[ ! -s "$OUT/$n.obscura.png" ]]; then
     echo "FAILED obscura: $n (see $OUT/$n.obscura.log)" >&2
     status=1

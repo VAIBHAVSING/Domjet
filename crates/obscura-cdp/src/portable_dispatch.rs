@@ -32,9 +32,13 @@ pub fn supports_browser(method: &str) -> bool {
 }
 
 /// Dispatch a state-only Browser/Target command.
-pub fn dispatch_browser(request: &CdpRequest, state: &mut BrowserState) -> Option<CdpResponse> {
+pub fn dispatch_browser(
+    request: &CdpRequest,
+    state: &mut BrowserState,
+    now_secs: u64,
+) -> Option<CdpResponse> {
     if crate::portable_storage::supports_browser(&request.method) {
-        return Some(crate::portable_storage::dispatch_browser(request, state));
+        return Some(crate::portable_storage::dispatch_browser(request, state, now_secs));
     }
     crate::portable_target::supports(&request.method)
         .then(|| crate::portable_target::dispatch(request, state))
@@ -82,8 +86,9 @@ pub fn dispatch_page(
     state: &mut BrowserState,
     page_id: PageId,
     session_id: Option<SessionId>,
+    now_secs: u64,
 ) -> Option<CdpResponse> {
-    dispatch_page_impl(request, state, page_id, session_id, None).map(|output| output.response)
+    dispatch_page_impl(request, state, page_id, session_id, now_secs, None).map(|output| output.response)
 }
 
 /// Dispatch one page command with a portable DOM backend. This is the cutover
@@ -94,9 +99,10 @@ pub fn dispatch_page_with_dom<B: crate::portable_dom::DomBackend>(
     state: &mut BrowserState,
     page_id: PageId,
     session_id: Option<SessionId>,
+    now_secs: u64,
     backend: &mut B,
 ) -> Option<PageDispatch> {
-    dispatch_page_impl(request, state, page_id, session_id, Some(backend))
+    dispatch_page_impl(request, state, page_id, session_id, now_secs, Some(backend))
 }
 
 fn dispatch_page_impl(
@@ -104,11 +110,12 @@ fn dispatch_page_impl(
     state: &mut BrowserState,
     page_id: PageId,
     session_id: Option<SessionId>,
+    now_secs: u64,
     mut backend: Option<&mut dyn crate::portable_dom::DomBackend>,
 ) -> Option<PageDispatch> {
     if crate::portable_storage::supports(&request.method) {
         return Some(PageDispatch::response(crate::portable_storage::dispatch(
-            request, state, page_id,
+            request, state, page_id, now_secs,
         )));
     }
     if crate::portable_fetch::supports(&request.method) {
@@ -179,7 +186,7 @@ mod tests {
     #[test]
     fn routes_browser_and_page_domains_without_transport_state() {
         let mut state = BrowserState::new();
-        let version = dispatch_browser(&request(1, "Browser.getVersion", json!({})), &mut state)
+        let version = dispatch_browser(&request(1, "Browser.getVersion", json!({})), &mut state, 0)
             .expect("Browser command should be shared");
         assert_eq!(version.result.unwrap()["product"], "Obscura/WASM");
 
@@ -191,6 +198,7 @@ mod tests {
             &mut state,
             page,
             None,
+            0,
         )
         .expect("Page command should be shared");
         assert_eq!(
@@ -204,7 +212,7 @@ mod tests {
     fn unsupported_host_commands_are_left_for_the_adapter() {
         let mut state = BrowserState::new();
         let request = request(1, "Runtime.evaluate", json!({"expression": "1 + 1"}));
-        assert!(dispatch_browser(&request, &mut state).is_none());
-        assert!(dispatch_page(&request, &mut state, PageId::new(1), None).is_none());
+        assert!(dispatch_browser(&request, &mut state, 0).is_none());
+        assert!(dispatch_page(&request, &mut state, PageId::new(1), None, 0).is_none());
     }
 }

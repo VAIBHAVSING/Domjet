@@ -18,6 +18,47 @@ impl Display for PlatformError {
 
 impl std::error::Error for PlatformError {}
 
+pub const MAX_KDF_OUTPUT_BYTES: u32 = 1024 * 1024;
+pub const MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
+pub const MAX_PBKDF2_WORK_UNITS: u64 = 1_000_000;
+
+pub fn validate_pbkdf2_parameters(
+    hash: &str,
+    iterations: u32,
+    length: u32,
+) -> Result<(), PlatformError> {
+    let digest_bytes = match hash {
+        "SHA-1" => 20u64,
+        "SHA-256" => 32,
+        "SHA-384" => 48,
+        "SHA-512" => 64,
+        _ => return Err(PlatformError::new("unsupported PBKDF2 hash")),
+    };
+    if iterations == 0 || iterations > MAX_PBKDF2_ITERATIONS {
+        return Err(PlatformError::new(format!(
+            "PBKDF2 iterations must be between 1 and {MAX_PBKDF2_ITERATIONS}"
+        )));
+    }
+    if length > MAX_KDF_OUTPUT_BYTES {
+        return Err(PlatformError::new(format!(
+            "PBKDF2 output exceeds the {MAX_KDF_OUTPUT_BYTES}-byte platform limit"
+        )));
+    }
+    let blocks = u64::from(length)
+        .checked_add(digest_bytes - 1)
+        .ok_or_else(|| PlatformError::new("PBKDF2 work calculation overflow"))?
+        / digest_bytes;
+    let work = u64::from(iterations)
+        .checked_mul(blocks)
+        .ok_or_else(|| PlatformError::new("PBKDF2 work calculation overflow"))?;
+    if work > MAX_PBKDF2_WORK_UNITS {
+        return Err(PlatformError::new(format!(
+            "PBKDF2 request exceeds the {MAX_PBKDF2_WORK_UNITS}-unit platform work limit"
+        )));
+    }
+    Ok(())
+}
+
 /// Hash data with a normalized SubtleCrypto digest algorithm name.
 pub fn subtle_digest(algorithm: &str, data: &[u8]) -> Vec<u8> {
     use sha1::Digest as _;
@@ -196,6 +237,7 @@ pub fn subtle_pbkdf2(
     length: u32,
 ) -> Result<Vec<u8>, PlatformError> {
     use pbkdf2::pbkdf2_hmac;
+    validate_pbkdf2_parameters(hash, iterations, length)?;
     let mut output = vec![0u8; length as usize];
     match hash {
         "SHA-1" => pbkdf2_hmac::<sha1::Sha1>(password, salt, iterations, &mut output),
@@ -292,5 +334,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(bytes, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn pbkdf2_rejects_unbounded_native_work_before_allocation() {
+        assert!(validate_pbkdf2_parameters("SHA-256", 500_000, 64).is_ok());
+        assert!(subtle_pbkdf2("SHA-256", b"p", b"s", 0, 32).is_err());
+        assert!(subtle_pbkdf2(
+            "SHA-256",
+            b"p",
+            b"s",
+            MAX_PBKDF2_ITERATIONS,
+            64,
+        )
+        .is_err());
+        assert!(subtle_pbkdf2(
+            "SHA-256",
+            b"p",
+            b"s",
+            1,
+            MAX_KDF_OUTPUT_BYTES + 1,
+        )
+        .is_err());
     }
 }

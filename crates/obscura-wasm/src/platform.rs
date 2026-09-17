@@ -15,39 +15,15 @@ const MAX_PLATFORM_BINARY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PLATFORM_STRING_BYTES: usize = 1024 * 1024;
 const MAX_PLATFORM_LABEL_BYTES: usize = 256;
 const MAX_RANDOM_BYTES: u32 = 65_536;
-const MAX_KDF_OUTPUT_BYTES: u32 = 1024 * 1024;
-const MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
-// PBKDF2 performs one PRF invocation per iteration for every digest-sized
-// output block. Bound that product as well as each independent input so a
-// request cannot combine both maxima into billions of synchronous HMACs.
-const MAX_PBKDF2_WORK_UNITS: u64 = 1_000_000;
-
-fn pbkdf2_digest_bytes(hash: &str) -> Option<u64> {
-    match hash {
-        "SHA-1" => Some(20),
-        "SHA-256" => Some(32),
-        "SHA-384" => Some(48),
-        "SHA-512" => Some(64),
-        _ => None,
-    }
-}
+const MAX_KDF_OUTPUT_BYTES: u32 = portable::MAX_KDF_OUTPUT_BYTES;
+const MAX_PBKDF2_ITERATIONS: u32 = portable::MAX_PBKDF2_ITERATIONS;
 
 fn require_pbkdf2_work(hash: &str, iterations: u32, length: u32) -> Result<(), DispatchError> {
-    let digest_bytes = pbkdf2_digest_bytes(hash)
-        .ok_or_else(|| dispatch_error("unsupported PBKDF2 hash"))?;
-    let blocks = u64::from(length)
-        .checked_add(digest_bytes - 1)
-        .ok_or_else(|| range_error("PBKDF2 work calculation overflow"))?
-        / digest_bytes;
-    let work = u64::from(iterations)
-        .checked_mul(blocks)
-        .ok_or_else(|| range_error("PBKDF2 work calculation overflow"))?;
-    if work > MAX_PBKDF2_WORK_UNITS {
-        return Err(range_error(format!(
-            "PBKDF2 request exceeds the {MAX_PBKDF2_WORK_UNITS}-unit platform work limit"
-        )));
+    if !matches!(hash, "SHA-1" | "SHA-256" | "SHA-384" | "SHA-512") {
+        return Err(dispatch_error("unsupported PBKDF2 hash"));
     }
-    Ok(())
+    portable::validate_pbkdf2_parameters(hash, iterations, length)
+        .map_err(range_error)
 }
 
 fn panic_message(payload: Box<dyn Any + Send>) -> String {

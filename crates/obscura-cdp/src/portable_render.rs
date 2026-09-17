@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
 
 use crate::portable_io::IoState;
-use crate::protocol::{CdpRequest, CdpResponse};
+use crate::protocol::{CdpRequest, CdpResponse, MAX_OUTPUT_BYTES};
 use crate::state::ConnectionId;
 
 pub const MAX_RENDER_RESULT_BYTES: usize = 16 * 1024 * 1024;
@@ -36,6 +36,21 @@ pub trait RenderBackend {
 
 fn error(request: &CdpRequest, code: i64, message: impl Into<String>) -> CdpResponse {
     CdpResponse::error(request.id, code, message.into(), request.session_id.clone())
+}
+
+fn inline_base64_fits(request: &CdpRequest, empty_result: Value, raw_bytes: usize) -> bool {
+    let response = CdpResponse::success(request.id, empty_result, request.session_id.clone());
+    let Some(encoded_bytes) = raw_bytes
+        .checked_add(2)
+        .map(|value| value / 3)
+        .and_then(|value| value.checked_mul(4))
+    else {
+        return false;
+    };
+    serde_json::to_vec(&response)
+        .ok()
+        .and_then(|envelope| envelope.len().checked_add(encoded_bytes))
+        .is_some_and(|total| total <= MAX_OUTPUT_BYTES)
 }
 
 fn boolean(params: &Value, name: &str, default: bool) -> Result<bool, String> {
@@ -249,11 +264,16 @@ pub fn dispatch<B: RenderBackend>(
                 Err(message) => return Some(error(request, -32602, message)),
             };
             match backend.capture_screenshot(&options) {
-                Ok(bytes) if bytes.len() <= MAX_RENDER_RESULT_BYTES => Some(CdpResponse::success(
-                    request.id,
-                    json!({"data": BASE64.encode(bytes), "fromSurface": true}),
-                    request.session_id.clone(),
-                )),
+                Ok(bytes) if bytes.len() <= MAX_RENDER_RESULT_BYTES => {
+                    if !inline_base64_fits(request, json!({"data": "", "fromSurface": true}), bytes.len()) {
+                        return Some(error(request, -32000, "portable screenshot exceeds the response limit"));
+                    }
+                    Some(CdpResponse::success(
+                        request.id,
+                        json!({"data": BASE64.encode(bytes), "fromSurface": true}),
+                        request.session_id.clone(),
+                    ))
+                }
                 Ok(_) => Some(error(
                     request,
                     -32000,
@@ -289,6 +309,9 @@ pub fn dispatch<B: RenderBackend>(
                     json!({"data": "", "stream": handle}),
                     request.session_id.clone(),
                 ));
+            }
+            if !inline_base64_fits(request, json!({"data": ""}), bytes.len()) {
+                return Some(error(request, -32000, "portable PDF exceeds the response limit"));
             }
             Some(CdpResponse::success(
                 request.id,
@@ -411,5 +434,16 @@ mod tests {
         assert_eq!(options.clip.unwrap().width, 100.0);
         assert!(options.capture_beyond_viewport);
         assert!(screenshot_options(&json!({"clip": {"x": 0, "y": 0, "width": 0, "height": 1, "scale": 1}})).is_err());
+    }
+
+    #[test]
+    fn inline_base64_results_reserve_the_complete_protocol_envelope() {
+        let request = request(9, "Page.captureScreenshot", json!({}));
+        assert!(inline_base64_fits(&request, json!({"data": ""}), 1));
+        assert!(!inline_base64_fits(
+            &request,
+            json!({"data": "", "fromSurface": true}),
+            MAX_OUTPUT_BYTES,
+        ));
     }
 }

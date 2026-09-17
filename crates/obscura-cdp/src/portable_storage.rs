@@ -44,15 +44,6 @@ pub fn supports_browser(method: &str) -> bool {
     matches!(method, "Storage.getCookies" | "Storage.setCookies")
 }
 
-fn now_secs(params: &Value) -> Result<u64, CdpFailure> {
-    match params.get("_obscuraNowSecs") {
-        None => Ok(0),
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| CdpFailure::invalid_argument("_obscuraNowSecs must be a non-negative integer")),
-    }
-}
-
 fn page_url(state: &BrowserState, page: &PageId) -> Result<String, CdpFailure> {
     state
         .page(page)
@@ -154,18 +145,18 @@ fn context_id(state: &BrowserState, params: &Value) -> Result<ContextId, CdpFail
         .ok_or(CdpFailure::UnknownContext(context))
 }
 
-pub fn dispatch_browser(request: &CdpRequest, state: &mut BrowserState) -> CdpResponse {
+pub fn dispatch_browser(
+    request: &CdpRequest,
+    state: &mut BrowserState,
+    now_secs: u64,
+) -> CdpResponse {
     let context = match context_id(state, &request.params) {
         Ok(context) => context,
         Err(error) => return failure(request, error),
     };
     match request.method.as_str() {
         "Storage.getCookies" => {
-            let now = match now_secs(&request.params) {
-                Ok(value) => value,
-                Err(error) => return failure(request, error),
-            };
-            match state.context_cookies_for_context(&context, now) {
+            match state.context_cookies_for_context(&context, now_secs) {
                 Ok(cookies) => CdpResponse::success(
                     request.id,
                     json!({"cookies": cookies}),
@@ -175,15 +166,11 @@ pub fn dispatch_browser(request: &CdpRequest, state: &mut BrowserState) -> CdpRe
             }
         }
         "Storage.setCookies" => {
-            let now = match now_secs(&request.params) {
-                Ok(value) => value,
-                Err(error) => return failure(request, error),
-            };
             let cookies = match parse_cookie_values(&request.params, "") {
                 Ok(value) => value,
                 Err(error) => return failure(request, error),
             };
-            match state.merge_context_cookies_for_context(&context, cookies, now) {
+            match state.merge_context_cookies_for_context(&context, cookies, now_secs) {
                 Ok(()) => CdpResponse::success(request.id, json!({}), request.session_id.clone()),
                 Err(error) => failure(request, error),
             }
@@ -192,14 +179,15 @@ pub fn dispatch_browser(request: &CdpRequest, state: &mut BrowserState) -> CdpRe
     }
 }
 
-pub fn dispatch(request: &CdpRequest, state: &mut BrowserState, page_id: PageId) -> CdpResponse {
+pub fn dispatch(
+    request: &CdpRequest,
+    state: &mut BrowserState,
+    page_id: PageId,
+    now_secs: u64,
+) -> CdpResponse {
     match request.method.as_str() {
         "Network.getAllCookies" | "Storage.getCookies" => {
-            let now = match now_secs(&request.params) {
-                Ok(value) => value,
-                Err(error) => return failure(request, error),
-            };
-            match state.context_cookies(&page_id, now) {
+            match state.context_cookies(&page_id, now_secs) {
                 Ok(cookies) => CdpResponse::success(
                     request.id,
                     json!({"cookies": cookies}),
@@ -213,15 +201,11 @@ pub fn dispatch(request: &CdpRequest, state: &mut BrowserState, page_id: PageId)
                 Ok(value) => value,
                 Err(error) => return failure(request, error),
             };
-            let now = match now_secs(&request.params) {
-                Ok(value) => value,
-                Err(error) => return failure(request, error),
-            };
             let cookies = match parse_cookie_values(&request.params, &target_url) {
                 Ok(value) => value,
                 Err(error) => return failure(request, error),
             };
-            match state.merge_context_cookies(&page_id, cookies, now) {
+            match state.merge_context_cookies(&page_id, cookies, now_secs) {
                 Ok(()) => CdpResponse::success(request.id, json!({}), request.session_id.clone()),
                 Err(error) => failure(request, error),
             }
@@ -295,25 +279,26 @@ mod tests {
         let mut state = BrowserState::new();
         let page = state.create_page(&state.default_context(), "https://example.test/path").unwrap();
         assert!(dispatch(
-            &request(1, "Network.setCookies", json!({"_obscuraNowSecs": 100, "cookies": [
-                {"name": "sid", "value": "abc", "domain": "example.test", "path": "/", "httpOnly": true},
+            &request(1, "Network.setCookies", json!({"_obscuraNowSecs": u64::MAX, "cookies": [
+                {"name": "sid", "value": "abc", "domain": "example.test", "path": "/", "httpOnly": true, "expires": 101},
                 {"name": "old", "value": "gone", "domain": "example.test", "path": "/", "expires": 99}
             ]})),
             &mut state,
             page,
+            100,
         ).error.is_none());
-        let result = dispatch(&request(2, "Network.getAllCookies", json!({"_obscuraNowSecs": 100})), &mut state, page);
+        let result = dispatch(&request(2, "Network.getAllCookies", json!({"_obscuraNowSecs": u64::MAX})), &mut state, page, 100);
         assert_eq!(result.result.as_ref().unwrap()["cookies"].as_array().unwrap().len(), 1);
         assert_eq!(result.result.as_ref().unwrap()["cookies"][0]["name"], "sid");
-        assert!(dispatch(&request(3, "Network.deleteCookies", json!({"name": "sid", "domain": "example.test", "path": "/"})), &mut state, page).error.is_none());
-        assert!(dispatch(&request(4, "Storage.getCookies", json!({"_obscuraNowSecs": 100})), &mut state, page).result.as_ref().unwrap()["cookies"].as_array().unwrap().is_empty());
+        assert!(dispatch(&request(3, "Network.deleteCookies", json!({"name": "sid", "domain": "example.test", "path": "/"})), &mut state, page, 100).error.is_none());
+        assert!(dispatch(&request(4, "Storage.getCookies", json!({})), &mut state, page, 100).result.as_ref().unwrap()["cookies"].as_array().unwrap().is_empty());
     }
 
     #[test]
     fn malformed_cookie_commands_are_bounded() {
         let mut state = BrowserState::new();
         let page = state.create_page(&state.default_context(), "about:blank").unwrap();
-        let response = dispatch(&request(1, "Network.setCookies", json!({"cookies": "bad"})), &mut state, page);
+        let response = dispatch(&request(1, "Network.setCookies", json!({"cookies": "bad"})), &mut state, page, 0);
         assert_eq!(response.error.unwrap().code, -32602);
     }
 
@@ -325,20 +310,20 @@ mod tests {
             {"name": "first", "value": "1", "domain": "example.test"},
             {"name": "second", "value": "2", "domain": "unrelated.test"}
         ]}));
-        assert!(dispatch(&set, &mut state, page).error.is_none());
+        assert!(dispatch(&set, &mut state, page, 0).error.is_none());
 
         let local_only = request(2, "Storage.clearDataForOrigin", json!({
             "origin": "https://example.test",
             "storageTypes": "local_storage"
         }));
-        assert!(dispatch(&local_only, &mut state, page).error.is_none());
+        assert!(dispatch(&local_only, &mut state, page, 0).error.is_none());
         assert_eq!(state.context_cookies(&page, 0).unwrap().len(), 2);
 
         let cookies = request(3, "Storage.clearDataForOrigin", json!({
             "origin": "https://example.test",
             "storageTypes": "cookies"
         }));
-        assert!(dispatch(&cookies, &mut state, page).error.is_none());
+        assert!(dispatch(&cookies, &mut state, page, 0).error.is_none());
         let remaining = state.context_cookies(&page, 0).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].domain, "unrelated.test");
@@ -352,11 +337,11 @@ mod tests {
             "browserContextId": format!("context-{}", context.get()),
             "cookies": [{"name": "sid", "value": "1", "url": "https://example.test/"}]
         }));
-        assert!(dispatch_browser(&set, &mut state).error.is_none());
+        assert!(dispatch_browser(&set, &mut state, 0).error.is_none());
         let get = request(2, "Storage.getCookies", json!({
             "browserContextId": format!("context-{}", context.get())
         }));
-        let response = dispatch_browser(&get, &mut state);
+        let response = dispatch_browser(&get, &mut state, 0);
         assert_eq!(response.result.unwrap()["cookies"][0]["hostOnly"], true);
     }
 }

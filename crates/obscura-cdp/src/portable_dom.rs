@@ -101,34 +101,48 @@ pub fn dispatch<B: DomBackend + ?Sized>(
             }
         }
         "DOM.querySelector" => {
-            let selector = request
-                .params
-                .get("selector")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let root = request
+            let Some(selector) = request.params.get("selector").and_then(Value::as_str) else {
+                return Some(DomDispatch {
+                    response: error(request, -32602, "selector must be a string"),
+                    events,
+                });
+            };
+            let Some(root) = request
                 .params
                 .get("nodeId")
                 .and_then(Value::as_u64)
                 .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or_else(|| backend.document_handle());
+                .filter(|value| *value != 0)
+            else {
+                return Some(DomDispatch {
+                    response: error(request, -32602, "nodeId must be a positive u32"),
+                    events,
+                });
+            };
             match backend.query_selector(root, selector) {
                 Ok(node_id) => success(request, json!({"nodeId": node_id})),
                 Err(_) => error(request, -32000, "DOM selector failed"),
             }
         }
         "DOM.querySelectorAll" => {
-            let selector = request
-                .params
-                .get("selector")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let root = request
+            let Some(selector) = request.params.get("selector").and_then(Value::as_str) else {
+                return Some(DomDispatch {
+                    response: error(request, -32602, "selector must be a string"),
+                    events,
+                });
+            };
+            let Some(root) = request
                 .params
                 .get("nodeId")
                 .and_then(Value::as_u64)
                 .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or_else(|| backend.document_handle());
+                .filter(|value| *value != 0)
+            else {
+                return Some(DomDispatch {
+                    response: error(request, -32602, "nodeId must be a positive u32"),
+                    events,
+                });
+            };
             match backend.query_selector_all(root, selector) {
                 Ok(node_ids) => success(request, json!({"nodeIds": node_ids})),
                 Err(_) => error(request, -32000, "DOM selector failed"),
@@ -183,7 +197,7 @@ pub fn dispatch<B: DomBackend + ?Sized>(
                 .and_then(Value::as_u64)
                 .and_then(|value| u32::try_from(value).ok())
                 .unwrap_or(0);
-            match backend.describe_children(node_id, 1) {
+            match backend.describe_children(node_id, depth(&request.params)) {
                 Ok(nodes) => {
                     events.push(match request.session_id.clone() {
                         Some(session_id) => CdpEvent::with_session(
@@ -215,7 +229,10 @@ mod tests {
     use super::*;
     use crate::engine::CdpEngine;
 
-    struct MockDom;
+    #[derive(Default)]
+    struct MockDom {
+        child_depth: usize,
+    }
 
     impl DomBackend for MockDom {
         fn document_handle(&self) -> u32 {
@@ -239,8 +256,9 @@ mod tests {
         fn describe_children(
             &mut self,
             _node_id: u32,
-            _depth: usize,
+            depth: usize,
         ) -> Result<Vec<Value>, String> {
+            self.child_depth = depth;
             Ok(vec![json!({"nodeId": 2})])
         }
     }
@@ -260,7 +278,7 @@ mod tests {
         let page = state
             .create_page(&state.default_context(), "https://example.test/")
             .unwrap();
-        let mut backend = MockDom;
+        let mut backend = MockDom::default();
         let document = dispatch(
             &request(1, "DOM.getDocument", json!({"depth": -1})),
             &state,
@@ -273,7 +291,7 @@ mod tests {
             "https://example.test/"
         );
         let children = dispatch(
-            &request(2, "DOM.requestChildNodes", json!({"nodeId": 1})),
+            &request(2, "DOM.requestChildNodes", json!({"nodeId": 1, "depth": 7})),
             &state,
             page,
             &mut backend,
@@ -281,6 +299,21 @@ mod tests {
         .unwrap();
         assert_eq!(children.events[0].method, "DOM.setChildNodes");
         assert_eq!(children.events[0].session_id.as_deref(), Some("s"));
+        assert_eq!(backend.child_depth, 7);
+
+        for params in [
+            json!({"nodeId": "bad", "selector": "body"}),
+            json!({"nodeId": 1, "selector": 7}),
+        ] {
+            let response = dispatch(
+                &request(3, "DOM.querySelector", params),
+                &state,
+                page,
+                &mut backend,
+            )
+            .unwrap();
+            assert_eq!(response.response.error.unwrap().code, -32602);
+        }
     }
 
     #[test]
@@ -289,7 +322,7 @@ mod tests {
         let page = state
             .create_page(&state.default_context(), "about:blank")
             .unwrap();
-        let mut backend = MockDom;
+        let mut backend = MockDom::default();
         assert!(dispatch(
             &request(1, "DOM.getNodeForLocation", json!({})),
             &state,

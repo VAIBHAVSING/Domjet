@@ -68,19 +68,19 @@ required-features = ["native-engine"]
 [[test]]
 name = "concurrent_connections_heavy_page"
 path = "tests/concurrent_connections_heavy_page.rs"
-required-features = ["native-engine"]
+required-features = ["native-server"]
 [[test]]
 name = "concurrent_navigations"
 path = "tests/concurrent_navigations.rs"
-required-features = ["native-engine"]
+required-features = ["native-server"]
 [[test]]
 name = "concurrent_navigations_with_fetch"
 path = "tests/concurrent_navigations_with_fetch.rs"
-required-features = ["native-engine"]
+required-features = ["native-server"]
 [[test]]
 name = "control_plane_unblocked"
 path = "tests/control_plane_unblocked.rs"
-required-features = ["native-engine"]
+required-features = ["native-server"]
 [[test]]
 name = "dynamic_script_onload_fires"
 path = "tests/dynamic_script_onload_fires.rs"
@@ -116,7 +116,7 @@ required-features = ["native-engine"]
 [[test]]
 name = "max_connections_cap"
 path = "tests/max_connections_cap.rs"
-required-features = ["native-engine"]
+required-features = ["native-server"]
 [[test]]
 name = "nodefilter_constants"
 path = "tests/nodefilter_constants.rs"

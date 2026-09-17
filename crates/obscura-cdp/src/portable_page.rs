@@ -140,8 +140,11 @@ mod tests {
     #[test]
     fn unsupported_page_commands_remain_explicit() {
         let mut state = BrowserState::new();
-        let response = dispatch(&request(1, "Page.navigate", None), &mut state, PageId::new(1));
-        assert_eq!(response.error.unwrap().code, -32000);
+        let page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        let response = dispatch(&request(1, "Page.navigate", None), &mut state, page);
+        assert_eq!(response.error.unwrap().code, -32601);
+        let unknown = dispatch(&request(2, "Page.navigate", None), &mut state, PageId::new(999));
+        assert_eq!(unknown.error.unwrap().code, -32000);
         assert!(!supports("Page.navigate"));
         assert!(supports("Page.getFrameTree"));
     }
