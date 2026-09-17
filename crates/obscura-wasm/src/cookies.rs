@@ -20,12 +20,13 @@ pub struct CookieInfo {
     pub same_site: String,
     #[serde(default)]
     pub expires: Option<i64>,
+    #[serde(default)]
+    pub host_only: bool,
 }
 
 #[derive(Clone, Debug)]
 struct CookieEntry {
     info: CookieInfo,
-    host_only: bool,
     created: u64,
 }
 
@@ -50,7 +51,7 @@ impl CookieJar {
             .entries
             .values()
             .filter(|entry| {
-                cookie_matches(&entry.info, entry.host_only, &host, path, secure, now_secs)
+                cookie_matches(&entry.info, &host, path, secure, now_secs)
             })
             .collect::<Vec<_>>();
         matches.sort_by(|a, b| {
@@ -78,7 +79,7 @@ impl CookieJar {
             .values()
             .filter(|entry| {
                 !entry.info.http_only
-                    && cookie_matches(&entry.info, entry.host_only, &host, path, secure, now_secs)
+                    && cookie_matches(&entry.info, &host, path, secure, now_secs)
             })
             .collect::<Vec<_>>();
         matches.sort_by(|a, b| a.created.cmp(&b.created));
@@ -142,7 +143,7 @@ impl CookieJar {
             if is_expired(expires, now_secs) {
                 continue;
             }
-            self.insert(info, false);
+            self.insert(info);
         }
         Ok(())
     }
@@ -214,29 +215,36 @@ impl CookieJar {
             return Ok(false);
         }
         let (domain, host_only) = resolve_domain(&origin_host, domain_attr.as_deref());
+        let key = (domain.clone(), name.clone(), path.clone());
+        if from_script
+            && self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.info.http_only)
+        {
+            return Ok(false);
+        }
         if let Some(expiry) = expires {
             if expiry == 0 || expiry <= now_secs {
-                self.entries.remove(&(domain, name, path));
+                self.entries.remove(&key);
                 return Ok(true);
             }
         }
-        self.insert(
-            CookieInfo {
-                name,
-                value: cookie_value.trim().to_string(),
-                domain: domain.clone(),
-                path,
-                secure,
-                http_only,
-                same_site,
-                expires: expires.map(|value| value as i64),
-            },
+        self.insert(CookieInfo {
+            name,
+            value: cookie_value.trim().to_string(),
+            domain: domain.clone(),
+            path,
+            secure,
+            http_only,
+            same_site,
+            expires: expires.map(|value| value as i64),
             host_only,
-        );
+        });
         Ok(true)
     }
 
-    fn insert(&mut self, info: CookieInfo, host_only: bool) {
+    fn insert(&mut self, info: CookieInfo) {
         if self.entries.len() >= MAX_COOKIE_COUNT {
             if let Some(oldest) = self
                 .entries
@@ -250,7 +258,7 @@ impl CookieJar {
         let key = (info.domain.clone(), info.name.clone(), info.path.clone());
         let created = self.next_created;
         self.next_created = self.next_created.wrapping_add(1);
-        self.entries.insert(key, CookieEntry { info, host_only, created });
+        self.entries.insert(key, CookieEntry { info, created });
     }
 }
 
@@ -266,8 +274,9 @@ fn is_expired(expires: Option<u64>, now_secs: u64) -> bool {
     expires.is_some_and(|value| value <= now_secs)
 }
 
-fn cookie_matches(info: &CookieInfo, host_only: bool, host: &str, path: &str, secure: bool, now_secs: u64) -> bool {
-    (!host_only && domain_matches(host, &info.domain) || host_only && host.eq_ignore_ascii_case(&info.domain))
+fn cookie_matches(info: &CookieInfo, host: &str, path: &str, secure: bool, now_secs: u64) -> bool {
+    (!info.host_only && domain_matches(host, &info.domain)
+        || info.host_only && host.eq_ignore_ascii_case(&info.domain))
         && (!info.secure || secure)
         && path_matches(path, &info.path)
         && !is_expired(info.expires.and_then(|value| u64::try_from(value).ok()), now_secs)
@@ -309,17 +318,38 @@ fn parse_http_date(value: &str) -> Option<u64> {
     if parts.len() < 5 { return None; }
     let day = parts[1].parse::<u64>().ok()?;
     let month = months.iter().position(|month| parts[2].to_ascii_lowercase().starts_with(month))? as u64 + 1;
-    let year = parts[3].parse::<u64>().ok()?;
-    let time = parts[4].split(':').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
-    let mut days = 0u64;
-    for current in 1970..year {
-        days += if current % 4 == 0 && (current % 100 != 0 || current % 400 == 0) { 366 } else { 365 };
+    let raw_year = parts[3].parse::<u64>().ok()?;
+    let year = match raw_year {
+        0..=69 => 2000 + raw_year,
+        70..=99 => 1900 + raw_year,
+        value => value,
+    };
+    if !(1601..=9999).contains(&year) {
+        return None;
     }
-    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for current in 1..month {
-        days += month_days[current as usize] + u64::from(current == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+    let time = parts[4]
+        .split(':')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if time.len() != 3 || time[0] > 23 || time[1] > 59 || time[2] > 59 {
+        return None;
     }
-    Some((days + day.saturating_sub(1)) * 86_400 + time.first().copied().unwrap_or(0) * 3_600 + time.get(1).copied().unwrap_or(0) * 60 + time.get(2).copied().unwrap_or(0))
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [31, 28 + u64::from(leap), 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if day == 0 || day > month_days[(month - 1) as usize] {
+        return None;
+    }
+    if year < 1970 {
+        return Some(0);
+    }
+    let days_before_year = |year: u64| {
+        let previous = year - 1;
+        365 * year + previous / 4 - previous / 100 + previous / 400
+    };
+    let days_before_month = month_days[..(month - 1) as usize].iter().sum::<u64>();
+    let days = days_before_year(year) - days_before_year(1970) + days_before_month + day - 1;
+    Some(days * 86_400 + time[0] * 3_600 + time[1] * 60 + time[2])
 }
 
 #[cfg(test)]
@@ -347,5 +377,35 @@ mod tests {
         assert_eq!(jar.request_header("https://example.com/a/x", 100), Ok(String::new()));
         jar.set_from_response("short=v; Max-Age=1", "https://example.com/", 100).unwrap();
         assert_eq!(jar.request_header("https://example.com/", 101), Ok(String::new()));
+    }
+
+    #[test]
+    fn export_import_preserves_host_only_scope() {
+        let mut jar = CookieJar::new();
+        jar.set_from_response("sid=host; Path=/", "https://example.com/", 100).unwrap();
+        let exported = jar.all_json(100).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&exported).unwrap()[0]["hostOnly"], true);
+
+        let mut restored = CookieJar::new();
+        restored.import_json(&exported, 100).unwrap();
+        assert_eq!(restored.request_header("https://example.com/", 100).unwrap(), "sid=host");
+        assert_eq!(restored.request_header("https://sub.example.com/", 100).unwrap(), "");
+    }
+
+    #[test]
+    fn scripts_cannot_overwrite_or_delete_http_only_cookies() {
+        let mut jar = CookieJar::new();
+        jar.set_from_response("sid=secret; Path=/; HttpOnly", "https://example.com/", 100).unwrap();
+        assert!(!jar.set_from_script("sid=visible; Path=/", "https://example.com/", 100).unwrap());
+        assert!(!jar.set_from_script("sid=gone; Path=/; Max-Age=0", "https://example.com/", 100).unwrap());
+        assert_eq!(jar.request_header("https://example.com/", 100).unwrap(), "sid=secret");
+        assert_eq!(jar.visible_cookie_string("https://example.com/", 100).unwrap(), "");
+    }
+
+    #[test]
+    fn cookie_dates_are_validated_in_constant_time() {
+        assert_eq!(parse_http_date("Wed, 09 Jun 2021 10:18:14 GMT"), Some(1_623_233_894));
+        assert_eq!(parse_http_date("Wed, 09 Jun 999999999999999999 10:18:14 GMT"), None);
+        assert_eq!(parse_http_date("Wed, 31 Feb 2021 10:18:14 GMT"), None);
     }
 }

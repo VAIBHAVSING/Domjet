@@ -28,12 +28,16 @@ impl PageDispatch {
 
 /// Whether the shared Browser/Target dispatcher owns this command.
 pub fn supports_browser(method: &str) -> bool {
-    crate::portable_target::supports(method)
+    crate::portable_target::supports(method) || crate::portable_storage::supports_browser(method)
 }
 
 /// Dispatch a state-only Browser/Target command.
 pub fn dispatch_browser(request: &CdpRequest, state: &mut BrowserState) -> Option<CdpResponse> {
-    supports_browser(&request.method).then(|| crate::portable_target::dispatch(request, state))
+    if crate::portable_storage::supports_browser(&request.method) {
+        return Some(crate::portable_storage::dispatch_browser(request, state));
+    }
+    crate::portable_target::supports(&request.method)
+        .then(|| crate::portable_target::dispatch(request, state))
 }
 
 /// Dispatch connection-owned IO stream commands through the shared state.

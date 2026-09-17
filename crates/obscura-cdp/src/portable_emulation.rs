@@ -87,9 +87,9 @@ pub fn dispatch(request: &CdpRequest, state: &mut BrowserState, page_id: PageId)
             CdpResponse::success(
                 request.id,
                 json!({
-                    "layoutViewport": {"pageX": 0, "pageY": 0, "clientWidth": width, "clientHeight": height},
-                    "visualViewport": {"offsetX": 0, "offsetY": 0, "pageX": 0, "pageY": 0, "scale": 1, "zoom": 1, "clientWidth": width, "clientHeight": height},
-                    "contentSize": {"x": 0, "y": 0, "width": width, "height": height},
+                    "layoutViewport": {"pageX": display.page_x, "pageY": display.page_y, "clientWidth": width, "clientHeight": height},
+                    "visualViewport": {"offsetX": 0, "offsetY": 0, "pageX": display.page_x, "pageY": display.page_y, "scale": 1, "zoom": 1, "clientWidth": width, "clientHeight": height},
+                    "contentSize": {"x": 0, "y": 0, "width": display.content_width, "height": display.content_height},
                 }),
                 request.session_id.clone(),
             )

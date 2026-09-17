@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use obscura_dom::{
@@ -62,22 +62,22 @@ fn raw_frame_limit(requested: u32) -> usize {
 
 fn encode_raw_frames(frames: &[Vec<u8>], max_bytes: usize) -> Result<Vec<u8>, JsValue> {
     if frames.len() > MAX_RAW_FRAMES {
-        return Err(js_sys::RangeError::new("raw CDP output exceeds the frame limit").into());
+        return Err(js_range_error_value("raw CDP output exceeds the frame limit"));
     }
     let mut output = Vec::new();
     for frame in frames {
         if frame.len() > obscura_cdp::protocol::MAX_MESSAGE_BYTES {
-            return Err(js_sys::RangeError::new("raw CDP frame exceeds the message limit").into());
+            return Err(js_range_error_value("raw CDP frame exceeds the message limit"));
         }
         let frame_len = u32::try_from(frame.len())
-            .map_err(|_| js_sys::RangeError::new("raw CDP frame length exceeds u32"))?;
+            .map_err(|_| js_range_error_value("raw CDP frame length exceeds u32"))?;
         let next_len = output
             .len()
             .checked_add(RAW_FRAME_HEADER_BYTES)
             .and_then(|value| value.checked_add(frame.len()))
-            .ok_or_else(|| js_sys::RangeError::new("raw CDP output size overflow"))?;
+            .ok_or_else(|| js_range_error_value("raw CDP output size overflow"))?;
         if next_len > max_bytes || next_len > MAX_RAW_BYTES {
-            return Err(js_sys::RangeError::new("raw CDP output exceeds the byte limit").into());
+            return Err(js_range_error_value("raw CDP output exceeds the byte limit"));
         }
         output.extend_from_slice(&frame_len.to_le_bytes());
         output.extend_from_slice(frame);
@@ -87,7 +87,7 @@ fn encode_raw_frames(frames: &[Vec<u8>], max_bytes: usize) -> Result<Vec<u8>, Js
 
 fn decode_raw_frames(bytes: &[u8]) -> Result<Vec<&[u8]>, JsValue> {
     if bytes.len() > MAX_RAW_BYTES {
-        return Err(js_sys::RangeError::new("raw CDP input exceeds the byte limit").into());
+        return Err(js_range_error_value("raw CDP input exceeds the byte limit"));
     }
     let mut frames = Vec::new();
     let mut offset = 0usize;
@@ -102,11 +102,11 @@ fn decode_raw_frames(bytes: &[u8]) -> Result<Vec<&[u8]>, JsValue> {
         ) as usize;
         offset += RAW_FRAME_HEADER_BYTES;
         if frame_len > obscura_cdp::protocol::MAX_MESSAGE_BYTES {
-            return Err(js_sys::RangeError::new("raw CDP frame exceeds the message limit").into());
+            return Err(js_range_error_value("raw CDP frame exceeds the message limit"));
         }
         let end = offset
             .checked_add(frame_len)
-            .ok_or_else(|| js_sys::RangeError::new("raw CDP frame size overflow"))?;
+            .ok_or_else(|| js_range_error_value("raw CDP frame size overflow"))?;
         if end > bytes.len() {
             return Err(js_syntax_error_value("raw CDP frame envelope is truncated"));
         }
@@ -183,6 +183,18 @@ fn js_error_value(message: &str) -> JsValue {
     #[cfg(target_arch = "wasm32")]
     {
         js_sys::Error::new(message).into()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = message;
+        JsValue::NULL
+    }
+}
+
+fn js_range_error_value(message: &str) -> JsValue {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::RangeError::new(message).into()
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -489,6 +501,89 @@ impl ObscuraCore {
             self.handle_to_node.insert(document_handle, document);
             self.node_to_handle.insert(document, document_handle);
             self.document_handle = document_handle;
+            self.page_revision = next_revision;
+            Ok(())
+        })
+    }
+
+    /// Refresh the CDP mirror from a host document snapshot without treating
+    /// an in-document mutation as a navigation. Handles for the document,
+    /// structural roots, and uniquely identified elements remain stable when
+    /// those nodes still exist in the refreshed tree. Other handles become
+    /// stale instead of being silently rebound to unrelated nodes.
+    pub(crate) fn sync_html_preserving_handles(&mut self, html: &str) -> Result<(), JsValue> {
+        require_max_bytes(html, MAX_HTML_INPUT_BYTES, "HTML input")?;
+        boundary_result("sync_html", || {
+            let next_revision = self
+                .page_revision
+                .checked_add(1)
+                .ok_or_else(|| "page revision space is exhausted".to_string())?;
+            let dom = parse_html(html);
+            let document = dom.document();
+            let mut retained = HashMap::new();
+            let mut retained_nodes = HashMap::new();
+            retained.insert(self.document_handle, document);
+            retained_nodes.insert(document, self.document_handle);
+
+            for selector in ["html", "head", "body"] {
+                let old_node = self.dom.query_selector(selector).ok().flatten();
+                let new_node = dom.query_selector(selector).ok().flatten();
+                if let (Some(old_node), Some(new_node)) = (old_node, new_node) {
+                    if let Some(handle) = self.node_to_handle.get(&old_node).copied() {
+                        if !retained_nodes.contains_key(&new_node) {
+                            retained.insert(handle, new_node);
+                            retained_nodes.insert(new_node, handle);
+                        }
+                    }
+                }
+            }
+
+            let mut old_ids: HashMap<String, Option<u32>> = HashMap::new();
+            for (node_id, handle) in &self.node_to_handle {
+                let Some(id) = self
+                    .dom
+                    .get_node(*node_id)
+                    .and_then(|node| node.get_attribute("id").map(str::to_owned))
+                    .filter(|id| !id.is_empty())
+                else {
+                    continue;
+                };
+                old_ids
+                    .entry(id)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(*handle));
+            }
+            let mut new_ids: HashMap<String, Option<NodeId>> = HashMap::new();
+            for node_id in dom.descendants(document) {
+                let Some(id) = dom
+                    .get_node(node_id)
+                    .and_then(|node| node.get_attribute("id").map(str::to_owned))
+                    .filter(|id| !id.is_empty())
+                else {
+                    continue;
+                };
+                new_ids
+                    .entry(id)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(node_id));
+            }
+            for (id, old_handle) in old_ids {
+                let (Some(old_handle), Some(Some(new_node))) = (old_handle, new_ids.get(&id)) else {
+                    continue;
+                };
+                if !retained_nodes.contains_key(new_node) {
+                    retained.insert(old_handle, *new_node);
+                    retained_nodes.insert(*new_node, old_handle);
+                }
+            }
+
+            self.dom = dom;
+            #[cfg(feature = "render")]
+            {
+                self.render_resources = portable_render_resources();
+            }
+            self.handle_to_node = retained;
+            self.node_to_handle = retained_nodes;
             self.page_revision = next_revision;
             Ok(())
         })
@@ -906,6 +1001,65 @@ impl ObscuraCore {
             self.record_render_memory("afterSurfaceDrop", 0, png.len());
             Ok(png)
         })
+    }
+
+    #[cfg(feature = "render")]
+    pub(crate) fn render_content_size(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<(f32, f32), String> {
+        if width == 0 || height == 0 {
+            return Err("render viewport must be non-zero".to_string());
+        }
+        let viewport = (width as f32, height as f32);
+        let base_url = obscura_render::resolve_document_base_url(&self.dom, &self.document_url);
+        let prepared = obscura_render::prepare_dom(
+            &self.dom,
+            viewport,
+            base_url.as_ref().map(url::Url::as_str),
+            &mut self.render_resources,
+        )
+        .ok_or_else(|| "unable to prepare document layout metrics".to_string())?;
+        Ok(prepared.content_size())
+    }
+
+    #[cfg(feature = "render")]
+    pub(crate) fn screenshot_region_png(
+        &mut self,
+        viewport_width: u32,
+        viewport_height: u32,
+        scroll_x: f32,
+        scroll_y: f32,
+        region: obscura_render::CaptureRegion,
+    ) -> Result<Vec<u8>, String> {
+        if viewport_width == 0 || viewport_height == 0 {
+            return Err("screenshot viewport must be non-zero".to_string());
+        }
+        let viewport = (viewport_width as f32, viewport_height as f32);
+        let base_url = obscura_render::resolve_document_base_url(&self.dom, &self.document_url);
+        let mut prepared = obscura_render::prepare_dom(
+            &self.dom,
+            viewport,
+            base_url.as_ref().map(url::Url::as_str),
+            &mut self.render_resources,
+        )
+        .ok_or_else(|| "unable to prepare document screenshot".to_string())?;
+        let element_scroll = HashMap::new();
+        let scroll = prepared.resolve_scroll_state_for_viewport(
+            &self.dom,
+            (scroll_x, scroll_y),
+            &element_scroll,
+            viewport,
+        );
+        obscura_render::screenshot_prepared_region_with_scroll(
+            &self.dom,
+            &mut prepared,
+            &mut self.render_resources,
+            &scroll,
+            region,
+        )
+        .map_err(|error| format!("portable screenshot failed: {error:?}"))
     }
 
     #[cfg(feature = "render")]
@@ -2404,6 +2558,17 @@ pub fn cdp_record_network(browser_id: u32, target_id: &str, metadata: &[u8]) -> 
     with_raw_browser(browser_id, |browser| browser.record_network_metadata_json(target_id, metadata))
 }
 
+#[wasm_bindgen(js_name = cdpSyncTargetState)]
+pub fn cdp_sync_target_state(
+    browser_id: u32,
+    target_id: &str,
+    state: &[u8],
+) -> Result<(), JsValue> {
+    let state = std::str::from_utf8(state)
+        .map_err(|_| js_syntax_error_value("CDP target state must be valid UTF-8 JSON"))?;
+    with_raw_browser(browser_id, |browser| browser.sync_target_state_json(target_id, state))
+}
+
 #[wasm_bindgen(js_name = cdpInterceptFetch)]
 pub fn cdp_intercept_fetch(browser_id: u32, target_id: &str, metadata: &[u8]) -> Result<Vec<u8>, JsValue> {
     let metadata = std::str::from_utf8(metadata)
@@ -2433,15 +2598,18 @@ pub fn cdp_cancel_fetch(browser_id: u32, target_id: &str, request_id: &str) -> R
     with_raw_browser(browser_id, |browser| browser.cancel_fetch_request_json(target_id, request_id))
 }
 
-/// Ingest one unframed UTF-8 CDP request and return exactly one length-
-/// prefixed response frame. Batched host work is exposed through the drain
-/// functions below, keeping request and execution traffic independent.
+/// Ingest one unframed UTF-8 CDP request. Immediate commands return one
+/// length-prefixed response frame. Host-backed commands return no frame until
+/// their action is completed, so each CDP request has exactly one response.
 #[wasm_bindgen(js_name = cdpIngest)]
 pub fn cdp_ingest(browser_id: u32, connection_id: u32, request: &[u8]) -> Result<Vec<u8>, JsValue> {
     let response = with_raw_browser(browser_id, |browser| {
         browser.raw_cdp_request(connection_id, request)
     })?;
-    encode_raw_frames(&[response], MAX_RAW_BYTES)
+    match response {
+        Some(response) => encode_raw_frames(&[response], MAX_RAW_BYTES),
+        None => Ok(Vec::new()),
+    }
 }
 
 #[cfg(feature = "render")]
@@ -2503,6 +2671,7 @@ pub fn cdp_complete_actions(
 ) -> Result<Vec<u8>, JsValue> {
     let frames = decode_raw_frames(completions)?;
     let mut decoded = Vec::with_capacity(frames.len());
+    let mut action_ids = BTreeSet::new();
     for frame in frames {
         let value: serde_json::Value = serde_json::from_slice(frame)
             .map_err(|error| js_syntax_error_value(&format!("invalid raw CDP completion: {error}")))?;
@@ -2514,6 +2683,9 @@ pub fn cdp_complete_actions(
             .and_then(serde_json::Value::as_u64)
             .and_then(|id| u32::try_from(id).ok())
             .ok_or_else(|| js_syntax_error_value("raw CDP completion actionId must be a u32"))?;
+        if !action_ids.insert(action_id) {
+            return Err(js_syntax_error_value("raw CDP completion actionId is duplicated"));
+        }
         let generation = object
             .get("generation")
             .and_then(serde_json::Value::as_u64)
@@ -2531,11 +2703,18 @@ pub fn cdp_complete_actions(
         decoded
             .iter()
             .map(|(action_id, generation, result)| {
-                browser.raw_complete_action(*action_id, *generation, result)
+                browser.preview_raw_completion(*action_id, *generation, result)
             })
             .collect::<Result<Vec<_>, _>>()
     })?;
-    encode_raw_frames(&responses, limit)
+    let output = encode_raw_frames(&responses, limit)?;
+    with_raw_browser(browser_id, |browser| {
+        for (action_id, generation, result) in &decoded {
+            browser.raw_complete_action(*action_id, *generation, result)?;
+        }
+        Ok(())
+    })?;
+    Ok(output)
 }
 
 /// Version of the length-prefixed raw CDP ABI. The legacy string ABI remains
@@ -2709,8 +2888,7 @@ mod tests {
             r#"{{"id":9,"sessionId":"{session}","method":"Runtime.evaluate","params":{{"expression":"6*7","returnByValue":true}}}}"#
         );
         let response = raw_values(&cdp_ingest(browser, connection, evaluate.as_bytes()).unwrap());
-        assert_eq!(response[0]["id"], 9);
-        assert!(response[0]["result"].get("obscuraAction").is_none());
+        assert!(response.is_empty());
 
         let actions = raw_values(&cdp_drain_actions(browser, 8, 0).unwrap());
         assert_eq!(actions.len(), 1);
@@ -2731,6 +2909,38 @@ mod tests {
         );
         assert_eq!(completed[0]["id"], 9);
         assert_eq!(completed[0]["result"]["result"]["value"], 42);
+
+        for id in [10, 11] {
+            let request = format!(
+                r#"{{"id":{id},"sessionId":"{session}","method":"Runtime.evaluate","params":{{"expression":"{id}"}}}}"#
+            );
+            assert!(cdp_ingest(browser, connection, request.as_bytes()).unwrap().is_empty());
+        }
+        let actions = raw_values(&cdp_drain_actions(browser, 8, 0).unwrap());
+        assert_eq!(actions.len(), 2);
+        let completion = |action: &serde_json::Value, generation: u64| {
+            serde_json::to_vec(&serde_json::json!({
+                "actionId": action["actionId"],
+                "generation": generation,
+                "result": {"result": {"type": "number", "value": action["requestId"]}}
+            }))
+            .unwrap()
+        };
+        let valid_first = completion(&actions[0], actions[0]["generation"].as_u64().unwrap());
+        let stale_second = completion(
+            &actions[1],
+            actions[1]["generation"].as_u64().unwrap().saturating_add(1),
+        );
+        let stale_batch = encode_raw_frames(&[valid_first.clone(), stale_second], MAX_RAW_BYTES).unwrap();
+        assert!(cdp_complete_actions(browser, &stale_batch, 0).is_err());
+
+        let valid_second = completion(&actions[1], actions[1]["generation"].as_u64().unwrap());
+        let valid_batch = encode_raw_frames(&[valid_first, valid_second], MAX_RAW_BYTES).unwrap();
+        assert!(cdp_complete_actions(browser, &valid_batch, 1).is_err());
+        let delivered = raw_values(&cdp_complete_actions(browser, &valid_batch, 0).unwrap());
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0]["id"], 10);
+        assert_eq!(delivered[1]["id"], 11);
 
         assert!(cdp_complete_actions(browser, &[1, 0, 0], 0).is_err());
         connection_close(browser, connection).unwrap();

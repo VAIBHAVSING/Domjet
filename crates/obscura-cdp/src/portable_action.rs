@@ -37,17 +37,15 @@ pub fn from_request(
         }),
         "Page.navigate" => serde_json::json!({
             "url": request.params.get("url").and_then(Value::as_str).unwrap_or("about:blank"),
-            "method": request.params.get("referrer").and_then(Value::as_str).unwrap_or("GET"),
+            "method": "GET",
+            "referrer": request.params.get("referrer").and_then(Value::as_str).unwrap_or(""),
             "extraHTTPHeaders": state.extra_headers(&page).unwrap_or_default(),
         }),
         "Page.reload" => serde_json::json!({
             "url": page_state.url,
             "extraHTTPHeaders": state.extra_headers(&page).unwrap_or_default(),
         }),
-        "Runtime.evaluate" => serde_json::json!({
-            "expression": request.params.get("expression").and_then(Value::as_str).unwrap_or(""),
-            "returnByValue": request.params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false),
-        }),
+        "Runtime.evaluate" => request.params.clone(),
         "Runtime.callFunctionOn" => request.params.clone(),
         "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => request.params.clone(),
         "Runtime.getProperties" => request.params.clone(),
@@ -193,6 +191,48 @@ mod tests {
         assert_eq!(action.kind, "reload");
         assert_eq!(action.payload["url"], "https://example.test/");
         assert_eq!(action.payload["extraHTTPHeaders"]["x-test"], "yes");
+
+        let navigation = from_request(
+            &CdpRequest {
+                id: 2,
+                method: "Page.navigate".into(),
+                params: serde_json::json!({
+                    "url": "https://destination.test/",
+                    "referrer": "https://referrer.test/"
+                }),
+                session_id: None,
+            },
+            &state,
+            page,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(navigation.payload["method"], "GET");
+        assert_eq!(navigation.payload["referrer"], "https://referrer.test/");
+
+        let evaluate = from_request(
+            &CdpRequest {
+                id: 3,
+                method: "Runtime.evaluate".into(),
+                params: serde_json::json!({
+                    "expression": "Promise.resolve(42)",
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                    "contextId": 17,
+                    "objectGroup": "test",
+                    "timeout": 250
+                }),
+                session_id: None,
+            },
+            &state,
+            page,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(evaluate.payload["awaitPromise"], true);
+        assert_eq!(evaluate.payload["contextId"], 17);
+        assert_eq!(evaluate.payload["objectGroup"], "test");
+        assert_eq!(evaluate.payload["timeout"], 250);
     }
 
     #[test]

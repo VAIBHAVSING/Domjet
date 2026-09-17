@@ -6876,6 +6876,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     this._timedOut = false;
     this._requestController = typeof AbortController === 'function' ? new AbortController() : null;
     this._fireEvent('loadstart');
+    if (this._requestToken !== token || this._aborted) return;
 
     const current = () => xhr._requestToken === token && !xhr._aborted && !xhr._timedOut;
     const clearRequestTimer = () => {
@@ -6905,6 +6906,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
         xhr._timedOut = true;
         xhr._aborted = true;
         xhr._requestToken += 1;
+        const terminalToken = xhr._requestToken;
         const controller = xhr._requestController;
         try { controller?.abort(new DOMException('The XHR request timed out.', 'TimeoutError')); } catch (_) {}
         completeRequest();
@@ -6913,7 +6915,9 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
         xhr.response = null;
         xhr.responseText = '';
         xhr._setReadyState(4);
+        if (xhr._requestToken !== terminalToken) return;
         xhr._fireEvent('timeout');
+        if (xhr._requestToken !== terminalToken) return;
         xhr._fireEvent('loadend');
       }, Math.min(timeout, 2 ** 31 - 1));
     }
@@ -6937,13 +6941,16 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       }
 
       xhr._setReadyState(2); // HEADERS_RECEIVED
+      if (!current()) return;
 
       const text = await resp.text();
       if (!current()) return;
 
       xhr.responseText = text;
       xhr._setReadyState(3); // LOADING
+      if (!current()) return;
       xhr._fireEvent('progress', { loaded: text.length, total: text.length, lengthComputable: true });
+      if (!current()) return;
 
       switch (xhr.responseType) {
         case 'json':
@@ -6966,9 +6973,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
           xhr.response = text;
       }
 
-      xhr._setReadyState(4); // DONE
       completeRequest();
+      xhr._setReadyState(4); // DONE
+      if (xhr._requestToken !== token) return;
       xhr._fireEvent('load');
+      if (xhr._requestToken !== token) return;
       xhr._fireEvent('loadend');
     }).catch((err) => {
       if (xhr._requestToken !== token || xhr._aborted || xhr._timedOut) return;
@@ -6976,12 +6985,15 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       xhr.status = 0;
       xhr.readyState = 4;
       xhr._fireEvent('readystatechange');
+      if (xhr._requestToken !== token) return;
       if (err && err.__aborted) {
         xhr._aborted = true;
         xhr._fireEvent('abort');
+        if (xhr._requestToken !== token) return;
         xhr._fireEvent('loadend');
       } else {
         xhr._fireEvent('error');
+        if (xhr._requestToken !== token) return;
         xhr._fireEvent('loadend');
       }
     });
@@ -6991,6 +7003,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     if (this.readyState === this.UNSENT || (this.readyState === this.DONE && !this._sendActive)) return;
     this._aborted = true;
     this._requestToken += 1;
+    const terminalToken = this._requestToken;
     if (this._timeoutId !== null) { clearTimeout(this._timeoutId); this._timeoutId = null; }
     try { this._requestController?.abort(); } catch (_) {}
     this._requestController = null;
@@ -6998,8 +7011,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     if (this.readyState > 0 && this.readyState < 4) {
       this.status = 0;
       this._setReadyState(4);
+      if (this._requestToken !== terminalToken) return;
       this._fireEvent('abort');
+      if (this._requestToken !== terminalToken) return;
       this._fireEvent('loadend');
+      if (this._requestToken !== terminalToken) return;
     }
     this.readyState = 0;
   }

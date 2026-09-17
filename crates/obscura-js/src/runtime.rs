@@ -13553,6 +13553,150 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn xhr_can_be_reused_from_its_done_callback_without_losing_new_request_state() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        Deno.core.ops.op_fetch_url = (url) => {
+                            calls.push(url);
+                            return JSON.stringify({
+                                status: 200,
+                                headers: {},
+                                body: calls.length === 1 ? "first" : "second",
+                                url,
+                            });
+                        };
+                        const xhr = new XMLHttpRequest();
+                        let done = 0;
+                        let afterReuse = null;
+                        let headerRejected = false;
+                        return await new Promise((resolve, reject) => {
+                            xhr.onerror = () => reject(new Error("XHR failed"));
+                            xhr.onreadystatechange = () => {
+                                if (xhr.readyState !== XMLHttpRequest.DONE) return;
+                                done += 1;
+                                if (done === 1) {
+                                    xhr.open("GET", "/two");
+                                    xhr.timeout = 5000;
+                                    xhr.send();
+                                    try {
+                                        xhr.setRequestHeader("x-too-late", "yes");
+                                    } catch (error) {
+                                        headerRejected = error.name === "InvalidStateError";
+                                    }
+                                    afterReuse = {
+                                        readyState: xhr.readyState,
+                                        sendActive: xhr._sendActive,
+                                        controllerPresent: xhr._requestController !== null,
+                                        timeoutPresent: xhr._timeoutId !== null,
+                                    };
+                                } else {
+                                    resolve({
+                                        calls,
+                                        done,
+                                        afterReuse,
+                                        headerRejected,
+                                        finalReadyState: xhr.readyState,
+                                        finalSendActive: xhr._sendActive,
+                                        finalControllerPresent: xhr._requestController !== null,
+                                        finalTimeoutPresent: xhr._timeoutId !== null,
+                                    });
+                                }
+                            };
+                            xhr.open("GET", "/one");
+                            xhr.timeout = 5000;
+                            xhr.send();
+                        });
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "calls": ["http://example.com/one", "http://example.com/two"],
+                "done": 2,
+                "afterReuse": {
+                    "readyState": 1,
+                    "sendActive": true,
+                    "controllerPresent": true,
+                    "timeoutPresent": true,
+                },
+                "headerRejected": true,
+                "finalReadyState": 4,
+                "finalSendActive": false,
+                "finalControllerPresent": false,
+                "finalTimeoutPresent": false,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn xhr_loadstart_reentrancy_does_not_continue_the_superseded_request() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        Deno.core.ops.op_fetch_url = (url) => {
+                            calls.push(url);
+                            return JSON.stringify({ status: 200, headers: {}, body: "ok", url });
+                        };
+                        const xhr = new XMLHttpRequest();
+                        let reused = false;
+                        return await new Promise((resolve, reject) => {
+                            xhr.onerror = () => reject(new Error("XHR failed"));
+                            xhr.onloadstart = () => {
+                                if (reused) return;
+                                reused = true;
+                                xhr.open("GET", "/two");
+                                xhr.send();
+                            };
+                            xhr.onload = () => resolve({
+                                calls,
+                                readyState: xhr.readyState,
+                                sendActive: xhr._sendActive,
+                            });
+                            xhr.open("GET", "/one");
+                            xhr.send();
+                        });
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "calls": ["http://example.com/two"],
+                "readyState": 4,
+                "sendActive": false,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dynamic_linked_stylesheet_enters_the_live_dom_with_imports_rebased() {
         let mut rt =
             setup_runtime("<html><head></head><body><div class=\"card\"></div></body></html>");

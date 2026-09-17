@@ -409,13 +409,21 @@ fn require_bytes(value: &str, maximum: usize, label: &str) -> Result<(), String>
 }
 
 fn validate_method(method: &str) -> Result<(), String> {
-    if method.is_empty() || method.len() > 16 || !method.bytes().all(|byte| byte.is_ascii_uppercase()) {
-        return Err("navigation method must be a short uppercase token".to_string());
+    if method.is_empty() || method.len() > 16 || !method.bytes().all(is_http_token_byte) {
+        return Err("navigation method must be a short HTTP token".to_string());
     }
     if matches!(method, "CONNECT" | "TRACE" | "TRACK") {
         return Err(format!("navigation method {method} is not allowed"));
     }
     Ok(())
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    matches!(byte,
+        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' |
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' |
+        b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+    )
 }
 
 pub(crate) fn parse_navigation_url(value: &str) -> Result<Url, String> {
@@ -443,6 +451,15 @@ fn to_json(value: &serde_json::Value) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_standard_http_tokens_and_rejects_forbidden_methods() {
+        assert!(validate_method("X-CUSTOM").is_ok());
+        assert!(validate_method("M-1").is_ok());
+        assert!(validate_method("patch").is_ok());
+        assert!(validate_method("BAD METHOD").is_err());
+        assert!(validate_method("CONNECT").is_err());
+    }
 
     fn begin(state: &mut NavigationState, url: &str) -> serde_json::Value {
         serde_json::from_str(&state.begin(url, "{}").unwrap()).unwrap()

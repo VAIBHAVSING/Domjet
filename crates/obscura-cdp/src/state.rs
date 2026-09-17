@@ -227,6 +227,10 @@ pub struct PageDisplayState {
     pub mobile: bool,
     pub emulated_media: String,
     pub focus_emulation: bool,
+    pub page_x: f64,
+    pub page_y: f64,
+    pub content_width: f64,
+    pub content_height: f64,
 }
 
 impl Default for PageDisplayState {
@@ -238,6 +242,10 @@ impl Default for PageDisplayState {
             mobile: false,
             emulated_media: String::new(),
             focus_emulation: false,
+            page_x: 0.0,
+            page_y: 0.0,
+            content_width: f64::from(DEFAULT_VIEWPORT_WIDTH),
+            content_height: f64::from(DEFAULT_VIEWPORT_HEIGHT),
         }
     }
 }
@@ -746,6 +754,26 @@ impl BrowserState {
 
     /// Drain at most `max_items` and `max_bytes` complete event frames.
     pub fn drain_events(&mut self, connection: ConnectionId, max_items: usize, max_bytes: usize) -> Vec<CdpEvent> {
+        self.drain_events_with_overhead(connection, max_items, max_bytes, 0)
+    }
+
+    pub fn drain_framed_events(
+        &mut self,
+        connection: ConnectionId,
+        max_items: usize,
+        max_bytes: usize,
+        frame_overhead: usize,
+    ) -> Vec<CdpEvent> {
+        self.drain_events_with_overhead(connection, max_items, max_bytes, frame_overhead)
+    }
+
+    fn drain_events_with_overhead(
+        &mut self,
+        connection: ConnectionId,
+        max_items: usize,
+        max_bytes: usize,
+        frame_overhead: usize,
+    ) -> Vec<CdpEvent> {
         let Some(queue) = self.events.get_mut(&connection) else {
             return Vec::new();
         };
@@ -755,7 +783,10 @@ impl BrowserState {
             let Some(event) = queue.front() else {
                 break;
             };
-            let event_size = serde_json::to_vec(event).map_or(usize::MAX, |value| value.len());
+            let event_size = serde_json::to_vec(event)
+                .ok()
+                .and_then(|value| value.len().checked_add(frame_overhead))
+                .unwrap_or(usize::MAX);
             if event_size > max_bytes || bytes.saturating_add(event_size) > max_bytes {
                 break;
             }
@@ -889,7 +920,19 @@ impl BrowserState {
         now_secs: u64,
     ) -> Result<(), CdpFailure> {
         let context = self.context_for_page(page)?;
-        let current = self.cookies.entry(context).or_default();
+        self.merge_context_cookies_for_context(&context, cookies, now_secs)
+    }
+
+    pub fn merge_context_cookies_for_context(
+        &mut self,
+        context: &ContextId,
+        cookies: Vec<ContextCookieState>,
+        now_secs: u64,
+    ) -> Result<(), CdpFailure> {
+        if !self.contexts.contains_key(context) {
+            return Err(CdpFailure::UnknownContext(*context));
+        }
+        let current = self.cookies.entry(*context).or_default();
         let mut next = current.clone();
         for cookie in cookies {
             validate_cookie(&cookie)?;
@@ -918,7 +961,20 @@ impl BrowserState {
             return Err(CdpFailure::invalid_argument("cookie name or domain is invalid"));
         }
         let context = self.context_for_page(page)?;
-        if let Some(cookies) = self.cookies.get_mut(&context) {
+        self.delete_context_cookies_for_context(&context, name, domain, path)
+    }
+
+    pub fn delete_context_cookies_for_context(
+        &mut self,
+        context: &ContextId,
+        name: &str,
+        domain: &str,
+        path: Option<&str>,
+    ) -> Result<(), CdpFailure> {
+        if !self.contexts.contains_key(context) {
+            return Err(CdpFailure::UnknownContext(*context));
+        }
+        if let Some(cookies) = self.cookies.get_mut(context) {
             let domain = domain.trim_start_matches('.').to_ascii_lowercase();
             cookies.retain(|(cookie_domain, cookie_name, cookie_path), _| {
                 !(cookie_name == name
@@ -931,7 +987,46 @@ impl BrowserState {
 
     pub fn clear_context_cookies(&mut self, page: &PageId) -> Result<(), CdpFailure> {
         let context = self.context_for_page(page)?;
-        self.cookies.entry(context).or_default().clear();
+        self.clear_context_cookies_for_context(&context)
+    }
+
+    pub fn clear_context_cookies_for_context(
+        &mut self,
+        context: &ContextId,
+    ) -> Result<(), CdpFailure> {
+        if !self.contexts.contains_key(context) {
+            return Err(CdpFailure::UnknownContext(*context));
+        }
+        self.cookies.entry(*context).or_default().clear();
+        Ok(())
+    }
+
+    pub fn clear_context_cookies_for_origin(
+        &mut self,
+        page: &PageId,
+        origin: &str,
+    ) -> Result<(), CdpFailure> {
+        let context = self.context_for_page(page)?;
+        let url = url::Url::parse(origin)
+            .map_err(|_| CdpFailure::invalid_argument("origin must be an absolute URL"))?;
+        let host = url
+            .host_str()
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| CdpFailure::invalid_argument("origin must include a host"))?;
+        if let Some(cookies) = self.cookies.get_mut(&context) {
+            cookies.retain(|_, cookie| {
+                let domain = cookie.domain.trim_start_matches('.');
+                let applies_to_origin = if cookie.host_only {
+                    host.eq_ignore_ascii_case(domain)
+                } else {
+                    host.eq_ignore_ascii_case(domain)
+                        || host
+                            .strip_suffix(domain)
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                };
+                !applies_to_origin
+            });
+        }
         Ok(())
     }
 
@@ -977,6 +1072,36 @@ impl BrowserState {
         if display.is_default() {
             self.display.remove(page);
         }
+        Ok(())
+    }
+
+    pub fn set_layout_metrics(
+        &mut self,
+        page: &PageId,
+        page_x: f64,
+        page_y: f64,
+        content_width: f64,
+        content_height: f64,
+    ) -> Result<(), CdpFailure> {
+        if !self.pages.contains_key(page) {
+            return Err(CdpFailure::UnknownPage(*page));
+        }
+        if !page_x.is_finite()
+            || !page_y.is_finite()
+            || !content_width.is_finite()
+            || !content_height.is_finite()
+            || page_x < 0.0
+            || page_y < 0.0
+            || content_width <= 0.0
+            || content_height <= 0.0
+        {
+            return Err(CdpFailure::invalid_argument("layout metrics are outside portable limits"));
+        }
+        let display = self.display.entry(*page).or_default();
+        display.page_x = page_x;
+        display.page_y = page_y;
+        display.content_width = content_width.max(f64::from(display.width));
+        display.content_height = content_height.max(f64::from(display.height));
         Ok(())
     }
 
@@ -2533,6 +2658,18 @@ mod tests {
         assert_eq!(state.event_count(connection), 0);
         state.queue_event(connection, CdpEvent::new("Test.event", serde_json::json!({}))).unwrap();
         let drained = state.drain_events(connection, 1, MAX_EVENT_BYTES_PER_CONNECTION);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(state.event_count(connection), 0);
+
+        let event = CdpEvent::new("Test.small", serde_json::json!({"ok": true}));
+        let framed_bytes = serde_json::to_vec(&event).unwrap().len() + 4;
+        state.queue_event(connection, event).unwrap();
+        let drained = state.drain_framed_events(
+            connection,
+            MAX_EVENTS_PER_CONNECTION,
+            framed_bytes,
+            4,
+        );
         assert_eq!(drained.len(), 1);
         assert_eq!(state.event_count(connection), 0);
     }

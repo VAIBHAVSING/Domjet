@@ -1,4 +1,4 @@
-use encoding_rs::{DecoderResult, EncoderResult, Encoding};
+use encoding_rs::{CoderResult, DecoderResult, EncoderResult, Encoding};
 
 /// WHATWG canonical lowercase name for an encoding label.
 pub fn encoding_for_label(label: &str) -> Option<String> {
@@ -20,15 +20,28 @@ pub fn decode_with_label(
     };
     if fatal {
         let mut output = String::with_capacity(bytes.len() + 1);
-        let (result, _) = decoder.decode_to_string_without_replacement(bytes, &mut output, true);
-        match result {
-            DecoderResult::InputEmpty => Some(output),
-            _ => None,
+        let mut input = bytes;
+        loop {
+            let (result, read) =
+                decoder.decode_to_string_without_replacement(input, &mut output, true);
+            input = &input[read..];
+            match result {
+                DecoderResult::InputEmpty => return Some(output),
+                DecoderResult::OutputFull => output.reserve(input.len().max(32)),
+                DecoderResult::Malformed(_, _) => return None,
+            }
         }
     } else {
         let mut output = String::with_capacity(bytes.len() * 2 + 1);
-        let _ = decoder.decode_to_string(bytes, &mut output, true);
-        Some(output)
+        let mut input = bytes;
+        loop {
+            let (result, read, _) = decoder.decode_to_string(input, &mut output, true);
+            input = &input[read..];
+            match result {
+                CoderResult::InputEmpty => return Some(output),
+                CoderResult::OutputFull => output.reserve(input.len().max(32)),
+            }
+        }
     }
 }
 
@@ -110,6 +123,14 @@ mod tests {
     fn fatal_decoding_rejects_invalid_input() {
         assert_eq!(decode_with_label("utf-8", &[0xff], true, false), None);
         assert!(decode_with_label("utf-8", &[0xff], false, false).is_some());
+    }
+
+    #[test]
+    fn replacement_decoding_grows_past_the_initial_output_buffer() {
+        let bytes = vec![0xff; 1024];
+        let decoded = decode_with_label("utf-8", &bytes, false, false).unwrap();
+        assert_eq!(decoded.chars().count(), bytes.len());
+        assert!(decoded.len() > bytes.len() * 2);
     }
 
     #[test]

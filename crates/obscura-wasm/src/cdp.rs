@@ -212,6 +212,10 @@ struct FetchPattern {
 struct Target {
     document_handle: u32,
     revision: u32,
+    host_document_handle: Option<u32>,
+    host_revision: Option<u32>,
+    scroll_x: f32,
+    scroll_y: f32,
     paused_fetches: BTreeMap<String, PausedFetch>,
     core: ObscuraCore,
 }
@@ -240,6 +244,7 @@ pub struct PortableCdp {
     io: obscura_cdp::portable_io::IoState,
     fetch_resolutions: VecDeque<Value>,
     raw_abi_mode: bool,
+    raw_request_pending: bool,
     #[cfg(feature = "render")]
     memory_trace_enabled: bool,
 }
@@ -272,6 +277,10 @@ impl PortableCdp {
             Target {
                 document_handle,
                 revision,
+                host_document_handle: None,
+                host_revision: None,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
                 paused_fetches: BTreeMap::new(),
                 core,
             },
@@ -285,6 +294,7 @@ impl PortableCdp {
             io: obscura_cdp::portable_io::IoState::with_limits(128, MAX_STREAM_BYTES),
             fetch_resolutions: VecDeque::new(),
             raw_abi_mode: false,
+            raw_request_pending: false,
             #[cfg(feature = "render")]
             memory_trace_enabled: false,
         })
@@ -394,20 +404,20 @@ impl PortableCdp {
     pub fn complete_action(&mut self, action_id: u32, result_json: &str) -> Result<String, JsValue> {
         bounded(result_json, MAX_ACTION_RESULT_BYTES, "CDP action result")?;
         let shared_action_id = EngineActionId::new(u64::from(action_id));
-        let (request_id, session_id, target_id, action_is_live, is_navigation) = {
+        let (request_id, session_id, target_id, action_is_live, replaces_document) = {
             let metadata = self
                 .shared_state
                 .host_action_wire_view(shared_action_id)
                 .map_err(|_| js_error("stale or unknown CDP action"))?;
             let target_id = format!("page-{}", metadata.metadata.target_page.get());
             let action_is_live = self.action_is_live(&metadata.metadata, &target_id);
-            let is_navigation = matches!(metadata.kind, "navigate" | "reload" | "setDocumentContent");
+            let replaces_document = matches!(metadata.kind, "navigate" | "reload");
             (
                 metadata.metadata.request.clone(),
                 metadata.metadata.session_id.map(str::to_owned),
                 target_id,
                 action_is_live,
-                is_navigation,
+                replaces_document,
             )
         };
         if !action_is_live {
@@ -444,32 +454,9 @@ impl PortableCdp {
                 return Err(js_error(&format!("shared CDP action completion failed: {error}")));
             }
         }
-        if is_navigation && !is_failure {
-            if let Some(state) = result.get("__obscuraState").and_then(Value::as_object) {
-                let document_url = shared_page_id(&target_id)
-                    .and_then(|page| self.shared_state.page(&page))
-                    .map(|page| page.url.clone())
-                    .unwrap_or_default();
-                if let Some(target) = self.targets.get_mut(&target_id) {
-                    if let Some(document_handle) = state.get("documentHandle").and_then(Value::as_u64) {
-                        target.document_handle = u32::try_from(document_handle).map_err(|_| js_error("document handle exceeds u32"))?;
-                    }
-                    if let Some(revision) = state.get("revision").and_then(Value::as_u64) {
-                        target.revision = u32::try_from(revision).map_err(|_| js_error("page revision exceeds u32"))?;
-                    }
-                    if let Some(html) = state.get("html").and_then(Value::as_str) {
-                        target
-                            .core
-                            .set_html(html)
-                            .map_err(|_| js_error("portable CDP document replacement failed"))?;
-                        target
-                            .core
-                            .set_document_metadata(&document_url, "", "UTF-8")
-                            .map_err(|_| js_error("portable CDP document metadata update failed"))?;
-                        target.document_handle = target.core.document_handle();
-                        target.revision = target.core.page_revision();
-                    }
-                }
+        if !is_failure {
+            if let Some(state) = result.get("__obscuraState").and_then(Value::as_object).cloned() {
+                self.apply_target_state(&target_id, &state, replaces_document)?;
             }
         }
         let mut network_metadata = None;
@@ -520,6 +507,21 @@ impl PortableCdp {
         let metadata: Value = serde_json::from_str(metadata_json)
             .map_err(|error| js_error(&format!("invalid CDP network metadata: {error}")))?;
         self.record_network_metadata(target_id, &metadata)
+    }
+
+    /// Synchronize a host-owned JavaScript document after work which completed
+    /// outside a pending CDP action, such as a timer or fetch callback.
+    #[wasm_bindgen(js_name = syncTargetState)]
+    pub fn sync_target_state_json(
+        &mut self,
+        target_id: &str,
+        state_json: &str,
+    ) -> Result<(), JsValue> {
+        bounded(target_id, MAX_METHOD_BYTES, "CDP target ID")?;
+        bounded(state_json, MAX_ACTION_RESULT_BYTES, "CDP target state")?;
+        let state: Map<String, Value> = serde_json::from_str(state_json)
+            .map_err(|error| js_error(&format!("invalid portable target state: {error}")))?;
+        self.apply_target_state(target_id, &state, false)
     }
 
     /// Ask the portable CDP state whether a host-owned request must pause for
@@ -656,6 +658,155 @@ impl PortableCdp {
 }
 
 impl PortableCdp {
+    fn validate_target_state(
+        &self,
+        target_id: &str,
+        state: &Map<String, Value>,
+    ) -> Result<(), JsValue> {
+        if !self.targets.contains_key(target_id) {
+            return Err(js_error("portable CDP document target is not known"));
+        }
+        for (name, maximum) in [("documentHandle", u64::from(u32::MAX)), ("revision", u64::from(u32::MAX))] {
+            if let Some(value) = state.get(name) {
+                let value = value
+                    .as_u64()
+                    .ok_or_else(|| js_error(&format!("{name} must be an unsigned integer")))?;
+                if value > maximum {
+                    return Err(js_error(&format!("{name} exceeds u32")));
+                }
+            }
+        }
+        for name in ["scrollX", "scrollY", "contentWidth", "contentHeight"] {
+            if let Some(value) = state.get(name) {
+                value
+                    .as_f64()
+                    .filter(|value| value.is_finite() && *value >= 0.0 && *value <= f64::from(f32::MAX))
+                    .ok_or_else(|| js_error(&format!("{name} must be a finite non-negative number")))?;
+            }
+        }
+        if let Some(html) = state.get("html") {
+            let html = html
+                .as_str()
+                .ok_or_else(|| js_error("portable target html must be a string"))?;
+            bounded(html, crate::MAX_HTML_INPUT_BYTES, "portable target html")?;
+        }
+        if let Some(url) = state.get("url") {
+            let url = url
+                .as_str()
+                .ok_or_else(|| js_error("portable target URL must be a string"))?;
+            bounded(url, crate::MAX_DOCUMENT_METADATA_BYTES, "portable target URL")?;
+        }
+        if state
+            .get("documentReplaced")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(js_error("documentReplaced must be a boolean"));
+        }
+        Ok(())
+    }
+
+    fn apply_target_state(
+        &mut self,
+        target_id: &str,
+        state: &Map<String, Value>,
+        replaces_document: bool,
+    ) -> Result<(), JsValue> {
+        self.validate_target_state(target_id, state)?;
+        let host_document_handle = state
+            .get("documentHandle")
+            .and_then(Value::as_u64)
+            .map(|value| u32::try_from(value).map_err(|_| js_error("document handle exceeds u32")))
+            .transpose()?;
+        let host_revision = state
+            .get("revision")
+            .and_then(Value::as_u64)
+            .map(|value| u32::try_from(value).map_err(|_| js_error("page revision exceeds u32")))
+            .transpose()?;
+        let finite_f32 = |name: &str| -> Result<Option<f32>, JsValue> {
+            let Some(value) = state.get(name) else { return Ok(None) };
+            let value = value
+                .as_f64()
+                .filter(|value| value.is_finite() && *value >= 0.0 && *value <= f64::from(f32::MAX))
+                .ok_or_else(|| js_error(&format!("{name} must be a finite non-negative number")))?;
+            Ok(Some(value as f32))
+        };
+        let scroll_x = finite_f32("scrollX")?;
+        let scroll_y = finite_f32("scrollY")?;
+        let content_width = finite_f32("contentWidth")?;
+        let content_height = finite_f32("contentHeight")?;
+        let document_url = state
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                shared_page_id(target_id)
+                    .and_then(|page| self.shared_state.page(&page))
+                    .map(|page| page.url.clone())
+            })
+            .unwrap_or_default();
+        let target = self
+            .targets
+            .get_mut(target_id)
+            .ok_or_else(|| js_error("portable CDP document target is not known"))?;
+        let identity_changed = host_document_handle
+            .is_some_and(|value| target.host_document_handle != Some(value))
+            || host_revision.is_some_and(|value| target.host_revision != Some(value));
+        let replaces_document = state
+            .get("documentReplaced")
+            .and_then(Value::as_bool)
+            .unwrap_or(replaces_document);
+        if let Some(html) = state.get("html").and_then(Value::as_str) {
+            if identity_changed || (host_document_handle.is_none() && host_revision.is_none()) {
+                if replaces_document {
+                    target
+                        .core
+                        .set_html(html)
+                        .map_err(|_| js_error("portable CDP document replacement failed"))?;
+                } else {
+                    target
+                        .core
+                        .sync_html_preserving_handles(html)
+                        .map_err(|_| js_error("portable CDP document synchronization failed"))?;
+                }
+                target
+                    .core
+                    .set_document_metadata(&document_url, "", "UTF-8")
+                    .map_err(|_| js_error("portable CDP document metadata update failed"))?;
+                target.document_handle = target.core.document_handle();
+                target.revision = target.core.page_revision();
+            }
+        }
+        if host_document_handle.is_some() {
+            target.host_document_handle = host_document_handle;
+        }
+        if host_revision.is_some() {
+            target.host_revision = host_revision;
+        }
+        if let Some(value) = scroll_x {
+            target.scroll_x = value;
+        }
+        if let Some(value) = scroll_y {
+            target.scroll_y = value;
+        }
+        let page_x = f64::from(target.scroll_x);
+        let page_y = f64::from(target.scroll_y);
+        if scroll_x.is_some() || scroll_y.is_some() || content_width.is_some() || content_height.is_some() {
+            let page = shared_page_id(target_id)
+                .ok_or_else(|| js_error("portable CDP document target is not known"))?;
+            let display = self.shared_state.display_state(&page).cloned().unwrap_or_default();
+            self.shared_state
+                .set_layout_metrics(
+                    &page,
+                    page_x,
+                    page_y,
+                    f64::from(content_width.unwrap_or(display.width as f32)),
+                    f64::from(content_height.unwrap_or(display.height as f32)),
+                )
+                .map_err(|error| js_error(&format!("portable layout state update failed: {error}")))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn export_context(&self, context_id: u32) -> Result<Vec<u8>, JsValue> {
         let context = shared_context_id(&format!("context-{context_id}"))
             .ok_or_else(|| js_error("context ID is invalid"))?;
@@ -720,7 +871,7 @@ impl PortableCdp {
         &mut self,
         connection_id: u32,
         message: &[u8],
-    ) -> Result<Vec<u8>, JsValue> {
+    ) -> Result<Option<Vec<u8>>, JsValue> {
         if message.len() > MAX_MESSAGE_BYTES {
             return Err(js_range_error(&format!(
                 "CDP message exceeds the {MAX_MESSAGE_BYTES}-byte limit"
@@ -729,9 +880,15 @@ impl PortableCdp {
         let message = std::str::from_utf8(message)
             .map_err(|_| js_error("CDP message must be valid UTF-8 JSON"))?;
         self.raw_abi_mode = true;
+        self.raw_request_pending = false;
         let result = self.cdp_request(connection_id, message);
+        let pending = self.raw_request_pending;
         self.raw_abi_mode = false;
+        self.raw_request_pending = false;
         let text = result?;
+        if pending {
+            return Ok(None);
+        }
         let mut response: Value = serde_json::from_str(&text)
             .map_err(|error| js_error(&format!("CDP response serialization failed: {error}")))?;
         if let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) {
@@ -744,7 +901,7 @@ impl PortableCdp {
                 "CDP response exceeds the {MAX_MESSAGE_BYTES}-byte limit"
             )));
         }
-        Ok(bytes)
+        Ok(Some(bytes))
     }
 
     pub(crate) fn drain_raw_actions(
@@ -810,13 +967,14 @@ impl PortableCdp {
         if max_items == 0 {
             return Ok(Vec::new());
         }
-        // Leave room for one four-byte prefix per possible frame. The shared
-        // queue then removes only complete events that fit the raw envelope.
-        let payload_limit = max_bytes.saturating_sub(4usize.saturating_mul(max_items));
-        let events = self.shared_state.drain_events(
+        // Charge each event only for the frame header it actually consumes.
+        // Reserving headers for the requested maximum can otherwise reduce a
+        // small output budget to zero even when a queued frame fits.
+        let events = self.shared_state.drain_framed_events(
             ConnectionId::new(u64::from(connection_id)),
             max_items,
-            payload_limit,
+            max_bytes,
+            4,
         );
         events
             .into_iter()
@@ -848,7 +1006,127 @@ impl PortableCdp {
         Ok(response.into_bytes())
     }
 
+    pub(crate) fn preview_raw_completion(
+        &self,
+        action_id: u32,
+        generation: u64,
+        result: &[u8],
+    ) -> Result<Vec<u8>, JsValue> {
+        let shared_action_id = EngineActionId::new(u64::from(action_id));
+        let expected_generation = self
+            .shared_state
+            .host_action_wire_view(shared_action_id)
+            .map(|action| action.generation)
+            .map_err(|_| js_error("stale or unknown CDP action"))?;
+        if generation != expected_generation {
+            return Err(js_error("stale CDP action generation"));
+        }
+        let result = std::str::from_utf8(result)
+            .map_err(|_| js_error("CDP action result must be valid UTF-8 JSON"))?;
+        self.preview_completion(action_id, result)
+    }
+
+    fn preview_completion(&self, action_id: u32, result_json: &str) -> Result<Vec<u8>, JsValue> {
+        bounded(result_json, MAX_ACTION_RESULT_BYTES, "CDP action result")?;
+        let shared_action_id = EngineActionId::new(u64::from(action_id));
+        let metadata = self
+            .shared_state
+            .host_action_wire_view(shared_action_id)
+            .map_err(|_| js_error("stale or unknown CDP action"))?;
+        let target_id = format!("page-{}", metadata.metadata.target_page.get());
+        if !self.action_is_live(&metadata.metadata, &target_id) {
+            return Err(js_error("CDP action target session is no longer live"));
+        }
+        let mut result: Value = serde_json::from_str(result_json)
+            .map_err(|error| js_error(&format!("invalid CDP action result: {error}")))?;
+        let shared_result = if let Some(error) = result.get("error").and_then(Value::as_object) {
+            let message = error.get("message").and_then(Value::as_str).unwrap_or("Portable host action failed");
+            EngineActionResult::Failed(CdpFailure::host(message))
+        } else {
+            EngineActionResult::Value(result.clone())
+        };
+        self.shared_state
+            .validate_action_completion(shared_action_id, &shared_result)
+            .map_err(|error| js_error(&format!("stale or unknown CDP action: {error}")))?;
+        if let Some(state) = result.get("__obscuraState") {
+            let state = state
+                .as_object()
+                .ok_or_else(|| js_error("portable target state must be an object"))?;
+            self.validate_target_state(&target_id, state)?;
+        }
+        if let Some(network) = result.get("__obscuraNetwork") {
+            self.validate_network_metadata(&target_id, network)?;
+        }
+        let network_metadata = result
+            .as_object_mut()
+            .and_then(|object| object.remove("__obscuraNetwork"));
+        drop(network_metadata);
+        if let Value::Object(ref mut object) = result {
+            object.remove("__obscuraState");
+        }
+        let response = if let Value::Object(object) = result {
+            if let Some(error) = object.get("error").and_then(Value::as_object) {
+                let code = error.get("code").and_then(Value::as_i64).and_then(|value| i32::try_from(value).ok()).unwrap_or(-32603);
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Portable host action failed");
+                cdp_error_response_with_data(
+                    metadata.metadata.request,
+                    code,
+                    message,
+                    error.get("data"),
+                    metadata.metadata.session_id,
+                )
+            } else {
+                cdp_result_response(metadata.metadata.request, Value::Object(object), metadata.metadata.session_id)
+            }
+        } else {
+            cdp_result_response(metadata.metadata.request, result, metadata.metadata.session_id)
+        };
+        serde_json::to_vec(&response)
+            .map_err(|error| js_error(&format!("CDP response serialization failed: {error}")))
+    }
+
+    fn validate_network_metadata(&self, target_id: &str, metadata: &Value) -> Result<(), JsValue> {
+        let Some(events) = metadata.as_array() else {
+            return Err(js_error("portable network metadata must be an array"));
+        };
+        if events.len() > MAX_EVENT_QUEUE {
+            return Err(js_range_error("portable network metadata exceeds the event limit"));
+        }
+        let shared_page = shared_page_id(target_id)
+            .filter(|page| self.shared_state.page(page).is_some());
+        if !self.targets.contains_key(target_id) || shared_page.is_none() {
+            return Err(js_error("portable network target is not known"));
+        }
+        for event in events {
+            let Some(event) = event.as_object() else {
+                return Err(js_error("portable network event must be an object"));
+            };
+            let request_id = event.get("requestId").and_then(Value::as_str).unwrap_or("");
+            let url = event.get("url").and_then(Value::as_str).unwrap_or("");
+            if request_id.is_empty() || request_id.len() > MAX_METHOD_BYTES || url.len() > MAX_NAVIGATION_URL_BYTES {
+                return Err(js_error("portable network event has an invalid request identity"));
+            }
+            if !event.get("responseHeaders").is_none_or(Value::is_object) {
+                return Err(js_error("portable network response headers must be an object"));
+            }
+            if let Some(body_base64) = event.get("bodyBase64").and_then(Value::as_str) {
+                bounded(body_base64, MAX_ACTION_RESULT_BYTES, "portable network response body")?;
+                let body = BASE64
+                    .decode(body_base64)
+                    .map_err(|_| js_error("portable network response body is not valid base64"))?;
+                if body.len() > MAX_RESPONSE_BODY_BYTES {
+                    return Err(js_range_error("portable network response body exceeds the 4MiB limit"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn record_network_metadata(&mut self, target_id: &str, metadata: &Value) -> Result<(), JsValue> {
+        self.validate_network_metadata(target_id, metadata)?;
         let Some(events) = metadata.as_array() else {
             return Err(js_error("portable network metadata must be an array"));
         };
@@ -1259,7 +1537,12 @@ impl PortableCdp {
         if !self.connections.contains_key(&connection_id) {
             return cdp_error_response(&request.id, -32000, "unknown CDP connection", request.session_id.as_deref());
         }
-        if request.session_id.is_none() {
+        let is_browser_session = request.session_id.as_deref().is_some_and(|session| {
+            self.connections
+                .get(&connection_id)
+                .is_some_and(|connection| connection.browser_session == session)
+        });
+        if request.session_id.is_none() || is_browser_session {
             return self.dispatch_browser(connection_id, request);
         }
         let (target_id, session_id) = match self.target_for_session(connection_id, request.session_id.as_deref()) {
@@ -1276,6 +1559,11 @@ impl PortableCdp {
 
     fn dispatch_browser(&mut self, connection_id: u32, request: Request) -> Value {
         let session = request.session_id.as_deref();
+        if obscura_cdp::portable_storage::supports_browser(&request.method) {
+            if let Some(response) = self.shared_browser_storage_response(&request) {
+                return response;
+            }
+        }
         if matches!(
             request.method.as_str(),
             "Browser.getVersion"
@@ -1462,7 +1750,7 @@ impl PortableCdp {
         } else {
             Vec::new()
         };
-        let disposing_sessions = if request.method == "Target.disposeBrowserContext" {
+        let disposing_targets = if request.method == "Target.disposeBrowserContext" {
             request
                 .params
                 .get("browserContextId")
@@ -1476,19 +1764,23 @@ impl PortableCdp {
                                 .and_then(|page| self.shared_state.context_for_page(&page).ok())
                                 == Some(context)
                         })
-                        .filter_map(|target_id| shared_page_id(target_id).map(|page| (target_id.clone(), page)))
-                        .flat_map(|(target_id, page)| {
-                            self.shared_state
-                                .sessions_for_page(page)
-                                .into_iter()
-                                .map(move |(session, connection)| (target_id.clone(), session, connection))
-                        })
+                        .cloned()
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default()
         } else {
             Vec::new()
         };
+        let disposing_sessions = disposing_targets
+            .iter()
+            .filter_map(|target_id| shared_page_id(target_id).map(|page| (target_id.clone(), page)))
+            .flat_map(|(target_id, page)| {
+                            self.shared_state
+                                .sessions_for_page(page)
+                                .into_iter()
+                                .map(move |(session, connection)| (target_id.clone(), session, connection))
+            })
+            .collect::<Vec<_>>();
         let response = obscura_cdp::portable_dispatch::dispatch_browser(&shared_request, &mut self.shared_state)?;
         if response.error.is_none() {
             match request.method.as_str() {
@@ -1503,23 +1795,8 @@ impl PortableCdp {
                     }
                 }
                 "Target.disposeBrowserContext" => {
-                    let context_id = request.params.get("browserContextId").and_then(Value::as_str);
-                    let doomed: Vec<String> = context_id
-                        .filter(|id| *id != "default")
-                        .map(|id| {
-                            self.targets
-                                .keys()
-                                .filter(|target_id| {
-                                    shared_page_id(target_id)
-                                        .and_then(|page| self.shared_state.context_for_page(&page).ok())
-                                        == shared_context_id(id)
-                                })
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    for target_id in doomed {
-                        self.destroy_target(&target_id);
+                    for target_id in &disposing_targets {
+                        self.destroy_target(target_id);
                     }
                     for (target_id, shared_session, shared_connection) in &disposing_sessions {
                         let Some(connection_id) = u32::try_from(shared_connection.get()).ok() else {
@@ -1597,6 +1874,91 @@ impl PortableCdp {
         serde_json::to_value(response).ok()
     }
 
+    fn context_target_ids(&self, context: ContextId) -> Vec<String> {
+        self.targets
+            .keys()
+            .filter(|target_id| {
+                shared_page_id(target_id)
+                    .and_then(|page| self.shared_state.context_for_page(&page).ok())
+                    == Some(context)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn merge_context_cookie_mirrors(&mut self, context: ContextId, now: u64) {
+        for target_id in self.context_target_ids(context) {
+            let cookies = self
+                .targets
+                .get(&target_id)
+                .and_then(|target| target.core.cdp_all_cookies(now).ok())
+                .and_then(|raw| serde_json::from_str::<Vec<ContextCookieState>>(&raw).ok())
+                .unwrap_or_default();
+            let _ = self
+                .shared_state
+                .merge_context_cookies_for_context(&context, cookies, now);
+        }
+    }
+
+    fn sync_context_cookie_mirrors(&mut self, context: ContextId, now: u64) {
+        let Ok(cookie_json) = self
+            .shared_state
+            .context_cookies_for_context_json(&context, now)
+        else {
+            return;
+        };
+        for target_id in self.context_target_ids(context) {
+            if let Some(target) = self.targets.get_mut(&target_id) {
+                target.core.cdp_clear_cookies();
+                let _ = target.core.cdp_import_cookies(&cookie_json, now);
+            }
+        }
+    }
+
+    fn shared_browser_storage_response(&mut self, request: &Request) -> Option<Value> {
+        let id = request.id.as_u64().unwrap_or(0);
+        let context = request
+            .params
+            .get("browserContextId")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        let parsed_context = shared_context_id(context);
+        let now = match cookie_clock(&request.params) {
+            Ok(now) => now,
+            Err(message) => {
+                return Some(cdp_error_response(
+                    &request.id,
+                    -32602,
+                    message,
+                    request.session_id.as_deref(),
+                ))
+            }
+        };
+        if let Some(context) = parsed_context.filter(|context| self.shared_state.context(context).is_some()) {
+            self.merge_context_cookie_mirrors(context, now);
+        }
+        let shared_request = obscura_cdp::protocol::CdpRequest {
+            id,
+            method: request.method.clone(),
+            params: Value::Object(request.params.clone()),
+            session_id: request.session_id.clone(),
+        };
+        let response = obscura_cdp::portable_storage::dispatch_browser(
+            &shared_request,
+            &mut self.shared_state,
+        );
+        if response.error.is_none() && request.method == "Storage.setCookies" {
+            if let Some(context) = parsed_context {
+                self.sync_context_cookie_mirrors(context, now);
+            }
+        }
+        let mut response = serde_json::to_value(response).ok()?;
+        if let Value::Object(object) = &mut response {
+            object.insert("id".to_string(), request.id.clone());
+        }
+        Some(response)
+    }
+
     fn shared_io_response(&mut self, connection_id: u32, request: &Request) -> Option<Value> {
         if !matches!(request.method.as_str(), "IO.read" | "IO.close") {
             return None;
@@ -1640,6 +2002,9 @@ impl PortableCdp {
             core: &mut target.core,
             width: display.width,
             height: display.height,
+            device_scale_factor: display.device_scale_factor,
+            scroll_x: target.scroll_x,
+            scroll_y: target.scroll_y,
             document_handle: target.document_handle,
             revision: target.revision,
         };
@@ -1668,6 +2033,27 @@ impl PortableCdp {
         }
         let id = request.id.as_u64()?;
         let page_id = shared_page_id(target_id)?;
+        #[cfg(feature = "render")]
+        if request.method == "Page.getLayoutMetrics" {
+            let display = self.shared_state.display_state(&page_id).cloned().unwrap_or_default();
+            let metrics = self.targets.get_mut(target_id).and_then(|target| {
+                let scroll = (target.scroll_x, target.scroll_y);
+                target
+                    .core
+                    .render_content_size(display.width, display.height)
+                    .ok()
+                    .map(|content| (scroll, content))
+            });
+            if let Some((scroll, content)) = metrics {
+                let _ = self.shared_state.set_layout_metrics(
+                    &page_id,
+                    f64::from(scroll.0),
+                    f64::from(scroll.1),
+                    f64::from(content.0),
+                    f64::from(content.1),
+                );
+            }
+        }
         let now = cookie_clock(&request.params).unwrap_or(0);
         if obscura_cdp::portable_storage::supports(&request.method) {
             let existing = self
@@ -2174,8 +2560,9 @@ impl PortableCdp {
             let _ = self.shared_state.claim_host_action(shared_action_id);
         } else {
             // The byte ABI delivers the queued action through
-            // drain_raw_actions. Return the exact empty CDP result envelope
-            // here and leave the ready marker untouched for that drain.
+            // drain_raw_actions. Suppress an early CDP success response and
+            // leave the ready marker untouched for that drain.
+            self.raw_request_pending = true;
             return cdp_result_response(&request.id, json!({}), request.session_id.as_deref());
         }
         let host_action = match self.shared_state.host_action(shared_action_id) {
@@ -2235,6 +2622,10 @@ impl PortableCdp {
         self.targets.insert(target_id.clone(), Target {
             document_handle: core.document_handle(),
             revision: core.page_revision(),
+            host_document_handle: None,
+            host_revision: None,
+            scroll_x: 0.0,
+            scroll_y: 0.0,
             paused_fetches: BTreeMap::new(),
             core,
         });
@@ -2606,20 +2997,86 @@ struct CoreRenderBackend<'a> {
     core: &'a mut ObscuraCore,
     width: u32,
     height: u32,
+    device_scale_factor: f64,
+    scroll_x: f32,
+    scroll_y: f32,
     document_handle: u32,
     revision: u32,
 }
 
 #[cfg(feature = "render")]
 impl obscura_cdp::portable_render::RenderBackend for CoreRenderBackend<'_> {
-    fn capture_screenshot(&mut self, _format: &str) -> Result<Vec<u8>, String> {
-        self.core
-            .screenshot_png(self.width, self.height, 0.0, 0.0)
-            .map_err(|_| "portable screenshot failed".to_string())
+    fn capture_screenshot(
+        &mut self,
+        options: &obscura_cdp::portable_render::ScreenshotOptions,
+    ) -> Result<Vec<u8>, String> {
+        let device_scale = if self.device_scale_factor > 0.0 {
+            self.device_scale_factor
+        } else {
+            1.0
+        };
+        let region = if let Some(clip) = options.clip {
+            let width = clip.width.trunc();
+            let height = clip.height.trunc();
+            let scale = clip.scale * device_scale;
+            let output_width = (width * scale).round();
+            let output_height = (height * scale).round();
+            if width <= 0.0
+                || height <= 0.0
+                || !scale.is_finite()
+                || scale <= 0.0
+                || !output_width.is_finite()
+                || !output_height.is_finite()
+                || output_width <= 0.0
+                || output_height <= 0.0
+                || output_width > f64::from(u32::MAX)
+                || output_height > f64::from(u32::MAX)
+            {
+                return Err("Page.captureScreenshot bitmap is too large".to_string());
+            }
+            obscura_render::CaptureRegion::with_output_size(
+                clip.x as f32,
+                clip.y as f32,
+                width as f32,
+                height as f32,
+                scale as f32,
+                output_width as u32,
+                output_height as u32,
+            )
+        } else if options.capture_beyond_viewport {
+            let content = self.core.render_content_size(self.width, self.height)?;
+            obscura_render::CaptureRegion::new(
+                0.0,
+                0.0,
+                content.0.max(self.width as f32),
+                content.1.max(self.height as f32),
+                device_scale as f32,
+            )
+        } else {
+            obscura_render::CaptureRegion::new(
+                self.scroll_x,
+                self.scroll_y,
+                self.width as f32,
+                self.height as f32,
+                device_scale as f32,
+            )
+        };
+        self.core.screenshot_region_png(
+            self.width,
+            self.height,
+            self.scroll_x,
+            self.scroll_y,
+            region,
+        )
     }
 
     fn print_to_pdf(&mut self, options: &Value) -> Result<Vec<u8>, String> {
-        let options = serde_json::to_string(options).map_err(|_| "invalid PDF options".to_string())?;
+        let mut options = options.clone();
+        if let Value::Object(object) = &mut options {
+            object.insert("viewportWidth".to_string(), json!(self.width));
+            object.insert("viewportHeight".to_string(), json!(self.height));
+        }
+        let options = serde_json::to_string(&options).map_err(|_| "invalid PDF options".to_string())?;
         self.core
             .pdf(&options, self.document_handle, self.revision)
             .map_err(|_| "portable PDF failed".to_string())
@@ -2729,11 +3186,13 @@ fn cdp_cookie_import(params: &Map<String, Value>, target_url: &str) -> Result<St
             .get("url")
             .and_then(Value::as_str)
             .and_then(cookie_url_host);
-        let domain = cookie
+        let explicit_domain = cookie
             .get("domain")
             .and_then(Value::as_str)
             .map(|domain| domain.trim_start_matches('.').to_ascii_lowercase())
-            .filter(|domain| !domain.is_empty())
+            .filter(|domain| !domain.is_empty());
+        let host_only = explicit_domain.is_none();
+        let domain = explicit_domain
             .or(url_host)
             .or_else(|| target_host.clone())
             .ok_or_else(|| format!("cookies[{index}] requires a domain or URL"))?;
@@ -2764,6 +3223,7 @@ fn cdp_cookie_import(params: &Map<String, Value>, target_url: &str) -> Result<St
             "httpOnly": cookie.get("httpOnly").and_then(Value::as_bool).unwrap_or(false),
             "sameSite": same_site,
             "expires": expires,
+            "hostOnly": host_only,
         });
         normalized.push(normalized_cookie);
     }
@@ -3417,14 +3877,7 @@ mod tests {
             r#"{{"id":"raw-id","sessionId":"{session}","method":"Runtime.getIsolateId","params":{{}}}}"#
         );
         let raw_response = cdp.raw_cdp_request(connection, raw_request.as_bytes()).unwrap();
-        let expected_raw_response = format!(r#"{{"id":"raw-id","result":{{}},"sessionId":"{session}"}}"#);
-        assert_eq!(std::str::from_utf8(&raw_response).unwrap(), expected_raw_response);
-        let response: Value = serde_json::from_slice(&raw_response).unwrap();
-        assert_eq!(response, serde_json::json!({
-            "id": "raw-id",
-            "result": {},
-            "sessionId": session,
-        }));
+        assert!(raw_response.is_none());
         assert!(cdp.drain_raw_actions(8, 1).is_err());
         let frames = cdp.drain_raw_actions(8, obscura_cdp::protocol::MAX_OUTPUT_BYTES).unwrap();
         assert_eq!(frames.len(), 1);
@@ -3468,6 +3921,108 @@ mod tests {
         assert_eq!(failed["error"]["code"], -32001);
         assert_eq!(failed["error"]["message"], "host timeout");
         assert_eq!(failed["error"]["data"]["retryable"], true);
+    }
+
+    #[test]
+    fn completed_evaluation_synchronizes_the_dom_used_by_cdp() {
+        let mut cdp = PortableCdp::new("<html><body><p id=old>Old</p></body></html>").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-1"}}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
+        cdp.poll_cdp_events(connection, 8).unwrap();
+        let root = cdp.targets["page-1"].document_handle;
+        let body = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":2,"sessionId":"{session}","method":"DOM.querySelector","params":{{"nodeId":{root},"selector":"body"}}}}"#),
+        ).unwrap())["result"]["nodeId"].as_u64().unwrap();
+        let request = serde_json::json!({
+            "id": 3,
+            "sessionId": session,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": "document.body.innerHTML = '<button id=\"new\">New</button>'",
+                "awaitPromise": true,
+                "contextId": 1
+            }
+        });
+        let queued = json(&cdp.cdp_request(connection, &request.to_string()).unwrap());
+        let action = &queued["result"]["obscuraAction"];
+        assert_eq!(action["payload"]["awaitPromise"], true);
+        assert_eq!(action["payload"]["contextId"], 1);
+        let action_id = action["actionId"].as_u64().unwrap() as u32;
+        cdp.complete_action(
+            action_id,
+            r#"{"result":{"type":"string","value":"New"},"__obscuraState":{"documentHandle":7,"revision":2,"html":"<html><body><button id=\"new\">New</button></body></html>"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(cdp.targets["page-1"].document_handle, root);
+        let selected = json(&cdp.cdp_request(
+            connection,
+            &format!(r##"{{"id":4,"sessionId":"{session}","method":"DOM.querySelector","params":{{"nodeId":{root},"selector":"#new"}}}}"##),
+        ).unwrap());
+        assert!(selected["result"]["nodeId"].as_u64().unwrap() > 0);
+        let selected_from_old_body = json(&cdp.cdp_request(
+            connection,
+            &format!(r##"{{"id":5,"sessionId":"{session}","method":"DOM.querySelector","params":{{"nodeId":{body},"selector":"#new"}}}}"##),
+        ).unwrap());
+        assert!(selected_from_old_body["result"]["nodeId"].as_u64().unwrap() > 0);
+        let old = json(&cdp.cdp_request(
+            connection,
+            &format!(r##"{{"id":6,"sessionId":"{session}","method":"DOM.querySelector","params":{{"nodeId":{root},"selector":"#old"}}}}"##),
+        ).unwrap());
+        assert!(old["result"]["nodeId"].as_u64().unwrap_or(0) == 0);
+    }
+
+    #[test]
+    fn disposing_context_removes_its_portable_target_objects() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let context = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.createBrowserContext"}"#,
+        ).unwrap())["result"]["browserContextId"].as_str().unwrap().to_string();
+        for id in 2..=3 {
+            let created = json(&cdp.cdp_request(
+                connection,
+                &format!(r#"{{"id":{id},"method":"Target.createTarget","params":{{"browserContextId":"{context}","url":"about:blank"}}}}"#),
+            ).unwrap());
+            assert!(cdp.targets.contains_key(created["result"]["targetId"].as_str().unwrap()));
+        }
+        assert_eq!(cdp.targets.len(), 3);
+        let disposed = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":4,"method":"Target.disposeBrowserContext","params":{{"browserContextId":"{context}"}}}}"#),
+        ).unwrap());
+        assert_eq!(disposed["result"], json!({}));
+        assert_eq!(cdp.targets.keys().cloned().collect::<Vec<_>>(), vec!["page-1"]);
+    }
+
+    #[test]
+    fn browser_session_routes_context_cookie_operations() {
+        let mut cdp = PortableCdp::new("").unwrap();
+        let connection = cdp.open_connection().unwrap();
+        let attached = json(&cdp.cdp_request(
+            connection,
+            r#"{"id":1,"method":"Target.attachToBrowserTarget"}"#,
+        ).unwrap());
+        let session = attached["result"]["sessionId"].as_str().unwrap();
+        let set = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":2,"sessionId":"{session}","method":"Storage.setCookies","params":{{"cookies":[{{"name":"sid","value":"one","url":"https://example.test/"}}]}}}}"#),
+        ).unwrap());
+        assert_eq!(set["result"], json!({}));
+        assert_eq!(set["sessionId"], session);
+        let cookies = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":3,"sessionId":"{session}","method":"Storage.getCookies","params":{{}}}}"#),
+        ).unwrap());
+        assert_eq!(cookies["sessionId"], session);
+        assert_eq!(cookies["result"]["cookies"][0]["name"], "sid");
+        assert_eq!(cookies["result"]["cookies"][0]["hostOnly"], true);
     }
 
     #[test]
@@ -4187,7 +4742,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[test]
     fn portable_render_commands_complete_inside_wasm() {
-        let mut cdp = PortableCdp::new("<html><body><h1>WASM</h1></body></html>").unwrap();
+        let mut cdp = PortableCdp::new("<html><body><h1>WASM</h1><div style=\"height:1000px\"></div></body></html>").unwrap();
         let connection = cdp.open_connection().unwrap();
         let attached = json(&cdp
             .cdp_request(
@@ -4198,20 +4753,36 @@ mod tests {
         let session = attached["result"]["sessionId"].as_str().unwrap().to_string();
         cdp.poll_cdp_events(connection, 8).unwrap();
 
+        let metrics_override = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":2,"sessionId":"{session}","method":"Emulation.setDeviceMetricsOverride","params":{{"width":320,"height":200,"deviceScaleFactor":2}}}}"#),
+        ).unwrap());
+        assert_eq!(metrics_override["result"], json!({}));
+        cdp.sync_target_state_json("page-1", r#"{"scrollX":0,"scrollY":50}"#).unwrap();
+        let metrics = json(&cdp.cdp_request(
+            connection,
+            &format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.getLayoutMetrics"}}"#),
+        ).unwrap());
+        assert_eq!(metrics["result"]["layoutViewport"]["clientHeight"], 200);
+        assert_eq!(metrics["result"]["layoutViewport"]["pageY"], 50.0);
+        assert!(metrics["result"]["contentSize"]["height"].as_f64().unwrap() > 200.0);
+
         let screenshot = json(&cdp
             .cdp_request(
                 connection,
-                &format!(r#"{{"id":2,"sessionId":"{session}","method":"Page.captureScreenshot","params":{{"format":"png"}}}}"#),
+                &format!(r#"{{"id":4,"sessionId":"{session}","method":"Page.captureScreenshot","params":{{"format":"png","clip":{{"x":0,"y":0,"width":100,"height":50,"scale":1}}}}}}"#),
             )
             .unwrap());
         assert!(screenshot["error"].is_null(), "{screenshot}");
         let png = BASE64.decode(screenshot["result"]["data"].as_str().unwrap()).unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 200);
+        assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 100);
 
         let pdf = json(&cdp
             .cdp_request(
                 connection,
-                &format!(r#"{{"id":3,"sessionId":"{session}","method":"Page.printToPDF","params":{{"transferMode":"ReturnAsBase64"}}}}"#),
+                &format!(r#"{{"id":5,"sessionId":"{session}","method":"Page.printToPDF","params":{{"transferMode":"ReturnAsBase64","pageRanges":"","displayHeaderFooter":false,"headerTemplate":"","footerTemplate":"","preferCSSPageSize":false}}}}"#),
             )
             .unwrap());
         assert!(pdf["error"].is_null(), "{pdf}");
