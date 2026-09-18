@@ -1,0 +1,36 @@
+{
+  "name": "domjet-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "build": "npm run build -w @domjet/browser-protocol && npm run build -w @domjet/browser-storage && npm run build -w @domjet/browser-runtime && npm run build -w domjet",
+    "prepare:browser": "npm run prepare:runtime -w domjet",
+    "test": "npm test -w domjet && npm test -w @domjet/browser-runtime && npm test -w @domjet/browser-storage && npm test -w @domjet/browser-protocol"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "version": "1.0.0",
+  "description": "Domjet: a lightweight embedded browser SDK for Node.js.",
+  "dependencies": {
+    "esbuild": "^0.28.2",
+    "undici-types": "^7.18.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VAIBHAVSING/domjet.git"
+  },
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/VAIBHAVSING/domjet/issues"
+  },
+  "homepage": "https://domjet.dev"
+}
