@@ -1,0 +1,38 @@
+---
+title: Compatibility
+description: Supported Domjet workflows and known adapter limitations.
+sidebar:
+  order: 3
+---
+
+Domjet provides a direct browser API and experimental CDP adapters. It does not
+implement every Chromium Web API or every Playwright and Puppeteer operation.
+Start with the [direct API](/docs/getting-started/).
+
+## Launch review: 10 September 2026
+
+The direct API and CLI passed packaged-artifact checks for navigation,
+evaluation, screenshots, and PDF. The Node suite passed 102 tests with the real
+WASM artifact. A separately enabled Playwright integration test failed.
+
+These failures reproduce both before and after the rebrand:
+
+- `puppeteer-core@25.10.0`: creating a page fails because `Audits.enable` is not
+  implemented by the Node CDP server.
+- `playwright-core@1.63.0`: basic navigation, evaluation, and screenshots work,
+  but `locator('h1').textContent()` fails with
+  `injected2.querySelectorAll is not a function`.
+
+These are release blockers for claiming full support for those clients. Broad
+peer dependency ranges do not guarantee every client method works. Use the
+direct API for the verified workflows until the adapter failures are fixed and
+their integration tests pass. The rebrand leaves WASM bytes and algorithms unchanged.
+
+## Runtime boundaries
+
+Node supplies page JavaScript and networking. The native Rust engine's optional
+wreq/BoringSSL stealth transport is not included in the Node package. Native
+engine benchmark numbers are not measurements of the Node/WASM package.
+
+Workers and VM contexts run within the Node process. For untrusted workloads,
+use suitable operating-system isolation and network controls.

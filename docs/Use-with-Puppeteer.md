@@ -1,17 +1,17 @@
 ## Setup
 
 ```bash
-obscura serve --port 9222
-npm install puppeteer-core
+npm install domjet puppeteer-core
+npx domjet serve --port 9222 --json
 ```
 
 ## Connect
 
 ```js
-const puppeteer = require('puppeteer-core');
+import puppeteer from 'puppeteer-core';
 
 const browser = await puppeteer.connect({
-  browserWSEndpoint: 'ws://127.0.0.1:9222',
+  browserURL: 'http://127.0.0.1:9222',
 });
 ```
 
@@ -26,7 +26,7 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 await page.goto('https://example.com', { waitUntil: 'networkidle0', timeout: 60000 });
 ```
 
-Default `waitUntil` is `domcontentloaded`. Other values: `load`, `networkidle2`, `networkidle0`.
+Pass `waitUntil` explicitly to select `domcontentloaded`, `load`, `networkidle2`, or `networkidle0`.
 
 ## Evaluate
 
@@ -46,7 +46,7 @@ const items = await page.evaluate(() => {
 ```js
 await page.click('#login-button');
 await page.type('#username', 'alice');
-await page.fill('#password', 'secret');  // alias of .type for compat
+await page.type('#password', 'secret');
 
 await page.waitForSelector('#dashboard');
 await page.waitForFunction(() => window.appReady === true);
@@ -159,7 +159,7 @@ Frames are activity-driven page captures, not fixed-rate desktop video.
 ## Disconnect
 
 ```js
-await browser.disconnect();  // leaves obscura serve running
+await browser.disconnect();  // leaves the browser service running
 ```
 
 ## Current limits

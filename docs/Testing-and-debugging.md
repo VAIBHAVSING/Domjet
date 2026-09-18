@@ -1,3 +1,15 @@
+## Node/WASM package
+
+```bash
+npm ci
+npm run build
+DOMJET_REAL_WASM_MODULE="$PWD/packages/browser/wasm/obscura_wasm.cjs" DOMJET_REQUIRE_REAL_ARTIFACTS=1 npm test
+```
+
+The Domjet environment names above enable the real-artifact regression tests;
+without them some tests are skipped. For local network fixtures, pass
+`allowPrivateNetwork: true` to `createBrowser`.
+
 ## Test suites
 
 ### Rust unit and integration
@@ -32,7 +44,7 @@ Pattern:
 ```rust
 #[tokio::test(flavor = "current_thread")]
 async fn my_test() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    std::env::set_var("DOMJET_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve_once().await;
     let mut ctx = CdpContext::new();
     let page_id = ctx.create_page();
@@ -49,25 +61,25 @@ async fn my_test() {
 ## Logging
 
 ```bash
-RUST_LOG=obscura=info  obscura serve
-RUST_LOG=obscura=debug obscura serve
-RUST_LOG=obscura_cdp=trace,obscura_browser=debug obscura serve
+RUST_LOG=obscura=info cargo nextest run --release -p obscura-cdp
+RUST_LOG=obscura=debug cargo nextest run --release -p obscura-browser
+RUST_LOG=obscura_cdp=trace,obscura_browser=debug cargo nextest run --release -p obscura-cdp
 ```
 
 Logs go to stderr.
 
-`--verbose` on any subcommand is equivalent to `RUST_LOG=obscura=info`.
+`RUST_LOG` applies to native Rust integrations. The Node CLI has no `--verbose` flag.
 
 ## Driving the CDP server manually
 
 ```bash
-obscura serve --port 9222 --verbose
+npx domjet serve --port 9222 --json
 ```
 
 In another shell:
 
 ```bash
-wscat -c ws://127.0.0.1:9222
+wscat -c <wsEndpoint-from-serve-output>
 > {"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}
 > {"id":2,"method":"Target.attachToTarget","params":{"targetId":"...","flatten":true}}
 > {"id":3,"sessionId":"...-session","method":"Page.navigate","params":{"url":"https://example.com"}}
@@ -110,10 +122,8 @@ Start with the committed deterministic fixtures, then use the representative
 real-site suite at both the top and bottom of pages:
 
 ```bash
-RUN_ROOT="$(mktemp -d)"
-OBSCURA_BIN=./target/release/obscura render-repros/run.sh "$RUN_ROOT/fixtures"
-OBSCURA_BIN=./target/release/obscura render-repros/representative-suite/run.sh "$RUN_ROOT/top"
-OBSCURA_BIN=./target/release/obscura render-repros/representative-suite/run.sh "$RUN_ROOT/bottom" bottom
+npm run build
+npm test -w domjet
 ```
 
 Set `BASELINE_BIN` or `CHROMIUM_BIN` when producing paired captures. Keep the
@@ -125,27 +135,9 @@ fixture. Do not add hostname-specific render branches.
 
 ## Profiling
 
-CPU with `perf` and a flamegraph:
+For Node CPU profiles, run your workload with `node --cpu-prof script.mjs`.
+Use `launchProfileProcess({ profile: "diagnostic", memoryTrace: true })` to
+collect host, Worker, and WASM memory counters. Tracing is disabled by default.
 
-```bash
-cargo build --release --features render
-perf record -F 99 -g -- ./target/release/obscura fetch https://heavy-spa.example
-perf script | flamegraph.pl > flame.svg
-```
-
-Memory with heaptrack:
-
-```bash
-heaptrack ./target/release/obscura serve
-```
-
-Tokio task inspection:
-
-```bash
-RUSTFLAGS="--cfg tokio_unstable" cargo build --release --features render
-./target/release/obscura serve
-# in another shell
-tokio-console
-```
-
-Requires the workspace `tokio` dependency to be built with the `tracing` feature; not enabled by default, add it in the relevant `Cargo.toml` before profiling.
+Profile native Rust code separately with a release build and process-isolated
+nextest runs. Do not apply native Rust benchmark results to the npm package.
