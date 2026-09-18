@@ -17,15 +17,13 @@ pub struct BrowserContext {
     pub stealth: bool,
     /// When true, CDP-driven navigation to file:// URLs is permitted.
     /// Default is false: a remote CDP client cannot point the browser
-    /// at /etc/shadow even if Obscura is running as a privileged user.
-    /// Flip on via `obscura serve --allow-file-access` for legitimate
-    /// local-HTML testing workflows. The CLI's own `obscura fetch
-    /// file://...` path is unaffected because it does not go through
-    /// the CDP server.
+    /// at /etc/shadow even if Domjet is running as a privileged user.
+    /// Enable explicitly for legitimate local-HTML testing workflows.
     pub allow_file_access: bool,
     pub storage_dir: Option<PathBuf>,
     /// When true, the http client allows fetching localhost / RFC1918 /
-    /// link-local addresses. Set via `--allow-private-network` (issue #33).
+    /// link-local addresses. Set by the embedding API or server configuration
+    /// (issue #33).
     /// Independent of `allow_file_access` because they cover different threat
     /// models: file:// is a local file-system read, while private-network is
     /// the broader SSRF gate from issue #4.
@@ -59,8 +57,8 @@ impl BrowserContext {
     }
 
     /// Variant that also accepts the `allow_private_network` opt-in. All
-    /// pre-existing constructors default it to `false`; callers that want the
-    /// CLI's `--allow-private-network` (issue #33) behaviour go through here.
+    /// pre-existing constructors default it to `false`; callers that want
+    /// private-network access (issue #33) go through here.
     pub fn with_storage_and_network(
         id: String,
         proxy_url: Option<String>,

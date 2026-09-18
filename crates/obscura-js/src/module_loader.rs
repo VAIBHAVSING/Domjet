@@ -77,7 +77,7 @@ pub struct ObscuraModuleLoader {
     /// identity, redirect/security policy, interception, and callbacks as the
     /// entry module. Directly-constructed standalone loaders remain supported.
     page_state: Option<Weak<RefCell<ObscuraState>>>,
-    /// Directly-constructed loaders still use Obscura's network policy and
+    /// Directly-constructed loaders still use Domjet's network policy and
     /// connection pool; they simply have an isolated cookie jar.
     standalone_client: Option<Arc<obscura_net::ObscuraHttpClient>>,
     import_map: Rc<RefCell<ImportMap>>,

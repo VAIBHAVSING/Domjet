@@ -1,0 +1,23 @@
+[package]
+name = "obscura-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable URL, encoding, randomness, and cryptography primitives for Domjet."
+publish = false
+
+[dependencies]
+aes = "0.8"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+cbc = { version = "0.1", features = ["alloc"] }
+ctr = "0.9"
+encoding_rs = "0.8"
+hkdf = "0.12"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+psl = "2"
+serde = { workspace = true }
+sha1 = "0.10"
+sha2 = "0.10"
+url = { workspace = true }

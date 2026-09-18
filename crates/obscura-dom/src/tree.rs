@@ -707,7 +707,7 @@ impl DomTree {
         // position). Without this, the linked-list fixup below sets the
         // node's prev_sibling and next_sibling to itself, creating a cycle
         // -- every later traversal (childNodes, querySelectorAll, etc) then
-        // loops forever and the test page hangs while obscura burns RAM.
+        // loops forever and the test page hangs while Domjet burns RAM.
         if existing_id == new_sibling_id {
             return;
         }
@@ -1533,7 +1533,7 @@ impl DomTree {
     // descendants() uses to cap a tree walk. A well-formed subtree has at most
     // this many nodes, so it is a safe ceiling for iterative walkers that need a
     // cycle backstop.
-    pub(crate) fn node_slot_count(&self) -> usize {
+    pub fn node_slot_count(&self) -> usize {
         self.inner.borrow().nodes.len()
     }
 

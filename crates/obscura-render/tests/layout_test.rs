@@ -1653,7 +1653,7 @@ fn ratio_only_inline_svg_sizes_inside_an_auto_grid_row() {
     assert!((logo.width - 254.0).abs() < 0.01, "SVG width: {logo:?}");
     assert!(
         (logo.height - 76.1875).abs() < 0.25,
-        "viewBox ratio must transfer the final grid width before Obscura's device-pixel rounding: {logo:?}"
+        "viewBox ratio must transfer the final grid width before Domjet's device-pixel rounding: {logo:?}"
     );
     assert!(
         (cell.height - 108.1875).abs() < 0.25,

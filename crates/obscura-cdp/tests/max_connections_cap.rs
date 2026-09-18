@@ -6,7 +6,7 @@
 //!
 //! 1. connections up to the limit are accepted and usable;
 //! 2. the one past the limit is refused with an explicit `503` carrying
-//!    `X-Obscura-Reason: max-connections`, not dropped with a bare reset;
+//!    `X-Domjet-Reason: max-connections`, not dropped with a bare reset;
 //! 3. closing a connection frees its slot, so the server recovers rather than
 //!    wedging shut once it has ever been full.
 //!
@@ -134,7 +134,7 @@ fn max_connections_refuses_then_recovers() {
             refused.lines().next()
         );
         assert!(
-            refused.contains("X-Obscura-Reason: max-connections"),
+            refused.contains("X-Domjet-Reason: max-connections"),
             "refusal must name the reason so a client can tell it apart from a crash: {:?}",
             refused
         );

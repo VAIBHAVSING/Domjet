@@ -4,19 +4,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Optional scoped render layer for Obscura: layout (taffy) and, with the paint feature, text and raster output for screenshots."
+description = "Optional scoped render layer for Domjet: layout (taffy) and, with the paint feature, text and raster output for screenshots."
 
 [features]
 default = []
 # Rasterize the laid-out tree to a pixmap (tiny-skia) with text (cosmic-text
 # shaping + line breaking, ab_glyph fallback) and images.
 # Off by default; the layout core (getBoundingClientRect etc.) works without it.
-paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
+paint = ["dep:tiny-skia", "dep:png", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
+# Native callers retain the pooled compatibility HTTP loader. WASM callers
+# preload resource bytes through RenderResourceCache and never select ureq,
+# rustls, ring, sockets, sleeps, or other operating-system transport code.
+native-resource-loader = ["paint", "dep:ureq"]
 
 [dependencies]
 taffy = { workspace = true }
 obscura-dom = { workspace = true }
+thiserror = { workspace = true }
 tiny-skia = { workspace = true, optional = true }
+png = { version = "0.18", optional = true }
 ab_glyph = { workspace = true, optional = true }
 # Real inline text layout: HarfBuzz-class shaping (rustybuzz) + UAX#14 line
 # breaking, the same algorithms browsers use. Built with only our embedded
@@ -43,4 +49,4 @@ path = "src/lib.rs"
 [[bin]]
 name = "paint_file"
 path = "src/bin/paint_file.rs"
-required-features = ["paint"]
+required-features = ["native-resource-loader"]

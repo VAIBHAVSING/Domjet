@@ -266,7 +266,7 @@ impl ResourceRequest {
         match self.resource_type {
             ResourceType::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             ResourceType::Stylesheet => "text/css,*/*;q=0.1",
-            // AVIF is intentionally omitted until obscura's decoder can paint
+            // AVIF is intentionally omitted until Domjet's decoder can paint
             // it. Advertising a format and then discarding the selected body
             // is less faithful than negotiating the best format we can use.
             ResourceType::Image => "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
@@ -547,13 +547,13 @@ impl Default for CallbackRegistry {
     }
 }
 
-/// Process-wide opt-in via env var. Older flow that issue #4 introduced. The
-/// new `--allow-private-network` CLI flag (issue #33) sets a per-client field
-/// that is OR'd with this so existing scripts and Docker setups that pin the
-/// env var keep working unchanged.
+/// Process-wide opt-in via `DOMJET_ALLOW_PRIVATE_NETWORK`. The legacy Obscura
+/// name remains a fallback. The embedding API can also set a per-client field
+/// that is OR'd with this so existing deployments keep working unchanged.
 pub fn env_allows_private_network() -> bool {
     matches!(
-        std::env::var("OBSCURA_ALLOW_PRIVATE_NETWORK")
+        std::env::var("DOMJET_ALLOW_PRIVATE_NETWORK")
+            .or_else(|_| std::env::var("OBSCURA_ALLOW_PRIVATE_NETWORK"))
             .ok()
             .as_deref()
             .map(str::trim)
@@ -604,8 +604,9 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
 /// DNS-rebinding bypass a host-string check alone cannot: a public name that
 /// resolves to 127.0.0.1 / 169.254.169.254 / an RFC1918 address is blocked at
 /// connect time, using the very addresses reqwest will dial. When private
-/// access is permitted (`--allow-private-network` or
-/// `OBSCURA_ALLOW_PRIVATE_NETWORK`) the lookup passes through unfiltered.
+/// access is permitted by the per-client option or
+/// `DOMJET_ALLOW_PRIVATE_NETWORK` (or its legacy Obscura name), the lookup
+/// passes through unfiltered.
 pub struct SsrfGuardResolver {
     allow_private: bool,
 }
@@ -842,8 +843,9 @@ pub struct ObscuraHttpClient {
     pub block_trackers: bool,
     resource_loader: std::sync::Mutex<ResourceLoaderState>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
-    /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
-    /// Set via `--allow-private-network` on the CLI (issue #33).
+    /// through in addition to `DOMJET_ALLOW_PRIVATE_NETWORK` or its legacy
+    /// Obscura name.
+    /// Set by the embedding API or server configuration (issue #33).
     pub allow_private_network: bool,
 }
 

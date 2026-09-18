@@ -75,7 +75,7 @@ enum RelationalSelectorKey {
 ///
 /// Gecko models the selector inside `:has()` as an upward dependency chain
 /// (parent/ancestors/previous siblings), then resumes the ordinary selector
-/// path outside the anchor. Obscura stores the smaller information needed by
+/// path outside the anchor. Domjet stores the smaller information needed by
 /// its whole-subtree cascade: an optional anchor key, the outward reach, and
 /// whether a key-independent child-list side effect can change the match.
 #[derive(Clone, Debug, PartialEq, Eq)]

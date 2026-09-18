@@ -6,12 +6,13 @@ edition.workspace = true
 [features]
 default = []
 stealth = ["obscura-net/stealth", "obscura-js/stealth"]
-render = ["obscura-js/render", "dep:image"]
+render = ["obscura-js/render", "dep:image", "dep:obscura-render", "obscura-render/paint"]
 
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
 obscura-js = { workspace = true }
+obscura-render = { workspace = true, optional = true }
 tokio = { workspace = true }
 futures = "0.3"
 url = { workspace = true }
