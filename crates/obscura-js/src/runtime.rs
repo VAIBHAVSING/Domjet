@@ -2614,6 +2614,25 @@ mod tests {
         rt
     }
 
+    // #1013: removeAttribute('id') must update the id_index so getElementById no
+    // longer returns the (still-attached) element.
+    #[test]
+    fn get_element_by_id_reflects_remove_attribute() {
+        let mut rt = setup_runtime("<html><body><div id='test'>x</div></body></html>");
+        assert_eq!(
+            rt.evaluate("document.getElementById('test') !== null").unwrap(),
+            serde_json::json!(true),
+            "the element should be found before its id is removed"
+        );
+        rt.evaluate("document.getElementById('test').removeAttribute('id')")
+            .unwrap();
+        assert_eq!(
+            rt.evaluate("document.getElementById('test') === null").unwrap(),
+            serde_json::json!(true),
+            "getElementById must not return an element whose id was removed"
+        );
+    }
+
     #[test]
     fn bounded_evaluation_preserves_primitives_and_uses_intrinsic_json() {
         let mut rt = setup_runtime("<html><body></body></html>");
