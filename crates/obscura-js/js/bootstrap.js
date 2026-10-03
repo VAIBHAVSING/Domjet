@@ -11370,9 +11370,9 @@ function _nodeList(els) {
 // small legacy set of HTML elements, as properties of the WindowProxy. V8's
 // global object cannot be replaced with a WindowProxy after snapshot startup,
 // so install lazy accessors for the supported names present in this document.
-// The accessor resolves against the live tree: one match returns that element
-// (or an iframe's Window), while duplicates return a live-shaped
-// HTMLCollection in tree order.
+// The accessor resolves against the live tree: named child contexts take
+// priority, otherwise one match returns its element and duplicate elements
+// return a live-shaped HTMLCollection in tree order.
 const _windowNamedPropertyNames = new Set();
 const _windowNamedNameTags = new Set(["embed", "form", "iframe", "img", "object"]);
 
@@ -11415,11 +11415,15 @@ function _windowNamedCandidates(name) {
 function _windowNamedValue(name) {
   const matches = _windowNamedCandidates(name);
   if (matches.length === 0) return undefined;
+  for (const element of matches) {
+    if (element.localName === "iframe" && _windowNameEligibleElement(element)
+        && element.getAttribute("name") === name) {
+      const window = element.contentWindow;
+      if (window) return window;
+    }
+  }
   if (matches.length > 1) return HTMLCollection._from(matches);
-  const element = matches[0];
-  return element.localName === "iframe" && element.contentWindow
-    ? element.contentWindow
-    : element;
+  return matches[0];
 }
 
 function _ensureWindowNamedProperty(name) {

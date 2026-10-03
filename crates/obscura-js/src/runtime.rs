@@ -4553,6 +4553,35 @@ mod tests {
     }
 
     #[test]
+    fn window_named_access_distinguishes_iframe_ids_from_child_context_names() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const byId = document.createElement('iframe'); byId.id = 'idOnlyFrame';
+            const collision = document.createElement('div'); collision.id = 'namedContext';
+            const first = document.createElement('iframe');
+            first.id = 'namedFrameId'; first.name = 'namedContext';
+            const second = document.createElement('iframe'); second.name = 'namedContext';
+            document.body.append(byId,collision,first,second);
+            const results = [window.idOnlyFrame===byId, window.namedFrameId===first,
+                window.namedContext===first.contentWindow];
+            first.remove();
+            results.push(window.namedContext===second.contentWindow);
+            second.remove();
+            results.push(window.namedContext===collision);
+            byId.name = 'idOnlyFrame';
+            results.push(window.idOnlyFrame===byId.contentWindow);
+            byId.removeAttribute('name');
+            results.push(window.idOnlyFrame===byId);
+            const duplicate = document.createElement('div'); duplicate.id = 'idOnlyFrame';
+            document.body.appendChild(duplicate);
+            results.push(window.idOnlyFrame instanceof HTMLCollection,
+                window.idOnlyFrame.length===2, window.idOnlyFrame[0]===byId);
+            return results;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,true,true,true,true,true,true,true,true,true]));
+    }
+
+    #[test]
     fn window_named_access_tracks_dynamic_ids_and_fragment_parsing() {
         let mut rt = setup_runtime("<html><body><div id='host'></div></body></html>");
         let result = rt
