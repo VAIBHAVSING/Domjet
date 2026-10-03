@@ -4458,6 +4458,34 @@ fn inherited_font_shorthand_overrides_native_control_typography() {
 }
 
 #[test]
+fn inline_block_percentage_height_uses_definite_block_content_height() {
+    let tree = parse_html(r#"<!doctype html>
+        <style>
+          html, body { margin:0 }
+          .switch { position:relative; width:32px; height:16px; line-height:1 }
+          input { position:absolute; width:100%; height:100%; margin:0; opacity:0; z-index:-1000 }
+          label { display:inline-block; box-sizing:border-box; width:100%; height:100%; border:1px solid }
+          .padded { height:30px; box-sizing:border-box; padding:4px; border:1px solid }
+          .indefinite { height:auto; min-height:40px }
+        </style>
+        <div class="switch"><input type="checkbox"><label id="percentage"></label></div>
+        <div class="switch"><input type="checkbox"><label id="pixels" style="height:16px"></label></div>
+        <div class="switch padded"><label id="content-box"></label></div>
+        <div class="switch padded"><label id="half" style="height:50%"></label></div>
+        <div class="switch indefinite"><label id="indefinite"></label></div>
+    "#);
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for (name, width, height) in [
+        ("percentage", 32.0, 16.0), ("pixels", 32.0, 16.0),
+        ("content-box", 22.0, 20.0), ("half", 22.0, 10.0), ("indefinite", 32.0, 2.0),
+    ] {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        assert_eq!(rect.width, width, "{name}");
+        assert_eq!(rect.height, height, "{name}");
+    }
+}
+
+#[test]
 fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
     let tree = parse_html(
         r#"

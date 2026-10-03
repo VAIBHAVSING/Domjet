@@ -1968,18 +1968,17 @@ fn sync_resolved_percentage_padding(
 }
 
 /// Taffy's flex stand-in for an inline formatting context can lose the
-/// block-axis percentage basis of an atomic containing block. This is most
-/// visible when the atomic box is floated: the float's synthetic placement
-/// wrapper has an indefinite block size, so a `height:100%` descendant
-/// collapses even though the float itself has a definite used height.
+/// block-axis percentage basis of its real containing block. Anonymous
+/// inline-run and float-placement wrappers have indefinite block sizes, so a
+/// `height:100%` descendant can collapse despite a definite containing block.
 ///
 /// Blink's `CalculateChildAvailableSize` and Gecko's `ReflowInput` both pass
 /// the containing block's used content-box block size to such descendants.
 /// Reify that basis after the preliminary layout, when min/max constraints and
 /// border-box edges are known exactly. Keep the repair to ordinary direct
-/// descendants of definite floated/inline-block containing blocks; grid-area,
-/// flex-item, positioned, and anonymous containing-block rules remain native.
-fn resolve_atomic_percentage_heights(
+/// descendants of atomic containing blocks or ordinary block children crossing
+/// anonymous inline wrappers. Grid-area, flex-item and positioned rules remain native.
+fn resolve_inline_percentage_heights(
     tree: &DomTree,
     taffy_tree: &mut TaffyTree<usize>,
     taffy_root: taffy::NodeId,
@@ -2016,13 +2015,16 @@ fn resolve_atomic_percentage_heights(
                     _ => None,
                 })
             });
-            let parent_is_definite_atomic = styles.get(&parent_id).is_some_and(|style| {
-                (style.float.is_some() || style.is_inline_block)
+            let parent_is_definite = styles.get(&parent_id).is_some_and(|style| {
+                (style.float.is_some() || style.is_inline_block
+                    || (style.display == crate::Display::Block
+                        && style.column_count.is_none()
+                        && taffy_tree.parent(node).is_some_and(|parent| !id_map.contains_key(&parent))))
                     && definite_height_nodes.contains(&parent_id)
                     && style.size_expressions[1].is_none()
             });
             if is_direct_dom_child
-                && parent_is_definite_atomic
+                && parent_is_definite
                 && containing_block_height.is_finite()
             {
                 if let Some(percent) = child_percent {
@@ -6834,7 +6836,7 @@ fn layout_dom_once(
                     let _ =
                         taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
-                if resolve_atomic_percentage_heights(
+                if resolve_inline_percentage_heights(
                     tree,
                     &mut taffy_tree,
                     taffy_root,
@@ -6973,7 +6975,7 @@ fn layout_dom_once(
                 {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
-                if resolve_atomic_percentage_heights(
+                if resolve_inline_percentage_heights(
                     tree,
                     &mut taffy_tree,
                     taffy_root,
