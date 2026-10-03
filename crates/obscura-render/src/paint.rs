@@ -14729,9 +14729,9 @@ mod tests {
         assert!(
             (20..100).any(|x| (20..60).any(|y| {
                 let pixel = pixmap.pixel(x, y).expect("scaled text region");
-                pixel.red() < 80 && pixel.green() < 80 && pixel.blue() < 80
+                pixel.red() < 80 && pixel.green() < 80 && pixel.blue() > 160
             })),
-            "text must be rasterized inside the scaled atomic subtree"
+            "authored blue text must be rasterized inside the scaled atomic subtree"
         );
 
         let rotated_box = pixmap.pixel(165, 25).expect("rotated box");

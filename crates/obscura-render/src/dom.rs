@@ -13406,9 +13406,9 @@ fn inline_wraps_only_in_flow_blocks(
 /// Recursively splice `display:contents`, decoration-free inline wrappers, and
 /// inline wrappers whose only generated flow content is block-level into a
 /// block container's effective child list. Descendants already carry inherited
-/// computed text styles, so removing these wrappers preserves shaping while
-/// exposing block-in-inline descendants early enough for anonymous block
-/// construction.
+/// computed text styles. Preserve wrappers the text engine can fold so their
+/// shaped runs retain element geometry; expose block-in-inline descendants
+/// early enough for anonymous block construction.
 fn flatten_boxless_inline_children(
     tree: &DomTree,
     children: &[NodeId],
@@ -13424,6 +13424,14 @@ fn flatten_boxless_inline_children(
             || is_flattenable_inline(tree, cid, styles)
             || inline_wraps_only_in_flow_blocks(tree, cid, styles)
         {
+            #[cfg(feature = "paint")]
+            if !display_contents {
+                let mut has_text = false;
+                if crate::inline::inline_child_ok(tree, cid, styles, &mut has_text) {
+                    out.push(cid);
+                    continue;
+                }
+            }
             let kids = rendered_children(tree, cid);
             flatten_boxless_inline_children(tree, &kids, styles, out);
         } else {

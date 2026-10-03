@@ -2822,7 +2822,7 @@ pub(crate) fn default_replaced_intrinsic_size(
 /// genuinely cannot fold are rejected: replaced/atomic elements, block-level
 /// children, floats, out-of-flow positioned boxes, and elements with generated
 /// content (which would be lost).
-fn inline_child_ok(
+pub(crate) fn inline_child_ok(
     tree: &DomTree,
     cid: NodeId,
     styles: &std::collections::HashMap<NodeId, LayoutStyle>,

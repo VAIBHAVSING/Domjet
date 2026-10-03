@@ -34,6 +34,40 @@ const HN_HTML: &str = r##"
     </table>
 "##;
 
+#[cfg(feature = "paint")]
+#[test]
+fn mixed_content_shaped_runs_retain_inline_owner_geometry() {
+    for content in ["ABCD", "AB<b id='nested'>CD</b>"] {
+        let tree = parse_html(&format!(
+            "<style>body{{margin:0;font:20px/24px monospace}}</style>\
+             <div id='parent'>AAAA<div style='height:30px'></div>\
+             <span id='owner'>{content}</span></div>"));
+        let layout = layout_dom(&tree, (200.0, 200.0));
+        let owner = tree.get_element_by_id("owner").unwrap();
+        let rect = layout.rects.get(&owner).expect("shaped inline owner has geometry");
+        assert!(rect.x.abs() < 0.01 && (52.0..=57.0).contains(&rect.y)
+            && (40.0..=55.0).contains(&rect.width) && (18.0..=26.0).contains(&rect.height),
+            "inline following a 24px line and 30px block: {rect:?}");
+        let pieces = layout.inline_fragments.get(&owner).expect("canonical inline fragments");
+        assert!(!pieces.is_empty());
+        for piece in pieces {
+            assert!(piece.width > 0.0 && piece.height > 0.0
+                && piece.x >= rect.x && piece.y >= rect.y
+                && piece.x + piece.width <= rect.x + rect.width + 0.01
+                && piece.y + piece.height <= rect.y + rect.height + 0.01,
+                "inline fragments remain within their owner bounds: {piece:?}, {rect:?}");
+        }
+        let parent = tree.get_element_by_id("parent").unwrap();
+        assert!((layout.rects[&parent].height - 78.0).abs() < 0.01,
+            "preserving inline ownership must not add a line or change block flow");
+        if let Some(nested) = tree.get_element_by_id("nested") {
+            let nested = layout.rects.get(&nested).expect("nested inline owner has geometry");
+            assert!((20.0..=28.0).contains(&nested.x) && (20.0..=28.0).contains(&nested.width)
+                && (nested.y - rect.y).abs() < 1.0, "nested text bounds: {nested:?}");
+        }
+    }
+}
+
 /// Top-left of the tightest laid-out element box whose text contains
 /// `needle`. Text geometry is no longer a per-word list: a pure-text
 /// container collapses to a single cosmic-text inline formatting context
