@@ -4436,6 +4436,28 @@ fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
 }
 
 #[test]
+fn inherited_font_shorthand_overrides_native_control_typography() {
+    let tree = parse_html(r#"
+        <style>
+          body { font:700 20px/30px Arial }
+          input { display:block; border:0; padding:0 }
+        </style>
+        <input id="inherit" style="font:inherit">
+        <input id="unset" style="font:unset">
+    "#);
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for name in ["inherit", "unset"] {
+        let node = tree.get_element_by_id(name).unwrap();
+        let style = &layout.styles[&node];
+        assert_eq!(style.font_size, Some(20.0), "{name}");
+        assert_eq!(style.line_height, Some(obscura_render::LineHeight::Px(30.0)), "{name}");
+        assert_eq!(style.font_weight.as_deref(), Some("700"), "{name}");
+        assert_eq!(style.font_family.as_deref(), Some("arial"), "{name}");
+        assert_eq!(layout.rects[&node].height, 30.0, "{name}");
+    }
+}
+
+#[test]
 fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
     let tree = parse_html(
         r#"

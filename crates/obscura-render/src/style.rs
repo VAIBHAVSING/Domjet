@@ -7072,6 +7072,22 @@ pub(crate) fn line_height_expression_is_length(value: &str) -> bool {
 /// the required size so modern design-system declarations reach the size,
 /// line-height, weight, style, and family fields that affect our layout.
 fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset") {
+        // All modeled font longhands are inherited. Clear earlier declarations,
+        // including native-control UA defaults, before the top-down pass.
+        style.font_size = None;
+        style.font_size_raw = None;
+        style.font_size_expression = None;
+        style.font_family = None;
+        style.font_weight = None;
+        style.font_style_italic = None;
+        style.font_optical_sizing = None;
+        style.font_variation_settings = None;
+        style.line_height = None;
+        style.line_height_expression = None;
+        return;
+    }
     let tokens = split_ws_paren(value);
     let Some((size_index, size, attached_line_height)) =
         tokens.iter().enumerate().find_map(|(index, token)| {
