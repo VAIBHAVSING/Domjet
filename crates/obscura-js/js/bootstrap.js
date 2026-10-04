@@ -13566,6 +13566,25 @@ if (typeof Image === 'undefined') {
   globalThis.Image.prototype = globalThis.HTMLImageElement.prototype;
 }
 
+if (typeof Option === 'undefined') {
+  // HTML legacy factory function: `new Option(text, value, defaultSelected,
+  // selected)` is a real <option> element, like `new Image()` above. WPForms
+  // calls `new Option().style` and threw a ReferenceError without it (#1168).
+  globalThis.Option = function Option(text, value, defaultSelected, selected) {
+    const option = document.createElement('option');
+    const label = text === undefined ? '' : String(text);
+    if (label !== '') option.appendChild(document.createTextNode(label));
+    if (value !== undefined) option.setAttribute('value', String(value));
+    if (defaultSelected) option.setAttribute('selected', '');
+    // Selectedness follows `selected` alone, so defaultSelected without
+    // selected leaves the attribute in place on an unselected option.
+    if (selected) option.selected = true;
+    else if (defaultSelected) option._selected = false;
+    return option;
+  };
+  globalThis.Option.prototype = globalThis.HTMLOptionElement.prototype;
+}
+
 if (typeof Audio === 'undefined') {
   globalThis.Audio = class Audio {
     constructor(src) { this.src = src || ''; this.paused = true; this.volume = 1; this.currentTime = 0; this.duration = 0; }

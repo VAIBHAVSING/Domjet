@@ -11654,6 +11654,88 @@ mod tests {
         assert_eq!(value["attribute"], "color: red;");
     }
 
+    // #1168: `Option` is a legacy factory function like `Image`. WPForms does
+    // `new Option().style`, so the result must be a real <option> element.
+    #[test]
+    fn option_named_constructor_builds_an_option_element() {
+        let mut rt = setup_runtime("<html><body><select id='s'></select></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const describe = option => ({
+                        tag: option.localName,
+                        text: option.text,
+                        value: option.value,
+                        valueAttr: option.getAttribute('value'),
+                        selectedAttr: option.hasAttribute('selected'),
+                        selected: option.selected,
+                        children: option.childNodes.length
+                    });
+                    const full = new Option('Greek', 'el', true, true);
+                    const select = document.getElementById('s');
+                    select.add(new Option('English', 'en'));
+                    select.add(full);
+                    return JSON.stringify({
+                        type: typeof Option,
+                        empty: describe(new Option()),
+                        textOnly: describe(new Option('Label')),
+                        full: describe(full),
+                        defaultOnly: describe(new Option('a', 'b', true, false)),
+                        selectedOnly: new Option('a', 'b', false, true).selected,
+                        coerced: describe(new Option(7, 0)),
+                        hasStyle: typeof new Option().style,
+                        isElement: new Option() instanceof HTMLOptionElement,
+                        isOption: new Option() instanceof Option,
+                        ownerDocument: new Option().ownerDocument === document,
+                        detached: new Option().parentNode === null,
+                        selectValue: select.value,
+                        selectHtml: select.innerHTML
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["type"], "function");
+        assert_eq!(
+            value["empty"],
+            serde_json::json!({
+                "tag": "option", "text": "", "value": "", "valueAttr": null,
+                "selectedAttr": false, "selected": false, "children": 0
+            })
+        );
+        assert_eq!(
+            value["textOnly"],
+            serde_json::json!({
+                "tag": "option", "text": "Label", "value": "Label", "valueAttr": null,
+                "selectedAttr": false, "selected": false, "children": 1
+            })
+        );
+        assert_eq!(
+            value["full"],
+            serde_json::json!({
+                "tag": "option", "text": "Greek", "value": "el", "valueAttr": "el",
+                "selectedAttr": true, "selected": true, "children": 1
+            })
+        );
+        // defaultSelected sets the content attribute; selected=false still
+        // leaves the option unselected.
+        assert_eq!(value["defaultOnly"]["selectedAttr"], true);
+        assert_eq!(value["defaultOnly"]["selected"], false);
+        assert_eq!(value["selectedOnly"], true);
+        assert_eq!(value["coerced"]["text"], "7");
+        assert_eq!(value["coerced"]["valueAttr"], "0");
+        assert_eq!(value["hasStyle"], "object");
+        assert_eq!(value["isElement"], true);
+        assert_eq!(value["isOption"], true);
+        assert_eq!(value["ownerDocument"], true);
+        assert_eq!(value["detached"], true);
+        assert_eq!(value["selectValue"], "el");
+        assert_eq!(
+            value["selectHtml"],
+            "<option value=\"en\">English</option><option value=\"el\" selected=\"\">Greek</option>"
+        );
+    }
+
     #[test]
     fn select_add_and_option_text_update_the_live_dom() {
         let mut rt = setup_runtime("<html><body><select id='language'></select></body></html>");
