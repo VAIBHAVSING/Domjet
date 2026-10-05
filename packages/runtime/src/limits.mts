@@ -53,7 +53,10 @@ export const PDF_OPTION_NAMES = Object.freeze([
 
 export function requireBoundedString(value, maximum, label) {
   if (typeof value !== "string") throw new TypeError(`${label} must be a string`);
-  if (Buffer.byteLength(value, "utf8") > maximum) {
+  // UTF-8 needs between 1 and 3 bytes per UTF-16 code unit, so most strings
+  // are decided by their length without scanning them.
+  if (value.length * 3 <= maximum) return value;
+  if (value.length > maximum || Buffer.byteLength(value, "utf8") > maximum) {
     throw new RangeError(`${label} exceeds the ${maximum}-byte ABI limit`);
   }
   return value;
