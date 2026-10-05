@@ -90,6 +90,15 @@ structured timeline received so far, including render-resource fetch/seed,
 layout, framebuffer, PNG encoding, and screenshot transfer stages. Tracing is
 off by default and records counters only, never response or screenshot bodies.
 
+Pages free DOM nodes that script can no longer reach without waiting for a
+navigation. Between tasks the page worker moves wrappers of detached subtrees
+to weak references and frees a subtree in the engine once none of its wrappers
+is alive; children replaced through `innerHTML` that script never touched are
+freed at once. Connected nodes keep their wrappers, listeners, and expando
+properties. Above 96 MiB of engine memory the worker also forces a V8
+collection, so released wrappers reach their finalizers. Worker memory
+snapshots report these counters under `reclaim`.
+
 An OS process is a crash boundary, not a complete hostile-code sandbox. For
 untrusted websites, run each profile worker in its own gVisor sandbox (or an
 equivalent container boundary) and cgroup. Placing the supervisor and every
