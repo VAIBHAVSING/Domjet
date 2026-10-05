@@ -320,6 +320,9 @@ function decodePlaywrightValue(value, refs = new Map()) {
   return result;
 }
 
+const NETWORK_FLUSH_MIN_MS = 25;
+const NETWORK_FLUSH_MAX_MS = 200;
+
 class PageTarget {
   constructor(server, id, contextId = "default") {
     this.server = server;
@@ -340,6 +343,7 @@ class PageTarget {
     this.portableCdpRawMode = null;
     this.networkFlushPromise = null;
     this.networkFlushTimer = null;
+    this.networkFlushDelay = NETWORK_FLUSH_MIN_MS;
     this.networkFlushPaused = false;
     this.nextRemoteId = 1;
     this.viewport = { width: 800, height: 600, deviceScaleFactor: 1 };
@@ -377,13 +381,10 @@ class PageTarget {
               });
             }
           }
-          this.networkFlushTimer = setInterval(() => {
-            // Fetch interception may pause a parser/resource request while the
-            // navigation host action is awaiting network I/O. Poll portable CDP
-            // events during that await so the client can continue/fulfill/fail it.
-            void this.flushPortableNetworkEvents({ allowWhilePaused: true });
-          }, 25);
-          this.networkFlushTimer.unref?.();
+          // Fetch interception may pause a parser/resource request while the
+          // navigation host action is awaiting network I/O. Poll portable CDP
+          // events during that await so the client can continue/fulfill/fail it.
+          this.scheduleNetworkFlush(NETWORK_FLUSH_MIN_MS);
           this.server.refillSpareWorkers();
         } catch (error) {
           if (this.worker === worker) this.worker = null;
@@ -404,7 +405,7 @@ class PageTarget {
     this.closed = true;
     await this.startPromise?.catch(() => undefined);
     if (this.networkFlushTimer) {
-      clearInterval(this.networkFlushTimer);
+      clearTimeout(this.networkFlushTimer);
       this.networkFlushTimer = null;
     }
     for (const session of this.sessions) session.target = null;
@@ -419,6 +420,28 @@ class PageTarget {
     this.portableCdpConnections.clear();
     if (this.worker) await this.worker.close();
     this.worker = null;
+  }
+
+  // Poll at the fast interval while network events flow or a navigation waits
+  // on a Fetch pause; back off while idle. CDP commands wake it up again.
+  scheduleNetworkFlush(delay = this.networkFlushDelay) {
+    if (this.closed) return;
+    if (this.networkFlushTimer) clearTimeout(this.networkFlushTimer);
+    this.networkFlushTimer = setTimeout(async () => {
+      this.networkFlushTimer = null;
+      const active = await this.flushPortableNetworkEvents({ allowWhilePaused: true }).catch(() => false);
+      this.networkFlushDelay = active || this.networkFlushPaused
+        ? NETWORK_FLUSH_MIN_MS
+        : Math.min(this.networkFlushDelay * 2, NETWORK_FLUSH_MAX_MS);
+      this.scheduleNetworkFlush();
+    }, delay);
+    this.networkFlushTimer.unref?.();
+  }
+
+  wakeNetworkFlush() {
+    if (this.closed || this.networkFlushDelay === NETWORK_FLUSH_MIN_MS) return;
+    this.networkFlushDelay = NETWORK_FLUSH_MIN_MS;
+    if (this.networkFlushTimer) this.scheduleNetworkFlush(NETWORK_FLUSH_MIN_MS);
   }
 
   async flushPortableNetworkEvents({ allowWhilePaused = false } = {}) {
@@ -445,7 +468,8 @@ class PageTarget {
       // Poll even when no asynchronous Network metadata was recorded. Fetch
       // interception emits requestPaused directly from the portable CDP core,
       // so an idle network recorder must not suppress those events.
-      if (!recorded?.recorded) return;
+      if (!recorded?.recorded) return false;
+      let active = (recorded.count ?? 0) > 0;
       for (const connection of this.sessions) {
         const core = this.portableCdpConnections.get(connection.id);
         if (!core || connection.closed) continue;
@@ -464,8 +488,10 @@ class PageTarget {
           if (typeof event.sessionId === "string") event.sessionId = sessionId;
           rewritePortableTargetIds(event, "page-1", this.frameId);
           connection.event(event.method, event.params ?? {}, sessionId);
+          active = true;
         }
       }
+      return active;
     })().finally(() => {
       this.networkFlushPromise = null;
     });
@@ -729,6 +755,7 @@ class PageTarget {
   }
 
   async portableCdpCommand(connectionId, command) {
+    this.wakeNetworkFlush();
     await this.start();
     if (this.portableCdpRawMode !== false && typeof this.worker.portableCdpRawAbiVersion === "function") {
       // The ABI is fixed for this worker. Re-probing on every command adds an
