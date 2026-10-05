@@ -1169,6 +1169,152 @@ impl DomTree {
         }
     }
 
+    /// Template contents are parentless but owned by their template element.
+    fn template_content_owners(inner: &DomTreeInner) -> HashMap<NodeId, NodeId> {
+        let mut owners = HashMap::new();
+        for node in inner.nodes.iter().flatten() {
+            if let NodeData::Element {
+                template_contents: Some(contents),
+                ..
+            } = &node.data
+            {
+                owners.insert(*contents, node.id);
+            }
+        }
+        owners
+    }
+
+    /// Topmost owner of a node outside the document. Parent links are
+    /// followed, a shadow root leads to its host and template contents lead
+    /// to their template. `None` means the node is missing or still owned by
+    /// the document.
+    fn detached_owner_root_inner(
+        inner: &DomTreeInner,
+        owners: &HashMap<NodeId, NodeId>,
+        node: NodeId,
+    ) -> Option<NodeId> {
+        let mut current = node;
+        for _ in 0..=inner.nodes.len() {
+            if current == inner.document {
+                return None;
+            }
+            let entry = inner.nodes.get(current.index())?.as_ref()?;
+            if entry.connected {
+                return None;
+            }
+            if let Some(parent) = entry.parent {
+                current = parent;
+            } else if let Some(root) = inner.shadow_roots.get(&current) {
+                current = root.host;
+            } else if let Some(template) = owners.get(&current) {
+                current = *template;
+            } else {
+                return Some(current);
+            }
+        }
+        None
+    }
+
+    /// Pairs each detached node with its detached owner root. Connected and
+    /// missing nodes are left out.
+    pub fn detached_owner_roots(&self, nodes: &[NodeId]) -> Vec<(NodeId, NodeId)> {
+        let inner = self.inner.borrow();
+        let owners = Self::template_content_owners(&inner);
+        nodes
+            .iter()
+            .filter_map(|&node| {
+                Self::detached_owner_root_inner(&inner, &owners, node).map(|root| (node, root))
+            })
+            .collect()
+    }
+
+    /// Nodes a detached owner root owns: its subtree plus the shadow trees
+    /// and template contents inside it. `None` when `root` is not its own
+    /// detached owner root.
+    pub fn detached_root_owned_nodes(&self, root: NodeId) -> Option<Vec<NodeId>> {
+        self.detached_root_parts(root).map(|(_, nodes)| nodes)
+    }
+
+    /// Frees a detached subtree whose host references are gone, including
+    /// the shadow trees and template contents it owns. Returns the freed ids,
+    /// or `None` when `root` is not a reclaimable root.
+    pub fn free_detached_root(&self, root: NodeId) -> Option<Vec<NodeId>> {
+        let (roots, freed) = self.detached_root_parts(root)?;
+        for current in roots {
+            self.remove(current);
+        }
+        Some(freed)
+    }
+
+    /// Frees a node that was just detached from its parent, unless `keep`
+    /// accepts one of the nodes it owns. A node that had a parent is never a
+    /// shadow root or template contents, so the arena-wide owner scan of
+    /// `free_detached_root` is skipped.
+    pub fn free_detached_child_unless(&self, child: NodeId, keep: impl Fn(NodeId) -> bool) -> bool {
+        {
+            let inner = self.inner.borrow();
+            let Some(Some(node)) = inner.nodes.get(child.index()) else {
+                return false;
+            };
+            if child == inner.document
+                || node.parent.is_some()
+                || node.connected
+                || inner.shadow_roots.contains_key(&child)
+            {
+                return false;
+            }
+        }
+        let (roots, owned) = self.owned_parts(child);
+        if owned.iter().any(|&id| keep(id)) {
+            return false;
+        }
+        for current in roots {
+            self.remove(current);
+        }
+        true
+    }
+
+    fn detached_root_parts(&self, root: NodeId) -> Option<(Vec<NodeId>, Vec<NodeId>)> {
+        {
+            let inner = self.inner.borrow();
+            let owners = Self::template_content_owners(&inner);
+            if Self::detached_owner_root_inner(&inner, &owners, root) != Some(root) {
+                return None;
+            }
+        }
+        Some(self.owned_parts(root))
+    }
+
+    fn owned_parts(&self, root: NodeId) -> (Vec<NodeId>, Vec<NodeId>) {
+        let mut roots = Vec::new();
+        let mut freed = Vec::new();
+        let mut seen = HashSet::new();
+        let mut work = vec![root];
+        while let Some(current) = work.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            let ids = self.inclusive_owned_subtrees(current);
+            let inner = self.inner.borrow();
+            for id in &ids {
+                if let Some(Some(Node {
+                    data:
+                        NodeData::Element {
+                            template_contents: Some(contents),
+                            ..
+                        },
+                    ..
+                })) = inner.nodes.get(id.index())
+                {
+                    work.push(*contents);
+                }
+            }
+            freed.extend(ids);
+            roots.push(current);
+        }
+        (roots, freed)
+    }
+
     /// Collect an ordinary subtree plus every shadow tree owned by a host in
     /// that subtree. This is used only by the arena-freeing path; normal DOM
     /// traversal must remain tree-scoped and therefore never follows host edges.
@@ -2353,6 +2499,121 @@ mod tests {
         assert_eq!(reused, link);
         assert!(tree.external_stylesheet(reused).is_none());
         assert!(!tree.is_hovered(reused));
+    }
+
+    #[test]
+    fn detached_owner_roots_cross_shadow_and_template_owners() {
+        let tree = DomTree::new();
+        let connected = element(&tree, "main");
+        tree.append_child(tree.document(), connected);
+        let live_template = element(&tree, "template");
+        tree.append_child(connected, live_template);
+        let live_contents = tree.template_contents(live_template).unwrap();
+        let live_content_child = element(&tree, "p");
+        tree.append_child(live_contents, live_content_child);
+
+        let detached = element(&tree, "div");
+        let child = element(&tree, "span");
+        tree.append_child(detached, child);
+        let host = element(&tree, "x-card");
+        tree.append_child(detached, host);
+        let shadow = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let shadow_child = element(&tree, "b");
+        tree.append_child(shadow, shadow_child);
+        let template = element(&tree, "template");
+        tree.append_child(detached, template);
+        let contents = tree.template_contents(template).unwrap();
+        let content_child = element(&tree, "i");
+        tree.append_child(contents, content_child);
+
+        let roots = tree.detached_owner_roots(&[
+            tree.document(),
+            connected,
+            live_template,
+            live_contents,
+            live_content_child,
+            detached,
+            child,
+            shadow,
+            shadow_child,
+            contents,
+            content_child,
+        ]);
+        assert_eq!(
+            roots,
+            vec![
+                (detached, detached),
+                (child, detached),
+                (shadow, detached),
+                (shadow_child, detached),
+                (contents, detached),
+                (content_child, detached),
+            ]
+        );
+    }
+
+    #[test]
+    fn free_detached_root_reclaims_owned_trees_and_refuses_owned_nodes() {
+        let tree = DomTree::new();
+        let connected = element(&tree, "main");
+        tree.append_child(tree.document(), connected);
+        let live_template = element(&tree, "template");
+        tree.append_child(connected, live_template);
+        let live_contents = tree.template_contents(live_template).unwrap();
+        tree.append_child(live_contents, element(&tree, "p"));
+
+        let detached = element(&tree, "div");
+        let child = element(&tree, "span");
+        tree.append_child(detached, child);
+        let host = element(&tree, "x-card");
+        tree.append_child(detached, host);
+        let shadow = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        tree.append_child(shadow, element(&tree, "b"));
+        let template = element(&tree, "template");
+        tree.append_child(detached, template);
+        let contents = tree.template_contents(template).unwrap();
+        let nested_template = element(&tree, "template");
+        tree.append_child(contents, nested_template);
+        let nested_contents = tree.template_contents(nested_template).unwrap();
+        tree.append_child(nested_contents, element(&tree, "i"));
+        let link = element(&tree, "link");
+        tree.append_child(detached, link);
+        assert!(tree.replace_external_stylesheet(link, "p{}".to_string(), true));
+        tree.set_hovered(Some(child));
+
+        for owned in [
+            tree.document(),
+            connected,
+            live_template,
+            live_contents,
+            child,
+            shadow,
+            contents,
+        ] {
+            assert_eq!(tree.free_detached_root(owned), None);
+        }
+
+        let mut owned = tree.detached_root_owned_nodes(detached).unwrap();
+        assert_eq!(tree.detached_root_owned_nodes(child), None);
+        let before = tree.len();
+        let freed = tree.free_detached_root(detached).unwrap();
+        owned.sort_by_key(|id| id.raw());
+        let mut sorted = freed.clone();
+        sorted.sort_by_key(|id| id.raw());
+        assert_eq!(owned, sorted);
+        assert_eq!(freed.len(), 11);
+        assert_eq!(tree.len(), before - 11);
+        for id in freed {
+            assert!(tree.get_node(id).is_none());
+        }
+        assert!(tree.get_node(live_contents).is_some());
+        assert_eq!(tree.free_detached_root(detached), None);
+
+        // Reused slots start clean.
+        let reused = element(&tree, "link");
+        assert!(tree.external_stylesheet(reused).is_none());
+        assert!(!tree.is_hovered(reused));
+        assert!(tree.external_stylesheets().is_empty());
     }
 
     #[test]
