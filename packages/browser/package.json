@@ -54,7 +54,7 @@
     "wasm/artifact.json",
     "wasm/obscura_wasm.cjs",
     "wasm/obscura_wasm.d.ts",
-    "wasm/obscura_wasm_bg.wasm",
+    "wasm/obscura_wasm_bg.wasm.br",
     "wasm/obscura_wasm_bg.wasm.d.ts",
     "bootstrap.js",
     "logo.svg",

@@ -1863,9 +1863,16 @@ if (!('encodeInto' in cachedTextEncoder)) {
 
 let WASM_VECTOR_LEN = 0;
 
-const wasmPath = `${__dirname}/obscura_wasm_bg.wasm`;
-const wasmBytes = require('fs').readFileSync(wasmPath);
-const wasmModule = new WebAssembly.Module(wasmBytes);
+const wasmModule = (() => {
+    const shared = globalThis[Symbol.for('domjet.wasmModule')];
+    if (shared instanceof WebAssembly.Module) return shared;
+    const fs = require('fs');
+    const compressed = `${__dirname}/obscura_wasm_bg.wasm.br`;
+    const bytes = fs.existsSync(compressed)
+        ? require('zlib').brotliDecompressSync(fs.readFileSync(compressed))
+        : fs.readFileSync(`${__dirname}/obscura_wasm_bg.wasm`);
+    return new WebAssembly.Module(bytes);
+})();
 let wasmInstance = new WebAssembly.Instance(wasmModule, __wbg_get_imports());
 let wasm = wasmInstance.exports;
 wasm.__wbindgen_start();
