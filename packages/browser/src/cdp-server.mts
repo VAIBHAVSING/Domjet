@@ -1028,6 +1028,9 @@ export class DomjetCdpServer {
       ...workerOptions,
       resourceLimits: {
         maxYoungGenerationSizeMb: 16,
+        // Bound each page's JavaScript heap so a runaway or hostile page ends
+        // its own worker instead of exhausting the embedding process.
+        maxOldGenerationSizeMb: 512,
         ...(workerOptions.resourceLimits ?? {}),
       },
       ...(this.bootstrapPath ? { bootstrapPath: this.bootstrapPath } : {}),
