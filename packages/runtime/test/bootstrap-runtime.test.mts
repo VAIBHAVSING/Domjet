@@ -27,7 +27,7 @@ test("portable DOM command manifest exactly covers the production bootstrap", as
     "shadow_root_info",
   ])).sort();
 
-  assert.equal(BOOTSTRAP_DOM_OP_COMMANDS.length, 65);
+  assert.equal(BOOTSTRAP_DOM_OP_COMMANDS.length, 68);
   assert.deepEqual(BOOTSTRAP_DOM_OP_COMMANDS, reachableCommands);
   assert.equal(new Set(BOOTSTRAP_DOM_OP_COMMANDS).size, BOOTSTRAP_DOM_OP_COMMANDS.length);
 });

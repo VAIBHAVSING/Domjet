@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parentPort, workerData, threadId } from "node:worker_threads";
-import { getHeapStatistics } from "node:v8";
+import { getHeapStatistics, setFlagsFromString } from "node:v8";
 
 import {
   BOOTSTRAP_PLATFORM_OP_COMMANDS,
@@ -486,6 +486,35 @@ let enqueueSerializedWork;
 let shuttingDown = false;
 const memoryTraceEnabled = workerData.memoryTrace === true;
 
+// Detached node reclamation (see __obscura_reclaim_detached in bootstrap.js).
+// Ticks run on the serialized queue, so no page or bootstrap frame is on the
+// stack when detached subtrees are released. A sweep runs once the WASM heap
+// grew by RECLAIM_SWEEP_GROWTH_BYTES; under memory pressure a V8 collection
+// is forced so collected wrapper groups reach their finalizers.
+const RECLAIM_TICK_MS = 500;
+const RECLAIM_IDLE_TICKS = 10;
+const RECLAIM_TIMEOUT_MS = 2_000;
+const RECLAIM_SWEEP_GROWTH_BYTES = 8 * 1024 * 1024;
+const RECLAIM_PRESSURE_BYTES = 96 * 1024 * 1024;
+const RECLAIM_PRESSURE_STEP_BYTES = 16 * 1024 * 1024;
+const RECLAIM_SCRIPT = new vm.Script("__obscura_reclaim_detached(false)");
+const RECLAIM_SWEEP_SCRIPT = new vm.Script("__obscura_reclaim_detached(true)");
+const reclaimStats = {
+  ticks: 0,
+  sweeps: 0,
+  released: 0,
+  forcedCollections: 0,
+  last: null,
+  lastError: null,
+};
+let reclaimQueued = false;
+let reclaimIdleTicks = 0;
+let reclaimLastActivity = -1;
+let serializedWorkCount = 0;
+let reclaimSweptBytes = 0;
+let reclaimCollectedBytes = 0;
+let reclaimCollect;
+
 function propertyNames(value) {
   const names = new Set();
   let cursor = value;
@@ -554,8 +583,92 @@ function memorySnapshot(stage, extra = {}) {
       networkEventBytes: bootstrapNetworkEventBytes,
       activeFetches: bootstrapFetches.size,
     },
+    reclaim: { ...reclaimStats, last: reclaimStats.last ? { ...reclaimStats.last } : null },
     ...extra,
   };
+}
+
+// `gc` is only reachable through --expose-gc. Expose it for one throwaway
+// context and switch the flag back off, so page realms never see it.
+function reclaimCollector() {
+  if (reclaimCollect !== undefined) return reclaimCollect;
+  reclaimCollect = null;
+  try {
+    setFlagsFromString("--expose-gc");
+    const collect = vm.runInNewContext("gc");
+    if (typeof collect === "function") reclaimCollect = collect;
+  } catch {
+    reclaimCollect = null;
+  } finally {
+    try { setFlagsFromString("--no-expose-gc"); } catch {}
+  }
+  return reclaimCollect;
+}
+
+function currentWasmBytes() {
+  try {
+    const read = member(target, WASM_MEMORY_BYTES_NAMES);
+    return read ? Number(syncCall(read)) || 0 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// A tick follows any serialized work (requests, page tasks, CDP); idle pages
+// only tick every RECLAIM_IDLE_TICKS to drain finalizers.
+function scheduleReclaimTick() {
+  if (reclaimQueued || shuttingDown || !enqueueSerializedWork) return;
+  if (!hostContext || bridgeRealmKind !== "bootstrap") return;
+  reclaimIdleTicks += 1;
+  if (serializedWorkCount === reclaimLastActivity && reclaimIdleTicks < RECLAIM_IDLE_TICKS) return;
+  reclaimIdleTicks = 0;
+  reclaimQueued = true;
+  // The tick's own queue entry is not page activity.
+  reclaimLastActivity = serializedWorkCount + 1;
+  void enqueueSerializedWork(() => {
+    reclaimQueued = false;
+    runReclaimTick(false);
+  });
+}
+
+function runReclaimTick(force) {
+  const context = hostContext;
+  if (!context || bridgeRealmKind !== "bootstrap") return null;
+  try {
+    const bytes = currentWasmBytes();
+    const sweep = force === true || bytes - reclaimSweptBytes >= RECLAIM_SWEEP_GROWTH_BYTES;
+    const script = sweep ? RECLAIM_SWEEP_SCRIPT : RECLAIM_SCRIPT;
+    const result = script.runInContext(context, { timeout: RECLAIM_TIMEOUT_MS });
+    reclaimStats.ticks += 1;
+    if (result && typeof result === "object") {
+      const released = Number(result.released) || 0;
+      if (result.swept === true) {
+        reclaimStats.sweeps += 1;
+        reclaimSweptBytes = bytes;
+      }
+      reclaimStats.released += released;
+      reclaimStats.last = {
+        swept: result.swept === true,
+        released,
+        moved: Number(result.moved) || 0,
+        wrappers: Number(result.wrappers) || 0,
+        weakWrappers: Number(result.weakWrappers) || 0,
+        wasmLinearBytes: bytes,
+      };
+    }
+    if (bytes >= RECLAIM_PRESSURE_BYTES && bytes - reclaimCollectedBytes >= RECLAIM_PRESSURE_STEP_BYTES) {
+      reclaimCollectedBytes = bytes;
+      const collect = reclaimCollector();
+      if (collect) {
+        collect();
+        reclaimStats.forcedCollections += 1;
+      }
+    }
+    return result ?? null;
+  } catch (error) {
+    reclaimStats.lastError = String(error?.message ?? error);
+    return null;
+  }
 }
 
 function traceMemory(stage, extra = {}) {
@@ -4886,6 +4999,10 @@ async function dispatch(operation, payload) {
       return { ...metadata, ...describeApi(), runtime: await inspectRuntime(), threadId };
     case "memorySnapshot":
       return memorySnapshot("explicit");
+    case "reclaimDetached": {
+      if (payload?.collect === true) reclaimCollector()?.();
+      return { result: runReclaimTick(true), stats: memorySnapshot("reclaim").reclaim };
+    }
     case "version": {
       const version = member(target, VERSION_NAMES);
       if (version) return await version.fn();
@@ -5068,9 +5185,11 @@ try {
     parentPort.close();
   };
   enqueueSerializedWork = (work) => {
+    serializedWorkCount += 1;
     operationQueue = operationQueue.then(work).catch(fatalQueueFailure);
     return operationQueue;
   };
+  setInterval(scheduleReclaimTick, RECLAIM_TICK_MS).unref();
   parentPort.on("message", (message) => {
     // CDP control and event-poll operations are deliberately re-entrant. A
     // navigation or resource fetch may be awaiting host I/O at a portable

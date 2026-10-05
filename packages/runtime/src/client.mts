@@ -611,6 +611,11 @@ export class WasmV8Worker {
     return this.request("memorySnapshot", undefined, options.requestTimeoutMs);
   }
 
+  /** Release detached DOM subtrees now; `collect` also forces a V8 collection. */
+  reclaimDetached(options = {}) {
+    return this.request("reclaimDetached", { collect: options.collect === true }, options.requestTimeoutMs);
+  }
+
   pdf(options = {}) {
     try {
       const { pdfOptions, expectedPage } = boundedPdfOptions(options);
