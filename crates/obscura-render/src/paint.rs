@@ -7656,7 +7656,13 @@ fn percent_decode(s: &str) -> Vec<u8> {
 /// allocate (256 MiB of RGBA, the same budget as a canvas surface). CSS sizes
 /// the destination box, so without a cap a 1x1 image styled 30000px square
 /// allocated ~3.6 GB in the resize.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_IMAGE_RASTER_PIXELS: u64 = 64 * 1024 * 1024;
+/// The WASM module's whole linear memory is capped at 256 MiB, so the native
+/// budget alone would exhaust it and trap. Use the capture budget (64 MiB of
+/// RGBA) instead; the oversized raster is still scaled up on draw.
+#[cfg(target_arch = "wasm32")]
+const MAX_IMAGE_RASTER_PIXELS: u64 = MAX_CAPTURE_PIXELS;
 
 /// The raster size for a `w`x`h` destination: unchanged within the budget,
 /// otherwise scaled down uniformly (each side at least 1px) so the caller can
