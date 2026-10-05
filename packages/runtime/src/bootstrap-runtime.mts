@@ -166,19 +166,18 @@ const installDomBridgeScript = new vm.Script(
       // All page-owned coercion stays inside the context and therefore inside
       // the vm timeout. The hidden host callback receives only primitive
       // strings and returns an inert envelope.
-      const response = safeApply(hostDomOp, undefined, [
-        safeApply(ContextString, undefined, [command]),
-        safeApply(ContextString, undefined, [arg1]),
-        safeApply(ContextString, undefined, [arg2]),
-      ]);
+      // Strings need no coercion; String(value) is the identity for them.
+      // A direct call of the captured host function cannot be intercepted
+      // through Function.prototype, so the hot path allocates nothing.
+      const response = hostDomOp(
+        typeof command === "string" ? command : safeApply(ContextString, undefined, [command]),
+        typeof arg1 === "string" ? arg1 : safeApply(ContextString, undefined, [arg1]),
+        typeof arg2 === "string" ? arg2 : safeApply(ContextString, undefined, [arg2]),
+      );
+      // Success is the result string itself; failures are inert error records.
+      if (typeof response === "string") return response;
       if (response === null || typeof response !== "object") {
         throw new ContextTypeError("Domjet DOM bridge returned an invalid response");
-      }
-      if (response.ok === true) {
-        if (typeof response.value !== "string") {
-          throw new ContextTypeError("Domjet DOM bridge returned a non-string op_dom value");
-        }
-        return response.value;
       }
       if (response.ok === false) throw translatedError(response.error);
       throw new ContextTypeError("Domjet DOM bridge returned an invalid response");
@@ -615,6 +614,25 @@ function hostResponse(call, fallbackMessage, ...args) {
   return Object.freeze(response);
 }
 
+// The DOM op hot path returns the primitive result string directly; only a
+// failure allocates the inert, null-prototype error envelope.
+function hostStringResponse(call, fallbackMessage, ...args) {
+  let failure;
+  try {
+    const value = call(...args);
+    if (typeof value === "string") return value;
+    failure = new TypeError("Portable bootstrap operation must return a string");
+  } catch (error) {
+    failure = error;
+  }
+  const response = Object.create(null);
+  Object.defineProperties(response, {
+    ok: { enumerable: true, value: false },
+    error: { enumerable: true, value: safeErrorRecord(failure, fallbackMessage) },
+  });
+  return Object.freeze(response);
+}
+
 function taskHostResponse(call, command, argument) {
   const response = Object.create(null);
   try {
@@ -707,7 +725,7 @@ export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>
       }
 
       Object.defineProperty(context, HOST_DOM_OP_BINDING, {
-        value: (command, arg1, arg2) => hostResponse(
+        value: (command, arg1, arg2) => hostStringResponse(
           opDom,
           "Domjet DOM bridge operation failed",
           command,
