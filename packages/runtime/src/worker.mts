@@ -632,6 +632,15 @@ function rawCdpDecodeJsonFrame(value, label = "raw CDP response") {
   return JSON.parse(new TextDecoder().decode(frames[0]));
 }
 
+// cdpIngest returns no frame while the command waits for a host action; the
+// response then arrives through cdpCompleteActions.
+function rawCdpDecodeOptionalJsonFrame(value, label = "raw CDP response") {
+  const frames = rawCdpFrameBytes(value, label);
+  if (frames.length === 0) return null;
+  if (frames.length !== 1) throw new SyntaxError(`${label} must contain at most one frame`);
+  return JSON.parse(new TextDecoder().decode(frames[0]));
+}
+
 function rawCdpDecodeJsonFrames(value, label = "raw CDP frame batch") {
   return rawCdpFrameBytes(value, label).map((frame) => JSON.parse(new TextDecoder().decode(frame)));
 }
@@ -1523,7 +1532,7 @@ function trackPortableNetworkCommand(connectionId, message, response) {
 function portableCdpRawRequest(connectionId, message, html = "") {
   const { api, browserId } = portableCdpRawEnsureBrowser(html);
   const request = rawCdpJsonBytes(message, "CDP message");
-  const response = rawCdpDecodeJsonFrame(api.ingest.fn(browserId, connectionId, request));
+  const response = rawCdpDecodeOptionalJsonFrame(api.ingest.fn(browserId, connectionId, request));
   trackPortableNetworkCommand(connectionId, message, response);
   const actions = rawCdpDecodeJsonFrames(api.drainActions.fn(browserId, RAW_CDP_MAX_FRAMES, RAW_CDP_MAX_BYTES));
   drainPortableFetchResolutions();
