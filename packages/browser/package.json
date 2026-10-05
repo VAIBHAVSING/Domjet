@@ -66,11 +66,10 @@
   },
   "scripts": {
     "build": "node ./scripts/clean.mjs && tsx ./scripts/prepare-runtime.mts && tsc -p tsconfig.json && node ./scripts/finalize-build.mjs",
-    "test": "tsx --test ./test/*.test.mts",
-    "pretest": "npm run build",
+    "test": "pnpm run build && tsx --test ./test/*.test.mts",
     "prepare:runtime": "tsx ./scripts/prepare-runtime.mts",
     "prepare:wasm": "tsx ./scripts/prepare-wasm.mts",
-    "prepack": "npm run build"
+    "prepack": "pnpm run build"
   },
   "peerDependencies": {
     "playwright-core": ">=1.45.0",
