@@ -166,3 +166,39 @@ test("launch rejects native addon paths", async () => {
     (error) => error.code === "ERR_OBSCURA_NATIVE_UNSUPPORTED",
   );
 });
+
+test("a prewarmed server hands its started spare to the next page and closes unused spares", async () => {
+  const workers = [];
+  const server = new DomjetCdpServer({
+    modulePath: "fake.wasm.js",
+    prewarmPages: 1,
+    workerFactory: async () => {
+      const worker = new FakeWorker();
+      workers.push(worker);
+      return worker;
+    },
+  });
+  await server.start();
+  const client = new CdpClient(server.wsEndpoint());
+  try {
+    await client.ready();
+    const targets = await client.command("Target.getTargets");
+    const first = await client.command("Target.attachToTarget", {
+      targetId: targets.targetInfos[0].targetId,
+      flatten: true,
+    });
+    await client.command("Page.navigate", { url: "https://example.test/" }, first.sessionId);
+    // The first page starts its own worker, then one spare is prepared.
+    assert.equal(workers.length, 2);
+    const { targetId } = await client.command("Target.createTarget", { url: "about:blank" });
+    const second = await client.command("Target.attachToTarget", { targetId, flatten: true });
+    await client.command("Page.navigate", { url: "https://example.test/" }, second.sessionId);
+    // The second page takes the spare instead of launching, and a new spare is prepared.
+    assert.equal(workers.length, 3);
+    assert.equal(server.targets.get(targetId).worker, workers[1]);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+  assert.ok(workers.every((worker) => worker.closed), "server close must close spares too");
+});

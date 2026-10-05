@@ -356,7 +356,8 @@ class PageTarget {
     if (this.closed) throw cdpError(-32000, `Target ${this.id} is closed`);
     if (!this.startPromise) {
       const startPromise = (async () => {
-        const worker = await this.server.workerFactory(this.server.modulePath, {
+        const spare = this.url === "about:blank" ? await this.server.takeSpareWorker() : null;
+        const worker = spare ?? await this.server.workerFactory(this.server.modulePath, {
           ...this.server.workerOptions,
         });
         if (this.closed) {
@@ -365,14 +366,16 @@ class PageTarget {
         }
         this.worker = worker;
         try {
-          await worker.ready(this.server.readyTimeoutMs);
-          const status = await worker.bridgeStatus();
-          if (!status.loaded) {
-            await worker.bootstrapEvaluate("undefined", {
-              html: "",
-              documentMetadata: { url: this.url, referrer: "", encoding: "UTF-8" },
-              timeoutMs: 1_000,
-            });
+          if (!spare) {
+            await worker.ready(this.server.readyTimeoutMs);
+            const status = await worker.bridgeStatus();
+            if (!status.loaded) {
+              await worker.bootstrapEvaluate("undefined", {
+                html: "",
+                documentMetadata: { url: this.url, referrer: "", encoding: "UTF-8" },
+                timeoutMs: 1_000,
+              });
+            }
           }
           this.networkFlushTimer = setInterval(() => {
             // Fetch interception may pause a parser/resource request while the
@@ -381,6 +384,7 @@ class PageTarget {
             void this.flushPortableNetworkEvents({ allowWhilePaused: true });
           }, 25);
           this.networkFlushTimer.unref?.();
+          this.server.refillSpareWorkers();
         } catch (error) {
           if (this.worker === worker) this.worker = null;
           await worker.close().catch(() => undefined);
@@ -984,6 +988,7 @@ export class DomjetCdpServer {
     requestTimeoutMs = 30_000,
     evaluateTimeoutMs = 5_000,
     allowPrivateNetwork = false,
+    prewarmPages = 0,
   } = {}) {
     this.modulePath = modulePath;
     const sourceBootstrap = resolve(HERE, "../bootstrap.js");
@@ -1018,6 +1023,61 @@ export class DomjetCdpServer {
     this.streamCounter = 0;
     this.streams = new Map();
     this.runtimeStarted = false;
+    // Page workers kept started and bootstrapped so newPage() does not pay
+    // for thread start, WASM instantiation, and bootstrap evaluation.
+    this.prewarmPages = Number.isSafeInteger(prewarmPages) && prewarmPages > 0 ? Math.min(prewarmPages, 4) : 0;
+    this.spareWorkers = [];
+  }
+
+  async launchPreparedWorker() {
+    const worker = await this.workerFactory(this.modulePath, { ...this.workerOptions });
+    try {
+      await worker.ready(this.readyTimeoutMs);
+      const status = await worker.bridgeStatus();
+      if (!status.loaded) {
+        await worker.bootstrapEvaluate("undefined", {
+          html: "",
+          documentMetadata: { url: "about:blank", referrer: "", encoding: "UTF-8" },
+          timeoutMs: 1_000,
+        });
+      }
+      worker.unref?.();
+      return worker;
+    } catch (error) {
+      await worker.close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  // Returns a started about:blank worker, or null when none is ready.
+  async takeSpareWorker() {
+    while (this.spareWorkers.length > 0) {
+      const pending = this.spareWorkers.shift();
+      const worker = await pending.catch(() => null);
+      if (worker && !worker.closed) {
+        worker.ref?.();
+        return worker;
+      }
+    }
+    return null;
+  }
+
+  refillSpareWorkers() {
+    while (this.spareWorkers.length < this.prewarmPages) {
+      const pending = this.launchPreparedWorker();
+      pending.catch(() => undefined);
+      this.spareWorkers.push(pending);
+    }
+  }
+
+  async closeSpareWorkers() {
+    const spares = this.spareWorkers.splice(0);
+    await Promise.all(spares.map(async (pending) => {
+      const worker = await pending.catch(() => null);
+      // Keep the event loop alive for the close handshake of an idle spare.
+      worker?.ref?.();
+      await worker?.close().catch(() => undefined);
+    }));
   }
 
   on(event, listener) {
@@ -1250,6 +1310,7 @@ export class DomjetCdpServer {
   }
 
   async close() {
+    await this.closeSpareWorkers();
     if (!this.server && this.targets.size === 0) return;
     for (const connection of [...this.connections]) await connection.close();
     for (const target of [...this.targets.values()]) await target.close();
