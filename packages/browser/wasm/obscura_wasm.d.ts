@@ -235,6 +235,11 @@ export class PortableCdp {
      * ownership as navigation actions.
      */
     recordNetworkMetadata(target_id: string, metadata_json: string): void;
+    /**
+     * Synchronize a host-owned JavaScript document after work which completed
+     * outside a pending CDP action, such as a timer or fetch callback.
+     */
+    syncTargetState(target_id: string, state_json: string): void;
 }
 
 /**
@@ -278,9 +283,9 @@ export function cdpDrainEvents(browser_id: number, connection_id: number, max_ev
 export function cdpDrainFetchResolutions(browser_id: number): Uint8Array;
 
 /**
- * Ingest one unframed UTF-8 CDP request and return exactly one length-
- * prefixed response frame. Batched host work is exposed through the drain
- * functions below, keeping request and execution traffic independent.
+ * Ingest one unframed UTF-8 CDP request. Immediate commands return one
+ * length-prefixed response frame. Host-backed commands return no frame until
+ * their action is completed, so each CDP request has exactly one response.
  */
 export function cdpIngest(browser_id: number, connection_id: number, request: Uint8Array): Uint8Array;
 
@@ -307,6 +312,8 @@ export function cdpRawAbiVersion(): number;
 export function cdpRecordNetwork(browser_id: number, target_id: string, metadata: Uint8Array): void;
 
 export function cdpSetMemoryTraceEnabled(browser_id: number, enabled: boolean): void;
+
+export function cdpSyncTargetState(browser_id: number, target_id: string, state: Uint8Array): void;
 
 export function cdpTakeMemoryTrace(browser_id: number): string;
 
