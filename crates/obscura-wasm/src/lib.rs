@@ -2063,11 +2063,24 @@ impl ObscuraCore {
             }
             "remove_attribute" => {
                 let node = self.resolve_handle(arg1)?;
+                // Removing `id` must clear the id index too, as set_attribute
+                // and remove_attribute_ns do; otherwise getElementById keeps
+                // returning the still-attached element (upstream #1013).
+                let old_id = if arg2 == "id" {
+                    self.dom
+                        .with_node(node, |node| node.get_attribute("id").map(str::to_string))
+                        .flatten()
+                } else {
+                    None
+                };
                 self.dom.with_node_mut(node, |node| {
                     if let NodeData::Element { attrs, .. } = &mut node.data {
                         attrs.retain(|attr| !attr.qualified_name_eq(arg2));
                     }
                 });
+                if arg2 == "id" {
+                    self.dom.update_id_index(node, old_id.as_deref(), None);
+                }
                 Ok("true".to_string())
             }
             "get_attribute_ns" => {
@@ -4322,17 +4335,13 @@ mod tests {
         assert_eq!(op(&mut core, "set_attribute", &main, "id\0renamed"), "true");
         assert_eq!(op(&mut core, "get_element_by_id", "main", ""), "-1");
         assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), main);
-        // Native parity: the plain remove_attribute path never consults the
-        // id index, so the "renamed" entry stays until the node leaves the
-        // tree. The WASM bridge keeps the same quirk.
+        // Native parity: removing the id attribute clears its index entry
+        // (upstream #1013), so the element is no longer found by its old id.
         assert_eq!(op(&mut core, "remove_attribute", &main, "id"), "true");
-        assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), main);
-        // Rewriting the id from a present attribute replaces the live entry,
-        // but the earlier stale entry survives (old_id was None at the
-        // rewrite because the attribute had been removed), exactly like
-        // native update_id_index.
+        assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), "-1");
+        // Setting a new id indexes only the new value.
         assert_eq!(op(&mut core, "set_attribute", &main, "id\0final"), "true");
-        assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), main);
+        assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), "-1");
         assert_eq!(op(&mut core, "get_element_by_id", "final", ""), main);
         // The namespace-aware path keeps the current entry consistent.
         assert_eq!(op(&mut core, "set_attribute_ns", &main, "\0id\0nsid"), "true");
@@ -4340,9 +4349,9 @@ mod tests {
         assert_eq!(op(&mut core, "get_element_by_id", "nsid", ""), main);
         assert_eq!(op(&mut core, "remove_attribute_ns", &main, "\0id"), "true");
         assert_eq!(op(&mut core, "get_element_by_id", "nsid", ""), "-1");
-        assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), main);
-        // Detaching clears every stale id entry for the subtree; the live
-        // fallback scan then finds nothing because main has no id attribute.
+        assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), "-1");
+        // Detaching keeps every id lookup empty; the live fallback scan finds
+        // nothing because main has no id attribute.
         assert_eq!(op(&mut core, "remove_child", &main, ""), "true");
         assert_eq!(op(&mut core, "get_element_by_id", "renamed", ""), "-1");
         assert_eq!(op(&mut core, "get_element_by_id", "final", ""), "-1");
