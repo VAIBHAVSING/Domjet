@@ -856,6 +856,14 @@ export class WasmV8Worker {
     );
   }
 
+  /** True once the worker is closing or has exited. */
+  get closed() { return this.#closed || this.#closing; }
+
+  /** Let an idle worker stop keeping the process alive. */
+  unref() { this.#worker?.unref?.(); }
+
+  ref() { this.#worker?.ref?.(); }
+
   async close() {
     if (this.#terminationPromise) return this.#terminationPromise;
     if (this.#closePromise) return this.#closePromise;

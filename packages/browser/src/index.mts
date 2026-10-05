@@ -23,6 +23,8 @@ export interface BrowserOptions {
   evaluateTimeoutMs?: number;
   taskTimeoutMs?: number;
   allowPrivateNetwork?: boolean;
+  /** Started page workers kept ready for newPage(). Default 1; 0 disables. */
+  prewarmPages?: number;
   workerOptions?: Record<string, unknown>;
   /** Stable Chrome-style user profile used by the default context. */
   profile?: string;
@@ -451,7 +453,7 @@ export class BrowserVM {
 
   static async create(options: BrowserOptions): Promise<BrowserVM> {
     const modulePath = resolveModulePath(options.modulePath);
-    const server = new DomjetCdpServer({ ...options, modulePath } as ServerOptions);
+    const server = new DomjetCdpServer({ ...options, prewarmPages: options.prewarmPages ?? 1, modulePath } as ServerOptions);
     await server.start({ listen: false });
     const controller = new CdpController(server as unknown as CdpServerLike);
     const client = await controller.connect();
