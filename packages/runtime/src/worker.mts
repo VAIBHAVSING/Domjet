@@ -5045,6 +5045,11 @@ async function handleMessage(message) {
 }
 
 try {
+  // A compiled engine shared by the launching process; the packaged glue uses
+  // it instead of reading, decompressing, and compiling the binary again.
+  if (workerData.wasmModule instanceof WebAssembly.Module) {
+    globalThis[Symbol.for("domjet.wasmModule")] = workerData.wasmModule;
+  }
   ({ namespace: target, metadata } = await loadModule(workerData.modulePath, workerData.cwd));
   await requireCompatibleCoreAbi();
   // Operations mutate persistent runtime and bridge ownership state. Preserve

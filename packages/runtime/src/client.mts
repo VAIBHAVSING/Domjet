@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { extname } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { Worker } from "node:worker_threads";
 
 import {
@@ -21,6 +21,41 @@ import {
   requireRenderImageRequestProfile,
 } from "./limits.mjs";
 import { resolveModulePath } from "./module-loader.mjs";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { promisify } from "node:util";
+import { brotliDecompress } from "node:zlib";
+
+const brotliDecompressAsync = promisify(brotliDecompress);
+
+// The packaged engine ships its WASM binary Brotli-compressed next to the
+// wasm-bindgen glue. Decompress and compile it once per process; every page
+// worker then receives the compiled module instead of reading, decompressing,
+// and compiling the engine itself. Other engine modules are left alone.
+const sharedWasmModules = new Map();
+
+function sharedWasmModule(modulePath, cwd) {
+  let resolved;
+  try { resolved = resolveModulePath(modulePath, cwd); } catch { return Promise.resolve(null); }
+  if (!resolved || !basename(resolved).startsWith("obscura_wasm.")) return Promise.resolve(null);
+  const directory = dirname(resolved);
+  const compressed = join(directory, "obscura_wasm_bg.wasm.br");
+  const raw = join(directory, "obscura_wasm_bg.wasm");
+  const source = existsSync(compressed) ? compressed : existsSync(raw) ? raw : null;
+  if (source === null) return Promise.resolve(null);
+  let pending = sharedWasmModules.get(source);
+  if (!pending) {
+    pending = (async () => {
+      const bytes = await readFile(source);
+      const wasm = source === compressed ? await brotliDecompressAsync(bytes) : bytes;
+      return WebAssembly.compile(wasm);
+    })();
+    pending.catch(() => sharedWasmModules.delete(source));
+    sharedWasmModules.set(source, pending);
+  }
+  return pending.catch(() => null);
+}
+
 
 const workerUrl = new URL("./worker.mjs", import.meta.url);
 const MAX_TIMER_MS = 2_147_483_647;
@@ -289,6 +324,7 @@ export class WasmV8Worker {
     taskTimeoutMs = 1_000,
     resourceLimits,
     memoryTrace = false,
+    wasmModule,
   } = {}) {
     if (bootstrapPath !== undefined && (typeof bootstrapPath !== "string" || bootstrapPath.length === 0)) {
       throw new TypeError("bootstrapPath must be a non-empty string");
@@ -296,6 +332,7 @@ export class WasmV8Worker {
     if (typeof memoryTrace !== "boolean") throw new TypeError("memoryTrace must be a boolean");
     validateVmTimeout(taskTimeoutMs, "taskTimeoutMs");
     const workerData = portableWorkerData(modulePath, cwd, bootstrapPath, taskTimeoutMs, memoryTrace);
+    if (wasmModule instanceof WebAssembly.Module) workerData.wasmModule = wasmModule;
     this.#ready = new Promise((resolve, reject) => {
       this.#readyResolve = resolve;
       this.#readyReject = reject;
@@ -320,7 +357,8 @@ export class WasmV8Worker {
   }
 
   static async launch(modulePath, options = {}) {
-    const worker = new WasmV8Worker(modulePath, options);
+    const wasmModule = options.wasmModule ?? await sharedWasmModule(modulePath, options.cwd ?? process.cwd());
+    const worker = new WasmV8Worker(modulePath, { ...options, wasmModule });
     try {
       await worker.ready(options.readyTimeoutMs);
       return worker;
