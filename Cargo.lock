@@ -1869,6 +1869,7 @@ dependencies = [
  "image",
  "log",
  "obscura-dom",
+ "obscura-ssrf",
  "png",
  "resvg",
  "swash",
@@ -1880,6 +1881,10 @@ dependencies = [
  "usvg",
  "wuff",
 ]
+
+[[package]]
+name = "obscura-ssrf"
+version = "0.1.0"
 
 [[package]]
 name = "obscura-wasm"

@@ -565,6 +565,26 @@ fn inset_absolute_uses_nearest_positioned_ancestor() {
 }
 
 #[test]
+fn inset_absolute_fills_positioned_inline_flex_ancestor() {
+    let tree = parse_html(
+        r#"<body style="margin:0">
+          <div style="display:flex">
+            <div id="button" style="position:relative;display:inline-flex;width:115px;height:40px;padding:0 12px;box-sizing:border-box">
+              <a id="overlay" style="position:absolute;inset:unset;top:50%;left:50%;width:max(48px,100%);height:max(48px,100%);transform:translate(-50%,-50%)"></a>
+            </div>
+          </div>
+        </body>"#,
+    );
+    let layout = layout_dom(&tree, (1120.0, 780.0));
+    let button = layout.rects[&tree.get_element_by_id("button").unwrap()];
+    let overlay = layout.rects[&tree.get_element_by_id("overlay").unwrap()];
+
+    assert_eq!((button.width, button.height), (115.0, 40.0));
+    assert_eq!(overlay.width, 91.0);
+    assert_eq!(overlay.height, 48.0, "functional percentage height must use the 40px containing block");
+}
+
+#[test]
 fn absolute_auto_axes_preserve_static_position_after_reparenting() {
     let tree = parse_html(include_str!("../../../render-repros/absolute-static-position.html"));
     let layout = layout_dom(&tree, (900.0, 1000.0));
@@ -3521,6 +3541,36 @@ fn cyclic_descendant_percentages_do_not_inflate_a_flex_items_intrinsic_minimum()
     }
 }
 
+#[test]
+fn cyclic_percentage_flex_row_keeps_its_intrinsic_content_width() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #scroller { display:flex; width:768px }
+          #month { flex:0 0 auto; width:auto; max-width:336px; padding:0 24px }
+          #week { display:flex; width:100% }
+          .day { flex:1 0 48px; width:48px; height:48px }
+        </style>
+        <div id="scroller"><div id="month"><div><div id="week">
+          <div class="day"></div><div class="day"></div><div class="day"></div>
+          <div class="day"></div><div class="day"></div><div class="day"></div>
+          <div class="day"></div>
+        </div></div></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1000.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    assert_eq!(rect("week").width, 336.0, "percentage row: {:?}", rect("week"));
+    assert_eq!(
+        rect("month").width,
+        384.0,
+        "content width plus inline padding: {:?}",
+        rect("month")
+    );
+}
+
 /// Chromium resolves both spellings to the same 163px content width: the
 /// percentage is cyclic while the link's flex-item width is being measured,
 /// then resolves against that link's final width. Carbon Ads uses the bare
@@ -4408,6 +4458,36 @@ fn grid_replaced_normal_and_explicit_stretch_match_browser_geometry() {
 }
 
 #[test]
+fn nested_grid_input_contributes_intrinsic_height_without_preventing_stretch() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0; font:14px Arial; line-height:22px }
+          .outer { display:grid; width:214px; align-items:center }
+          .editor { display:inline-grid; grid-area:1 / 1 / 2 / 3;
+                    grid-template-columns:0 min-content }
+          input { display:block; width:100%; grid-area:1 / 2;
+                  font:inherit; min-width:2px; padding:0; border:0 }
+          .short { grid-template-rows:12px }
+        </style>
+        <div class="outer"><div class="editor" id="auto-editor"><input id="auto-input"></div></div>
+        <div class="outer"><div class="editor short" id="short-editor"><input id="short-input"></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for (input, editor, height) in [
+        ("auto-input", "auto-editor", 22.0),
+        ("short-input", "short-editor", 12.0),
+    ] {
+        let input_rect = layout.rects[&tree.get_element_by_id(input).unwrap()];
+        let editor_rect = layout.rects[&tree.get_element_by_id(editor).unwrap()];
+        assert_eq!(input_rect.height, height, "{input}");
+        assert_eq!(editor_rect.height, height, "{editor}");
+        assert!(input_rect.width >= 2.0, "{input}");
+    }
+}
+
+#[test]
 fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
     let tree = parse_html(
         r#"
@@ -4470,28 +4550,6 @@ fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
 }
 
 #[test]
-fn inherited_font_shorthand_overrides_native_control_typography() {
-    let tree = parse_html(r#"
-        <style>
-          body { font:700 20px/30px Arial }
-          input { display:block; border:0; padding:0 }
-        </style>
-        <input id="inherit" style="font:inherit">
-        <input id="unset" style="font:unset">
-    "#);
-    let layout = layout_dom(&tree, (800.0, 600.0));
-    for name in ["inherit", "unset"] {
-        let node = tree.get_element_by_id(name).unwrap();
-        let style = &layout.styles[&node];
-        assert_eq!(style.font_size, Some(20.0), "{name}");
-        assert_eq!(style.line_height, Some(obscura_render::LineHeight::Px(30.0)), "{name}");
-        assert_eq!(style.font_weight.as_deref(), Some("700"), "{name}");
-        assert_eq!(style.font_family.as_deref(), Some("arial"), "{name}");
-        assert_eq!(layout.rects[&node].height, 30.0, "{name}");
-    }
-}
-
-#[test]
 fn inline_block_percentage_height_uses_definite_block_content_height() {
     let tree = parse_html(r#"<!doctype html>
         <style>
@@ -4516,6 +4574,28 @@ fn inline_block_percentage_height_uses_definite_block_content_height() {
         let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
         assert_eq!(rect.width, width, "{name}");
         assert_eq!(rect.height, height, "{name}");
+    }
+}
+
+#[test]
+fn inherited_font_shorthand_overrides_native_control_typography() {
+    let tree = parse_html(r#"
+        <style>
+          body { font:700 20px/30px Arial }
+          input { display:block; border:0; padding:0 }
+        </style>
+        <input id="inherit" style="font:inherit">
+        <input id="unset" style="font:unset">
+    "#);
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for name in ["inherit", "unset"] {
+        let node = tree.get_element_by_id(name).unwrap();
+        let style = &layout.styles[&node];
+        assert_eq!(style.font_size, Some(20.0), "{name}");
+        assert_eq!(style.line_height, Some(obscura_render::LineHeight::Px(30.0)), "{name}");
+        assert_eq!(style.font_weight.as_deref(), Some("700"), "{name}");
+        assert_eq!(style.font_family.as_deref(), Some("arial"), "{name}");
+        assert_eq!(layout.rects[&node].height, 30.0, "{name}");
     }
 }
 
