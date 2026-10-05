@@ -1154,6 +1154,15 @@ impl DomTree {
         for id in nodes_to_remove {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
                 inner.form_controls.remove(&id);
+                // A reused slot must not inherit the old owner's stylesheet or
+                // hover state.
+                if inner.external_stylesheets.remove(&id).is_some() {
+                    inner.external_stylesheet_generation =
+                        inner.external_stylesheet_generation.wrapping_add(1);
+                }
+                if inner.hovered == Some(id) {
+                    inner.hovered = None;
+                }
                 inner.nodes[id.index()] = None;
                 inner.free_list.push(id.0);
             }
@@ -2329,6 +2338,21 @@ mod tests {
         let replacement = element(&tree, "div");
         assert_eq!(tree.shadow_root(replacement), None);
         assert_eq!(tree.shadow_root_info(replacement), None);
+    }
+
+    #[test]
+    fn freed_slots_do_not_inherit_stylesheet_or_hover_state() {
+        let tree = DomTree::new();
+        let link = element(&tree, "link");
+        tree.append_child(tree.document(), link);
+        assert!(tree.replace_external_stylesheet(link, "p{}".to_string(), true));
+        tree.set_hovered(Some(link));
+        tree.remove(link);
+
+        let reused = element(&tree, "link");
+        assert_eq!(reused, link);
+        assert!(tree.external_stylesheet(reused).is_none());
+        assert!(!tree.is_hovered(reused));
     }
 
     #[test]
