@@ -982,6 +982,22 @@ class PortableCdp {
             throw takeFromExternrefTable0(ret[0]);
         }
     }
+    /**
+     * Synchronize a host-owned JavaScript document after work which completed
+     * outside a pending CDP action, such as a timer or fetch callback.
+     * @param {string} target_id
+     * @param {string} state_json
+     */
+    syncTargetState(target_id, state_json) {
+        const ptr0 = passStringToWasm0(target_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(state_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.portablecdp_syncTargetState(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
 }
 if (Symbol.dispose) PortableCdp.prototype[Symbol.dispose] = PortableCdp.prototype.free;
 exports.PortableCdp = PortableCdp;
@@ -1157,9 +1173,9 @@ function cdpDrainFetchResolutions(browser_id) {
 exports.cdpDrainFetchResolutions = cdpDrainFetchResolutions;
 
 /**
- * Ingest one unframed UTF-8 CDP request and return exactly one length-
- * prefixed response frame. Batched host work is exposed through the drain
- * functions below, keeping request and execution traffic independent.
+ * Ingest one unframed UTF-8 CDP request. Immediate commands return one
+ * length-prefixed response frame. Host-backed commands return no frame until
+ * their action is completed, so each CDP request has exactly one response.
  * @param {number} browser_id
  * @param {number} connection_id
  * @param {Uint8Array} request
@@ -1272,6 +1288,23 @@ function cdpSetMemoryTraceEnabled(browser_id, enabled) {
     }
 }
 exports.cdpSetMemoryTraceEnabled = cdpSetMemoryTraceEnabled;
+
+/**
+ * @param {number} browser_id
+ * @param {string} target_id
+ * @param {Uint8Array} state
+ */
+function cdpSyncTargetState(browser_id, target_id, state) {
+    const ptr0 = passStringToWasm0(target_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(state, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.cdpSyncTargetState(browser_id, ptr0, len0, ptr1, len1);
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
+    }
+}
+exports.cdpSyncTargetState = cdpSyncTargetState;
 
 /**
  * @param {number} browser_id
