@@ -93,22 +93,31 @@ fn set_url_part_inner(href: &str, part: &str, value: &str) -> Option<UrlComponen
         "port" => {
             if value.is_empty() {
                 let _ = url.set_port(None);
-            } else if let Ok(port) = value.parse::<u16>() {
-                let _ = url.set_port(Some(port));
+            } else {
+                // WHATWG port-state parser consumes the leading digits and stops
+                // at the first non-digit, so "8080abc" sets port 8080.
+                let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(port) = digits.parse::<u16>() {
+                    let _ = url.set_port(Some(port));
+                }
             }
         }
         "pathname" => url.set_path(value),
         "search" => {
-            let query = value.strip_prefix('?').unwrap_or(value);
-            url.set_query(if query.is_empty() { None } else { Some(query) });
+            // WHATWG: a null query only for the empty string; a bare "?" is an
+            // empty (not null) query that serializes with a trailing "?".
+            if value.is_empty() {
+                url.set_query(None);
+            } else {
+                url.set_query(Some(value.strip_prefix('?').unwrap_or(value)));
+            }
         }
         "hash" => {
-            let fragment = value.strip_prefix('#').unwrap_or(value);
-            url.set_fragment(if fragment.is_empty() {
-                None
+            if value.is_empty() {
+                url.set_fragment(None);
             } else {
-                Some(fragment)
-            });
+                url.set_fragment(Some(value.strip_prefix('#').unwrap_or(value)));
+            }
         }
         _ => {}
     }
@@ -205,6 +214,25 @@ mod tests {
         assert_eq!(parsed.search, "?q=1");
         assert_eq!(parsed.hash, "#x");
         assert_eq!(parsed.origin, "https://example.test");
+    }
+
+    // #1008: URL property setters must follow WHATWG; search/hash keep a bare
+    // delimiter as an empty component, and port parses the leading digits.
+    #[test]
+    fn url_setters_follow_whatwg_search_hash_and_port() {
+        // search = "?" keeps an empty query and serializes with a trailing "?".
+        let r = set_url_part("http://example.com/path", "search", "?").unwrap();
+        assert_eq!(r.href, "http://example.com/path?");
+        // search = "" removes the query.
+        let r = set_url_part("http://example.com/path?a=1", "search", "").unwrap();
+        assert_eq!(r.href, "http://example.com/path");
+        // hash = "#" keeps an empty fragment.
+        let r = set_url_part("http://example.com/path", "hash", "#").unwrap();
+        assert_eq!(r.href, "http://example.com/path#");
+        // port = "8080abc" parses the leading digits, so the port is 8080.
+        let r = set_url_part("http://example.com/", "port", "8080abc").unwrap();
+        assert_eq!(r.port, "8080");
+        assert_eq!(r.href, "http://example.com:8080/");
     }
 
     #[test]
