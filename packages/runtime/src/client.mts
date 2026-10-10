@@ -3,6 +3,7 @@ import { basename, dirname, extname, join } from "node:path";
 import { Worker } from "node:worker_threads";
 
 import {
+  MAX_BOOTSTRAP_CODE_CACHE_BYTES,
   MAX_DOCUMENT_METADATA_BYTES,
   MAX_DOM_ARGUMENT_BYTES,
   MAX_DOM_BATCH_BYTES,
@@ -56,8 +57,44 @@ function sharedWasmModule(modulePath, cwd) {
   return pending.catch(() => null);
 }
 
+// V8 code cache of bootstrap.js, produced by the first Worker that runs it and
+// handed to later Workers in this process. Keyed by bootstrap path; each entry
+// carries the SHA-256 of the source it was built from, which the Worker checks
+// before use because V8 itself only compares the source length.
+const sharedBootstrapCodeCaches = new Map();
+
+function storeBootstrapCodeCache(key, value) {
+  const sourceHash = value?.sourceHash;
+  const data = value?.data;
+  if (typeof sourceHash !== "string" || !/^[0-9a-f]{64}$/.test(sourceHash)) return;
+  if (!(data instanceof Uint8Array) || data.byteLength === 0 || data.byteLength > MAX_BOOTSTRAP_CODE_CACHE_BYTES) return;
+  const current = sharedBootstrapCodeCaches.get(key);
+  // Keep the first cache for a source unless V8 rejected it in a later Worker.
+  if (current && current.sourceHash === sourceHash && value.previous !== "rejected") return;
+  sharedBootstrapCodeCaches.set(key, { sourceHash, data });
+}
 
 const workerUrl = new URL("./worker.mjs", import.meta.url);
+
+// An explicit Worker execArgv replaces the flags a Worker would inherit, and
+// Node then does not apply the Permission Model in that Worker. Forward the
+// launching process's own --permission/--allow-* flags (with a separate value
+// token, as in `--allow-fs-read /dir`) so page Workers keep its restrictions.
+// Flags from NODE_OPTIONS already reach the Worker.
+function permissionExecArgv(parentExecArgv = process.execArgv) {
+  const forwarded = [];
+  for (let index = 0; index < parentExecArgv.length; index += 1) {
+    const flag = parentExecArgv[index];
+    if (flag !== "--permission" && flag !== "--permission-audit" && !flag.startsWith("--allow-")) continue;
+    forwarded.push(flag);
+    const value = parentExecArgv[index + 1];
+    if (flag.startsWith("--allow-") && !flag.includes("=") && value !== undefined && !value.startsWith("-")) {
+      forwarded.push(value);
+      index += 1;
+    }
+  }
+  return forwarded;
+}
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_VM_TIMEOUT_MS = 4_294_967_295;
 const MAX_NAVIGATION_URL_BYTES = 64 * 1024;
@@ -317,6 +354,7 @@ export class WasmV8Worker {
   #ready;
   #readyResolve;
   #readyReject;
+  #bootstrapCacheKey;
 
   constructor(modulePath, {
     cwd = process.cwd(),
@@ -325,6 +363,7 @@ export class WasmV8Worker {
     resourceLimits,
     memoryTrace = false,
     wasmModule,
+    hostOptions,
   } = {}) {
     if (bootstrapPath !== undefined && (typeof bootstrapPath !== "string" || bootstrapPath.length === 0)) {
       throw new TypeError("bootstrapPath must be a non-empty string");
@@ -333,16 +372,28 @@ export class WasmV8Worker {
     validateVmTimeout(taskTimeoutMs, "taskTimeoutMs");
     const workerData = portableWorkerData(modulePath, cwd, bootstrapPath, taskTimeoutMs, memoryTrace);
     if (wasmModule instanceof WebAssembly.Module) workerData.wasmModule = wasmModule;
+    // Host-specific settings for non-Node hosts (for example the browser
+    // fetch proxy); a plain object copied to the Worker as is.
+    if (hostOptions !== undefined) {
+      if (hostOptions === null || typeof hostOptions !== "object" || Array.isArray(hostOptions)) {
+        throw new TypeError("hostOptions must be a plain object");
+      }
+      workerData.hostOptions = hostOptions;
+    }
+    this.#bootstrapCacheKey = workerData.bootstrapPath ?? "";
+    const bootstrapCodeCache = sharedBootstrapCodeCaches.get(this.#bootstrapCacheKey);
+    if (bootstrapCodeCache) workerData.bootstrapCodeCache = bootstrapCodeCache;
     this.#ready = new Promise((resolve, reject) => {
       this.#readyResolve = resolve;
       this.#readyReject = reject;
     });
     // VM modules are an optional Node flag and the test runner injects
     // several process-only flags that Worker rejects. Pass only the one
-    // portable flag needed by the page module loader.
+    // portable flag needed by the page module loader, plus any Permission
+    // Model flags of this process.
     this.#worker = new Worker(workerUrl, {
       workerData,
-      execArgv: ["--experimental-vm-modules"],
+      execArgv: ["--experimental-vm-modules", ...permissionExecArgv()],
       ...(resourceLimits === undefined ? {} : { resourceLimits }),
     });
     this.#worker.on("message", (message) => this.#onMessage(message));
@@ -941,6 +992,10 @@ export class WasmV8Worker {
     }
     if (message.type === "fatal") {
       void this.#abort(remoteError(message.error));
+      return;
+    }
+    if (message.type === "bootstrapCodeCache") {
+      storeBootstrapCodeCache(this.#bootstrapCacheKey, message.result);
       return;
     }
     if (message.type !== "response") return;

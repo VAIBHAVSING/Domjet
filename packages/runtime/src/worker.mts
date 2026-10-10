@@ -1,6 +1,7 @@
 // @ts-nocheck
 import vm from "node:vm";
 import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parentPort, workerData, threadId } from "node:worker_threads";
@@ -28,6 +29,7 @@ import {
   MAX_PLATFORM_REQUEST_BYTES,
   MAX_PLATFORM_RESPONSE_BYTES,
   MAX_PDF_OPTIONS_BYTES,
+  MAX_BOOTSTRAP_CODE_CACHE_BYTES,
   MAX_RENDER_RESOURCE_BYTES,
   MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE,
   MAX_RENDER_URL_BYTES,
@@ -453,6 +455,14 @@ let bridgeDisposed = 0;
 let bridgeDocumentHandle = null;
 let bridgePageRevision = null;
 let compiledBootstrapRuntime;
+// bootstrap.js code cache shared through the launching thread: "none" (no
+// cache supplied), "accepted", "rejected" (by V8), or "stale" (other source).
+let bootstrapCodeCacheState = "none";
+let bootstrapSourceHash = null;
+let bootstrapSourceText = null;
+let bootstrapCodeCachePublished = false;
+// Set once a realm exists or caller code was evaluated in this isolate.
+let callerScriptsMayHaveRun = false;
 let bridgeCapabilityProbePromise;
 let portablePlatformOp;
 let bridgeTaskHost;
@@ -1028,6 +1038,7 @@ async function disposeRuntime(runtime) {
 }
 
 async function evaluateWithModule(source, timeoutMs) {
+  callerScriptsMayHaveRun = true;
   source = sourceText(source);
   timeoutMs = optionalTimeout(timeoutMs);
   const direct = member(target, EVALUATE_NAMES);
@@ -1054,6 +1065,7 @@ async function evaluateWithModule(source, timeoutMs) {
 function getHostContext() {
   if (hostContext) return hostContext;
   const sandbox = Object.create(null);
+  callerScriptsMayHaveRun = true;
   hostContext = vm.createContext(sandbox, {
     name: "domjet-page",
     codeGeneration: { strings: true, wasm: false },
@@ -1078,8 +1090,58 @@ async function getCompiledBootstrapRuntime() {
     error.code = cause?.code ?? "ERR_OBSCURA_BOOTSTRAP_SOURCE";
     throw error;
   }
-  compiledBootstrapRuntime = compileBootstrapRuntime(source, { filename: bootstrapPath });
+  bootstrapSourceText = source;
+  const cachedData = takeBootstrapCodeCache();
+  compiledBootstrapRuntime = compileBootstrapRuntime(source, { filename: bootstrapPath, cachedData });
+  if (cachedData !== undefined) bootstrapCodeCacheState = compiledBootstrapRuntime.codeCache;
   return compiledBootstrapRuntime;
+}
+
+// Hash only when a cache is supplied or published: hosts without code caches
+// (browsers) never pay for hashing the 0.6 MB bootstrap source.
+function bootstrapHash() {
+  if (bootstrapSourceHash === null) bootstrapSourceHash = createHash("sha256").update(bootstrapSourceText).digest("hex");
+  return bootstrapSourceHash;
+}
+
+function takeBootstrapCodeCache() {
+  const supplied = workerData.bootstrapCodeCache;
+  // The structured clone is only needed for this one compile.
+  delete workerData.bootstrapCodeCache;
+  if (supplied === null || typeof supplied !== "object") return undefined;
+  const { sourceHash: expectedHash, data } = supplied;
+  if (!(data instanceof Uint8Array) || data.byteLength === 0 || data.byteLength > MAX_BOOTSTRAP_CODE_CACHE_BYTES) {
+    return undefined;
+  }
+  if (expectedHash !== bootstrapHash()) {
+    bootstrapCodeCacheState = "stale";
+    return undefined;
+  }
+  return data;
+}
+
+// Give the launching thread a code cache of bootstrap.js so later Workers skip
+// most of its compile. Only a Worker's first realm publishes, before any page
+// or caller script has run in this isolate. This is defense in depth: V8 does
+// not harden cache deserialization against crafted bytes, so the cache must
+// never cross a process or trust boundary; it only lives in this process.
+function publishBootstrapCodeCache(runtime, firstRealm) {
+  if (!firstRealm || bootstrapCodeCachePublished || bootstrapCodeCacheState === "accepted") return;
+  bootstrapCodeCachePublished = true;
+  try {
+    const produced = runtime.createCodeCache();
+    if (!produced || produced.byteLength > MAX_BOOTSTRAP_CODE_CACHE_BYTES) return;
+    const data = new Uint8Array(produced);
+    parentPort.postMessage(
+      {
+        type: "bootstrapCodeCache",
+        result: { sourceHash: bootstrapHash(), previous: bootstrapCodeCacheState, data },
+      },
+      [data.buffer],
+    );
+  } catch {
+    // The cache is only an optimization; the page keeps working without it.
+  }
 }
 
 function hostEvaluate(source, timeoutMs = 1_000) {
@@ -2411,6 +2473,19 @@ async function replaceBridgeCore(html, documentMetadata) {
   html = requireBoundedString(html, MAX_HTML_INPUT_BYTES, "HTML input");
   const next = new constructor.fn(html);
   const nextApi = bridgeApi(next);
+  // The cookie jar belongs to the profile, not the document: carry it into the
+  // replacement core so setContent and other HTML replacements keep cookies.
+  if (bridgeCore && nextApi.importCookies) {
+    const currentApi = bridgeApi(bridgeCore);
+    if (currentApi.allCookies) {
+      try {
+        const now = cookieNowSeconds();
+        syncCall(nextApi.importCookies, syncCall(currentApi.allCookies, now), now);
+      } catch {
+        // A core whose jar cannot be read starts with an empty jar, as before.
+      }
+    }
+  }
   if (memoryTraceEnabled && nextApi.setMemoryTraceEnabled) {
     syncCall(nextApi.setMemoryTraceEnabled, true);
   }
@@ -4202,6 +4277,7 @@ async function bridgeStatus() {
       domTransport: "synchronous-op-dom",
       source: workerData.bootstrapPath ? "explicit-bootstrapPath" : "checkout-default",
       compiled: Boolean(compiledBootstrapRuntime),
+      codeCache: bootstrapCodeCacheState,
       fullBrowser: false,
       denoIntegration: false,
       tasks: bridgeTaskHost?.status() ?? bridgeTaskLastStatus ?? {
@@ -4802,6 +4878,7 @@ async function installBootstrapRealm(timeoutMs = 5_000) {
   // globals with a page whose native wrappers belong to another lifecycle.
   hostContext = null;
   bridgeRealmKind = null;
+  const firstRealm = !callerScriptsMayHaveRun;
   const context = getHostContext();
   const generation = bridgeGeneration;
   const documentHandle = bridgeDocumentHandle;
@@ -4830,6 +4907,7 @@ async function installBootstrapRealm(timeoutMs = 5_000) {
     bridgeTaskHost = taskHost;
     bridgeTaskLastStatus = null;
     bridgeRealmKind = "bootstrap";
+    publishBootstrapCodeCache(runtime, firstRealm);
     return context;
   } catch (error) {
     taskHost.close();
@@ -4874,6 +4952,7 @@ async function createDrop({ iterations = 1, source = "1 + 1", timeoutMs } = {}) 
     throw new RangeError("iterations must be a positive safe integer");
   }
 
+  callerScriptsMayHaveRun = true;
   source = sourceText(source);
   timeoutMs = optionalTimeout(timeoutMs);
   const api = describeApi();
@@ -4915,6 +4994,7 @@ async function hostStress({ iterations = 10_000, source = "1 + 1", timeoutMs = 1
     throw new RangeError("iterations must be a positive safe integer");
   }
   const sandbox = Object.create(null);
+  callerScriptsMayHaveRun = true;
   const context = vm.createContext(sandbox, {
     name: "domjet-page-stress",
     codeGeneration: { strings: true, wasm: false },

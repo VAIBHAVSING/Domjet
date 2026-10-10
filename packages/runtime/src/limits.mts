@@ -1,5 +1,23 @@
 // @ts-nocheck
-import { Buffer } from "node:buffer";
+// Portable (Node, Bun, browsers): no node:buffer. A Buffer is a Uint8Array,
+// so the ArrayBuffer.isView checks below accept it.
+function utf8ByteLengthExceeds(value, maximum) {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else bytes += 3;
+    } else bytes += 3;
+    if (bytes > maximum) return true;
+  }
+  return false;
+}
 
 export const MAX_HTML_INPUT_BYTES = 8 * 1024 * 1024;
 export const MAX_SELECTOR_BYTES = 64 * 1024;
@@ -22,6 +40,8 @@ export const MAX_PLATFORM_PBKDF2_WORK_UNITS = 1_000_000;
 export const MAX_RENDER_URL_BYTES = 64 * 1024;
 export const MAX_RENDER_RESOURCE_BYTES = 16 * 1024 * 1024;
 export const MAX_RENDER_RESOURCE_REQUESTS_PER_PAGE = 32;
+// A V8 code cache for bootstrap.js is about 0.4 MB; anything far larger is not one.
+export const MAX_BOOTSTRAP_CODE_CACHE_BYTES = 16 * 1024 * 1024;
 export const RENDER_IMAGE_REQUEST_PROFILES = Object.freeze([
   "no-cors-include",
   "cors-same-origin",
@@ -56,14 +76,14 @@ export function requireBoundedString(value, maximum, label) {
   // UTF-8 needs between 1 and 3 bytes per UTF-16 code unit, so most strings
   // are decided by their length without scanning them.
   if (value.length * 3 <= maximum) return value;
-  if (value.length > maximum || Buffer.byteLength(value, "utf8") > maximum) {
+  if (value.length > maximum || utf8ByteLengthExceeds(value, maximum)) {
     throw new RangeError(`${label} exceeds the ${maximum}-byte ABI limit`);
   }
   return value;
 }
 
 export function requireBoundedBytes(value, maximum, label) {
-  if (!(value instanceof Uint8Array) && !Buffer.isBuffer(value) && !ArrayBuffer.isView(value)) {
+  if (!(value instanceof Uint8Array) && !ArrayBuffer.isView(value)) {
     throw new TypeError(`${label} must be a Uint8Array or Buffer`);
   }
   if (value.byteLength > maximum) {
@@ -73,7 +93,7 @@ export function requireBoundedBytes(value, maximum, label) {
 }
 
 export function requireValidPngBytes(bytes, label = "screenshot PNG") {
-  if (!(bytes instanceof Uint8Array) && !Buffer.isBuffer(bytes) && !ArrayBuffer.isView(bytes)) {
+  if (!(bytes instanceof Uint8Array) && !ArrayBuffer.isView(bytes)) {
     throw new TypeError(`${label} must return a Uint8Array or Buffer`);
   }
   if (bytes.byteLength < PNG_HEADER_SIGNATURE.length) {
@@ -207,7 +227,7 @@ export function requirePdfOptions(value = {}) {
 }
 
 export function requireValidPdfBytes(bytes, label = "PDF output") {
-  if (!(bytes instanceof Uint8Array) && !Buffer.isBuffer(bytes) && !ArrayBuffer.isView(bytes)) {
+  if (!(bytes instanceof Uint8Array) && !ArrayBuffer.isView(bytes)) {
     throw new TypeError(`${label} must return a Uint8Array or Buffer`);
   }
   if (bytes.byteLength > MAX_PDF_OUTPUT_BYTES) {

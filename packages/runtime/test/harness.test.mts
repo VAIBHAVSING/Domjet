@@ -235,6 +235,7 @@ test("bridges Domjet core queries into the persistent host V8 document facade", 
         domTransport: "synchronous-op-dom",
         source: "checkout-default",
         compiled: false,
+        codeCache: "none",
         fullBrowser: false,
         denoIntegration: false,
         tasks: {

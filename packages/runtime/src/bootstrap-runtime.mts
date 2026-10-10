@@ -1,6 +1,5 @@
 // @ts-nocheck
 import vm from "node:vm";
-import { randomBytes } from "node:crypto";
 
 import { translateTaskDispatchError } from "./task-runtime.mjs";
 
@@ -656,19 +655,34 @@ function taskHostResponse(call, command, argument) {
   return Object.freeze(response);
 }
 
-export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>" } = {}) {
+export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>", cachedData } = {}) {
   if (typeof source !== "string" || source.length === 0) {
     throw new TypeError("Domjet bootstrap source must be a non-empty string");
   }
   if (typeof filename !== "string" || filename.length === 0) {
     throw new TypeError("Domjet bootstrap filename must be a non-empty string");
   }
+  if (cachedData !== undefined && !(cachedData instanceof Uint8Array)) {
+    throw new TypeError("Domjet bootstrap cachedData must be a Uint8Array when supplied");
+  }
 
-  const bootstrapScript = new vm.Script(source, { filename });
+  // V8 checks a code cache against its version, flags, and the source length,
+  // but not the source text: a same-length edit is accepted and runs the old
+  // code. Callers must key cachedData by the source content.
+  const bootstrapScript = new vm.Script(source, cachedData === undefined ? { filename } : { filename, cachedData });
+  const codeCache = cachedData === undefined
+    ? "none"
+    : bootstrapScript.cachedDataRejected === false ? "accepted" : "rejected";
   // Keep the page dispatcher in a realm-global lexical binding. Unlike a
   // global property it is not enumerable or directly recoverable by page
   // code. The random identifier is compiled only into host-owned scripts.
-  const secret = randomBytes(16).toString("hex");
+  const secretBytes = new Uint8Array(16);
+  crypto.getRandomValues(secretBytes);
+  const secret = Array.from(secretBytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  // A host whose page realm is its own global (a Web Worker) cannot keep a
+  // script-level lexical binding between evaluations; it takes the
+  // dispatchers out of their slots directly. Node keeps the lexical capture.
+  const sharedRealmHost = vm.domjetSharedRealmHost === true;
   const dispatchLexical = `__obscuraTaskDispatch_${secret}`;
   const fetchResolveLexical = `__obscuraFetchResolve_${secret}`;
   const dispatchSlot = `__obscuraTaskDispatchSlot_${secret}`;
@@ -706,6 +720,13 @@ export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>
     { filename: "domjet-portable-fetch-dispatch.js" },
   );
   return Object.freeze({
+    codeCache,
+    // Bytecode for the functions compiled so far. Taken after a bootstrap run,
+    // it also covers the functions the run compiled lazily.
+    createCodeCache() {
+      const data = bootstrapScript.createCachedData();
+      return data instanceof Uint8Array && data.byteLength > 0 ? data : null;
+    },
     install(context, { opDom, opPlatform, opTask, opFetch, opCookie, timeoutMs } = {}) {
       if (!vm.isContext(context)) {
         throw new TypeError("Domjet bootstrap requires a Node vm context");
@@ -783,8 +804,20 @@ export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>
         Reflect.deleteProperty(context, HOST_FETCH_DISPATCH_SLOT_BINDING);
       }
 
-      captureTaskDispatcherScript.runInContext(context, { timeout: timeoutMs });
-      captureFetchResolverScript.runInContext(context, { timeout: timeoutMs });
+      let directDispatch;
+      let directResolveFetch;
+      if (sharedRealmHost) {
+        directDispatch = context[dispatchSlot];
+        directResolveFetch = context[fetchDispatchSlot];
+        Reflect.deleteProperty(context, dispatchSlot);
+        Reflect.deleteProperty(context, fetchDispatchSlot);
+        if (typeof directDispatch !== "function" || typeof directResolveFetch !== "function") {
+          throw new Error("Domjet bridge did not install its task dispatchers");
+        }
+      } else {
+        captureTaskDispatcherScript.runInContext(context, { timeout: timeoutMs });
+        captureFetchResolverScript.runInContext(context, { timeout: timeoutMs });
+      }
 
       bootstrapScript.runInContext(context, { timeout: timeoutMs });
       initializePageScript.runInContext(context, { timeout: timeoutMs });
@@ -795,6 +828,13 @@ export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>
             throw new TypeError("Domjet task dispatch id must be a positive safe integer");
           }
           taskTimeoutMs = vmTimeout(taskTimeoutMs);
+          if (sharedRealmHost) {
+            try {
+              return Reflect.apply(directDispatch, undefined, [id]);
+            } catch (error) {
+              throw translateTaskDispatchError(error, taskTimeoutMs);
+            }
+          }
           Object.defineProperty(context, dispatchIdSlot, {
             value: id,
             writable: false,
@@ -817,6 +857,7 @@ export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>
             throw new TypeError("Domjet fetch dispatch payload must be a string");
           }
           fetchTimeoutMs = vmTimeout(fetchTimeoutMs);
+          if (sharedRealmHost) return Reflect.apply(directResolveFetch, undefined, [id, serialized]);
           Object.defineProperty(context, dispatchIdSlot, {
             value: id,
             writable: false,
