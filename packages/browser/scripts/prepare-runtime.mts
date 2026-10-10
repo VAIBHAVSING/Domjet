@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { copyFile, mkdir, rm } from "node:fs/promises";
+import { copyFile, cp, mkdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,6 +19,8 @@ for (const name of [
 ]) {
   await copyFile(resolve(sourceRoot, name), resolve(outputRoot, name));
 }
+// Browser and Web Worker host layer (build-time shims for the web bundles).
+await cp(resolve(sourceRoot, "web"), resolve(outputRoot, "web"), { recursive: true });
 await copyFile(resolve(repositoryRoot, "crates/obscura-js/js/bootstrap.js"), resolve(packageRoot, "bootstrap.js"));
 const internalRoot = resolve(packageRoot, "src/internal");
 await rm(internalRoot, { recursive: true, force: true });

@@ -10,6 +10,18 @@
       "import": "./dist/src/index.mjs",
       "default": "./dist/src/index.mjs"
     },
+    "./web": {
+      "types": "./dist/src/web/index.d.mts",
+      "browser": "./dist/web/domjet.web.mjs",
+      "worker": "./dist/web/domjet.web.mjs",
+      "import": "./dist/web/domjet.web.mjs",
+      "default": "./dist/web/domjet.web.mjs"
+    },
+    "./web/frame": {
+      "types": "./dist/src/web/frame-client.d.mts",
+      "import": "./dist/web/frame-client.mjs",
+      "default": "./dist/web/frame-client.mjs"
+    },
     "./cdp": {
       "types": "./dist/src/cdp.d.mts",
       "import": "./dist/src/cdp.mjs",
@@ -47,7 +59,8 @@
     }
   },
   "bin": {
-    "domjet": "./dist/bin/domjet.mjs"
+    "domjet": "./dist/bin/domjet.mjs",
+    "domjet-web-assets": "./dist/bin/domjet-web-assets.mjs"
   },
   "files": [
     "dist",
@@ -65,11 +78,12 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "node ./scripts/clean.mjs && tsx ./scripts/prepare-runtime.mts && tsc -p tsconfig.json && node ./scripts/finalize-build.mjs",
+    "build": "node ./scripts/clean.mjs && tsx ./scripts/prepare-runtime.mts && tsc -p tsconfig.json && node ./scripts/finalize-build.mjs && node ./scripts/build-web.mjs",
     "test": "pnpm run build && tsx --test ./test/*.test.mts",
     "prepare:runtime": "tsx ./scripts/prepare-runtime.mts",
     "prepare:wasm": "tsx ./scripts/prepare-wasm.mts",
-    "prepack": "pnpm run build"
+    "prepack": "pnpm run build",
+    "build:web": "node ./scripts/build-web.mjs"
   },
   "peerDependencies": {
     "playwright-core": ">=1.45.0",

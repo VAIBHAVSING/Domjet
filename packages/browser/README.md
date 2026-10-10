@@ -133,6 +133,69 @@ The `domjet/transport` subpath contains the bounded, versioned
 request/event transport intended for a future remote browser service. Local and
 remote placement can therefore share the same public browser API.
 
+## Runtimes: Node.js, Bun, browsers, Web Workers, and iframes
+
+The same engine (`bootstrap.js` unmodified, the same runtime core, the same
+WebAssembly module) runs on every host; only the JavaScript host differs.
+
+| Host | Entry | Page JavaScript runs in | Notes |
+|---|---|---|---|
+| Node.js >= 22 (V8) | `domjet` | a `node:vm` realm in one Worker thread per page | Per-page heap cap (512 MB default) and synchronous script timeouts. |
+| Bun (JavaScriptCore) | `domjet` | the same `node:vm` realm and Worker thread | Bun ignores `resourceLimits`, so there is no per-page heap cap. |
+| Browsers (V8, JavaScriptCore, SpiderMonkey) | `domjet/web` | a dedicated module Web Worker per document | No synchronous timeout: a runaway page is stopped by terminating its Worker. |
+| `<iframe>` | `domjet/web/frame` + `frame.html` | the frame's page Workers | Shows the rendered page inside the frame; driven with `postMessage`. |
+
+### In a page or Web Worker
+
+```js
+import { createBrowser } from "domjet/web";
+
+const browser = await createBrowser({ assetsUrl: "/domjet/" });
+const page = await (await browser.newContext()).newPage();
+await page.goto("https://example.com/");
+console.log(await page.title(), await page.evaluate(() => document.links.length));
+const png = await page.screenshot({ width: 1280, height: 800 });
+await browser.close();
+```
+
+Publish the assets with `npx domjet-web-assets public/domjet` (copies `dist/web`
+and writes the raw `engine.<hash>.wasm`). Serve them with:
+
+- `Cache-Control: public, max-age=31536000, immutable` for files with a hash in
+  the name (the engine, worker, frame, and bootstrap); `no-cache` for
+  `frame.html`, `domjet.web.mjs`, and `manifest.json`.
+- `Content-Type: application/wasm` for the engine, and `Content-Encoding: br`
+  from `engine.<hash>.wasm.br` (3.6 MB instead of 16.8 MB). The engine is
+  compiled with `WebAssembly.compileStreaming`, so the browser reuses its cached
+  copy. Uncompressed, the 16.8 MB file can exceed a browser's in-memory cache
+  entry limit.
+- A Content Security Policy for the worker that allows `'unsafe-eval'`: page
+  scripts are evaluated inside the page Worker.
+
+Browser limits: page requests are subject to CORS (pass `fetchProxy` to route
+them through your own proxy). Browsers do not let scripts set `Cookie` or read
+`Set-Cookie`, so only cookies written by page scripts or `setCookie` reach the
+cookie jar. ES module page scripts are not supported yet. Within a context,
+cookies are shared between pages when pages navigate or evaluate.
+
+### As an iframe
+
+```js
+import { mountBrowserFrame } from "domjet/web/frame";
+
+const frame = await mountBrowserFrame(document.getElementById("browser"), {
+  frameUrl: "https://assets.example.com/domjet/frame.html",
+  url: "https://example.com/",
+});
+await frame.navigate("https://example.org/");
+console.log(await frame.evaluate("document.title"));
+```
+
+Serve `frame.html` from a dedicated origin (for example an assets subdomain).
+The frame then has its own HTTP cache and storage, page content cannot reach the
+embedding document, and the frame only accepts commands from the embedder's
+origin.
+
 ## Compatibility and attribution
 
 Import from `domjet` and run `npx domjet`. `DOMJET_ENGINE_MODULE` selects a
