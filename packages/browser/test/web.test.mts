@@ -85,7 +85,18 @@ test("domjet/web runs the engine, unmodified bootstrap.js, and the iframe in a b
   </script>`);
   const assetServer = await serve(assets);
   const A = origin(assetServer);
-  const embedServer = await serve(assets, { "/embed.html": `<!doctype html><div id=c></div><script type="module">
+  const embedServer = await serve(assets, { "/app.html": `<!doctype html><script type="module">
+    const out = {};
+    try {
+      const { createBrowser } = await import("${A}/domjet.web.mjs");
+      const browser = await createBrowser({ assetsUrl: "${A}/" });
+      const page = await browser.newPage();
+      await page.setContent("<title>cross-origin assets</title>");
+      out.title = await page.title();
+      await browser.close();
+    } catch (error) { out.error = String(error && error.stack || error); }
+    window.__result = out;
+  </script>`, "/embed.html": `<!doctype html><div id=c></div><script type="module">
     const out = {};
     try {
       const { mountBrowserFrame } = await import("${A}/frame-client.mjs");
@@ -130,6 +141,11 @@ test("domjet/web runs the engine, unmodified bootstrap.js, and the iframe in a b
     const reload = await cacheResult();
     assert.ok(first.transferSize > 0);
     assert.equal(reload.transferSize, 0, "engine must come from the HTTP cache on reload");
+
+    // The SDK and its assets on another origin (a CDN) than the page.
+    const crossOrigin = await result(`${B}/app.html`);
+    assert.equal(crossOrigin.error, undefined, crossOrigin.error);
+    assert.equal(crossOrigin.title, "cross-origin assets");
 
     const embed = await result(`${B}/embed.html`);
     assert.equal(embed.error, undefined, embed.error);

@@ -20,9 +20,13 @@ export function __domjetConfigureFetch(options = {}) {
 }
 
 export function fetch(input, init) {
-  const url = typeof input === "string" ? input : input instanceof g.URL ? input.href : null;
+  const url = typeof input === "string" ? input
+    : input instanceof g.URL ? input.href
+    : input instanceof g.Request ? input.url
+    : null;
   if (fetchProxyPrefix && url && /^https?:/i.test(url) && (hostOrigin === null || !url.startsWith(`${hostOrigin}/`))) {
-    return nativeFetch(fetchProxyPrefix + encodeURIComponent(url), init);
+    const proxied = fetchProxyPrefix + encodeURIComponent(url);
+    return nativeFetch(input instanceof g.Request ? new g.Request(proxied, input) : proxied, init);
   }
   return nativeFetch(input, init);
 }

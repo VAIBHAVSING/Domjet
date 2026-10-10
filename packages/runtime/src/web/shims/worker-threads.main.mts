@@ -14,24 +14,46 @@ export const threadId = 0;
 export const parentPort = null;
 export const workerData = null;
 
+// Browsers start Worker scripts only from the page's own origin. For assets
+// on another origin (a CDN), a same-origin blob module imports the hashed
+// worker; the assets origin must send CORS headers, as for any module.
+function workerScript(url) {
+  const target = new URL(url, globalThis.location?.href);
+  if (!globalThis.location || target.origin === globalThis.location.origin) return { url: target.href, blob: null };
+  const blob = URL.createObjectURL(new Blob([`import ${JSON.stringify(target.href)};\n`], { type: "text/javascript" }));
+  return { url: blob, blob };
+}
+
 export class Worker {
   #worker;
   #port;
+  #blob = null;
   #listeners = new Map();
   #exited = false;
 
   constructor(_url, options = {}) {
     if (!workerScriptUrl) throw new Error("Domjet web worker URL is not configured; load the engine first");
-    this.#worker = new globalThis.Worker(workerScriptUrl, { type: "module", name: "domjet-page" });
+    const script = workerScript(workerScriptUrl);
+    this.#blob = script.blob;
+    this.#worker = new globalThis.Worker(script.url, { type: "module", name: "domjet-page" });
     const channel = new MessageChannel();
     this.#port = channel.port1;
-    this.#port.onmessage = (event) => this.#emit("message", event.data);
+    this.#port.onmessage = (event) => {
+      this.#revokeBlob();
+      this.#emit("message", event.data);
+    };
     this.#worker.onerror = (event) => {
       event.preventDefault?.();
+      this.#revokeBlob();
       this.#emit("error", new Error(event.message || "Domjet page worker failed"));
       this.#exit(1);
     };
     this.#worker.postMessage({ type: "domjet:init", port: channel.port2, workerData: options.workerData }, [channel.port2]);
+  }
+
+  #revokeBlob() {
+    if (this.#blob) URL.revokeObjectURL(this.#blob);
+    this.#blob = null;
   }
 
   #emit(type, value) {
@@ -66,6 +88,7 @@ export class Worker {
   }
 
   terminate() {
+    this.#revokeBlob();
     this.#worker.terminate();
     this.#port.close();
     this.#exit(1);

@@ -58,7 +58,12 @@ function assetBase(options: WebBrowserOptions): URL {
 
 async function compileEngine(url: string): Promise<WebAssembly.Module> {
   const response = await fetch(url, { credentials: "same-origin" });
-  if (!response.ok) throw new Error(`Domjet engine request failed: HTTP ${response.status} for ${url}`);
+  if (!response.ok) {
+    throw new Error(
+      `Domjet engine request failed: HTTP ${response.status} for ${url}. ` +
+      "Serve the files written by `domjet-web-assets` and pass their base URL as `assetsUrl`.",
+    );
+  }
   const type = response.headers.get("content-type") ?? "";
   // Streaming compile lets the engine reuse its cached machine code for a
   // cached response; it needs the application/wasm content type.
