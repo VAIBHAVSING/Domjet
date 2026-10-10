@@ -133,6 +133,15 @@ The `domjet/transport` subpath contains the bounded, versioned
 request/event transport intended for a future remote browser service. Local and
 remote placement can therefore share the same public browser API.
 
+The CDP endpoint has no credentials, so it only answers local clients. It
+refuses requests whose `Host` is not `localhost`, an IP address, or the host it
+was bound to (DNS rebinding), and WebSocket or HTTP requests that carry an
+`Origin` header (a web page) unless `allowedOrigins` lists that origin. Node CDP
+clients such as Puppeteer and Playwright send no `Origin`. Browser and page IDs
+are random. Remote clients of a non-loopback bind connect by IP address, as with
+Chrome. Binding to a non-loopback host gives anyone who can reach it control of
+the browser; `domjet serve --host` warns about it.
+
 ## Runtimes: Node.js, Bun, browsers, Web Workers, and iframes
 
 The same engine (`bootstrap.js` unmodified, the same runtime core, the same

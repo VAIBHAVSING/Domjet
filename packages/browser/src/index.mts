@@ -23,6 +23,12 @@ export interface BrowserOptions {
   evaluateTimeoutMs?: number;
   taskTimeoutMs?: number;
   allowPrivateNetwork?: boolean;
+  /**
+   * Origins (for example "https://devtools.example") allowed to open the CDP
+   * endpoint from a web page. Default none: browsers send an Origin header,
+   * Node CDP clients do not. "*" allows every origin.
+   */
+  allowedOrigins?: readonly string[];
   /** Started page workers kept ready for newPage(). Default 1; 0 disables. */
   prewarmPages?: number;
   workerOptions?: Record<string, unknown>;

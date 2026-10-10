@@ -159,6 +159,12 @@ async function main(argv) {
     const browser = await launch({ modulePath: options.module, host: options.host, port: options.port === undefined ? 0 : Number(options.port) });
     const info = { httpEndpoint: browser.httpEndpoint(), wsEndpoint: browser.wsEndpoint(), ...browser.processInfo() };
     process.stdout.write(options.json ? `${JSON.stringify(info)}\n` : `${info.httpEndpoint}\n`);
+    const loopback = ["127.0.0.1", "localhost", "::1", "[::1]"];
+    if (options.host !== undefined && !loopback.includes(String(options.host).toLowerCase())) {
+      process.stderr.write(
+        `warning: the CDP endpoint on ${options.host} has no authentication; anyone who can reach it controls this browser\n`,
+      );
+    }
     let stopping = false;
     let resolveStopped;
     const stopped = new Promise((resolvePromise) => { resolveStopped = resolvePromise; });

@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { EventEmitter } from "node:events";
 import { dirname, resolve } from "node:path";
@@ -9,6 +10,26 @@ import { WebSocketPeer, websocketAccept } from "./websocket.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HOST = "127.0.0.1";
+
+// The CDP endpoint has no credentials, so it only answers requests a local
+// client could have made. A Host header must be localhost, an IP literal, or
+// the host the server was bound to: a DNS-rebinding page uses its own host
+// name. Browsers attach Origin to cross-site WebSocket and fetch requests;
+// Node CDP clients (Puppeteer, Playwright, this SDK) send none. Requests with
+// an Origin are refused unless it is listed in `allowedOrigins`.
+function hostHeaderAllowed(value, boundHost) {
+  if (typeof value !== "string" || value.length === 0) return false;
+  let hostname;
+  try { hostname = new URL(`http://${value}`).hostname.toLowerCase(); } catch { return false; }
+  if (hostname === "localhost" || hostname.endsWith(".localhost")) return true;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/u.test(hostname) || hostname.startsWith("[")) return true;
+  return typeof boundHost === "string" && hostname === boundHost.toLowerCase();
+}
+
+function originAllowed(origin, allowedOrigins) {
+  if (origin === undefined) return true;
+  return allowedOrigins.has("*") || allowedOrigins.has(String(origin));
+}
 const MAX_COMMAND_BYTES = 8 * 1024 * 1024;
 const MAX_REMOTE_OBJECTS = 2_048;
 
@@ -1016,7 +1037,12 @@ export class DomjetCdpServer {
     evaluateTimeoutMs = 5_000,
     allowPrivateNetwork = false,
     prewarmPages = 0,
+    allowedOrigins = [] as readonly string[],
   } = {}) {
+    if (!Array.isArray(allowedOrigins) || allowedOrigins.some((origin) => typeof origin !== "string" || origin.length === 0)) {
+      throw new TypeError("allowedOrigins must be an array of origin strings");
+    }
+    this.allowedOrigins = new Set(allowedOrigins);
     this.modulePath = modulePath;
     const sourceBootstrap = resolve(HERE, "../bootstrap.js");
     const builtBootstrap = resolve(HERE, "../../bootstrap.js");
@@ -1048,7 +1074,8 @@ export class DomjetCdpServer {
     this.connectionCounter = 0;
     this.targetCounter = 0;
     this.sessionCounter = 0;
-    this.browserId = `domjet-browser-${process.pid}-${Date.now().toString(36)}`;
+    // Unguessable: the WebSocket path is part of what a local client must know.
+    this.browserId = `domjet-browser-${randomUUID()}`;
     this.listeners = new Map();
     this.streamCounter = 0;
     this.streams = new Map();
@@ -1125,7 +1152,7 @@ export class DomjetCdpServer {
 
   allocateTargetId() {
     this.targetCounter += 1;
-    return `page-${this.targetCounter}`;
+    return `page-${this.targetCounter}-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
   }
 
   allocateSessionId(targetId) {
@@ -1367,6 +1394,11 @@ export class DomjetCdpServer {
   }
 
   #http(request, response) {
+    if (!hostHeaderAllowed(request.headers.host, this.host) || !originAllowed(request.headers.origin, this.allowedOrigins)) {
+      response.writeHead(403, { connection: "close" });
+      response.end();
+      return;
+    }
     if (request.method !== "GET") {
       response.writeHead(405, { allow: "GET", connection: "close" });
       response.end();
@@ -1394,7 +1426,6 @@ export class DomjetCdpServer {
         type: "page",
         title: target.title,
         url: target.url,
-        webSocketDebuggerUrl: `ws://${this.hostForUrl()}:${this.addressInfo.port}/devtools/page/${target.id}`,
         devtoolsFrontendUrl: "",
         webSocketDebuggerUrl: `ws://${this.hostForUrl()}:${this.addressInfo.port}/devtools/page/${target.id}`,
         faviconUrl: "",
@@ -1420,6 +1451,14 @@ export class DomjetCdpServer {
     if (request.method !== "GET" || String(request.headers.upgrade).toLowerCase() !== "websocket" ||
         !String(request.headers.connection).toLowerCase().split(",").map((value) => value.trim()).includes("upgrade")) {
       fail("400 Bad Request", "invalid websocket upgrade");
+      return;
+    }
+    if (!hostHeaderAllowed(request.headers.host, this.host)) {
+      fail("403 Forbidden", "host not allowed");
+      return;
+    }
+    if (!originAllowed(request.headers.origin, this.allowedOrigins)) {
+      fail("403 Forbidden", "origin not allowed");
       return;
     }
     if (request.headers["sec-websocket-version"] !== "13") {

@@ -61,9 +61,10 @@ class FakeWorker {
   async close() { this.closed = true; }
 }
 
-async function makeServer() {
+async function makeServer(options = {}) {
   const workers = [];
   const server = new DomjetCdpServer({
+    ...options,
     modulePath: "fake.wasm.js",
     workerFactory: async () => {
       const worker = new FakeWorker();
@@ -75,7 +76,7 @@ async function makeServer() {
   return { server, workers };
 }
 
-function rawUpgrade(endpoint, path, head = Buffer.alloc(0)) {
+function rawUpgrade(endpoint, path, head = Buffer.alloc(0), headers = {}) {
   return new Promise((resolveResponse, reject) => {
     const url = new URL(endpoint);
     const socket = createConnection({ host: url.hostname, port: Number(url.port) });
@@ -91,11 +92,12 @@ function rawUpgrade(endpoint, path, head = Buffer.alloc(0)) {
       socket.write(Buffer.concat([
         Buffer.from([
           `GET ${path} HTTP/1.1`,
-          `Host: ${url.host}`,
+          `Host: ${headers.Host ?? url.host}`,
           "Connection: Upgrade",
           "Upgrade: websocket",
           "Sec-WebSocket-Version: 13",
           "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+          ...Object.entries(headers).filter(([name]) => name !== "Host").map(([name, value]) => `${name}: ${value}`),
           "\r\n",
         ].join("\r\n"), "latin1"),
         head,
@@ -202,3 +204,61 @@ test("a prewarmed server hands its started spare to the next page and closes unu
   }
   assert.ok(workers.every((worker) => worker.closed), "server close must close spares too");
 });
+
+function httpStatus(endpoint, path, headers = {}) {
+  return new Promise((resolveStatus, reject) => {
+    const url = new URL(endpoint);
+    const socket = createConnection({ host: url.hostname, port: Number(url.port) });
+    let response = "";
+    socket.on("data", (chunk) => { response += chunk.toString("latin1"); });
+    socket.once("error", reject);
+    socket.once("close", () => resolveStatus(Number(response.split(" ")[1])));
+    socket.once("connect", () => socket.write([
+      `GET ${path} HTTP/1.1`,
+      `Host: ${headers.Host ?? url.host}`,
+      ...Object.entries(headers).filter(([name]) => name !== "Host").map(([name, value]) => `${name}: ${value}`),
+      "Connection: close",
+      "\r\n",
+    ].join("\r\n")));
+  });
+}
+
+// An unmasked text frame makes the server answer 101 and then close, so the
+// raw request finishes instead of holding the socket open.
+const CLOSE_AFTER_UPGRADE = Buffer.from([0x81, 0x01, 0x61]);
+
+test("the CDP endpoint refuses web origins and rebound host names", async () => {
+  const { server } = await makeServer();
+  try {
+    const target = await server.createTarget("about:blank");
+    assert.match(target.id, /^page-\d+-[0-9a-f]{16}$/u);
+    assert.match(new URL(server.wsEndpoint()).pathname, /^\/devtools\/browser\/domjet-browser-[0-9a-f-]{36}$/u);
+    const http = server.httpEndpoint();
+    const port = new URL(http).port;
+    const pagePath = `/devtools/page/${target.id}`;
+
+    // Local clients send no Origin and a loopback Host.
+    assert.match(await rawUpgrade(server.wsEndpoint(), pagePath, CLOSE_AFTER_UPGRADE), /^HTTP\/1\.1 101 /u);
+    assert.match(await rawUpgrade(server.wsEndpoint(), pagePath, CLOSE_AFTER_UPGRADE, { Host: `localhost:${port}` }), /^HTTP\/1\.1 101 /u);
+    assert.equal(await httpStatus(http, "/json/version"), 200);
+
+    // A page in a desktop browser sends its Origin; a DNS-rebinding page sends its own host name.
+    assert.match(await rawUpgrade(server.wsEndpoint(), pagePath, Buffer.alloc(0), { Origin: "https://evil.example" }), /^HTTP\/1\.1 403 /u);
+    assert.match(await rawUpgrade(server.wsEndpoint(), pagePath, Buffer.alloc(0), { Host: `evil.example:${port}` }), /^HTTP\/1\.1 403 /u);
+    assert.equal(await httpStatus(http, "/json/version", { Host: `evil.example:${port}` }), 403);
+    assert.equal(await httpStatus(http, "/json/list", { Origin: "https://evil.example" }), 403);
+  } finally {
+    await server.close();
+  }
+
+  const { server: allowing } = await makeServer({ allowedOrigins: ["https://devtools.example"] });
+  try {
+    const path = new URL(allowing.wsEndpoint()).pathname;
+    assert.match(await rawUpgrade(allowing.wsEndpoint(), path, CLOSE_AFTER_UPGRADE, { Origin: "https://devtools.example" }), /^HTTP\/1\.1 101 /u);
+    assert.match(await rawUpgrade(allowing.wsEndpoint(), path, Buffer.alloc(0), { Origin: "https://other.example" }), /^HTTP\/1\.1 403 /u);
+  } finally {
+    await allowing.close();
+  }
+  assert.throws(() => new DomjetCdpServer({ allowedOrigins: "https://devtools.example" }), TypeError);
+});
+
