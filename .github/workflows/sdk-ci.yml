@@ -2,6 +2,7 @@ name: SDK CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -89,6 +90,10 @@ jobs:
           cd "$smoke_dir"
           npm init --yes >/dev/null
           npm install --ignore-scripts --no-audit --no-fund "$package_tarball"
+          ./node_modules/.bin/domjet-web-assets "$smoke_dir/web-assets" > /dev/null
+          for file in frame.html domjet.web.mjs frame-client.mjs manifest.json; do test -f "$smoke_dir/web-assets/$file"; done
+          compgen -G "$smoke_dir/web-assets/engine.*.wasm" > /dev/null
+          compgen -G "$smoke_dir/web-assets/bootstrap.*.js" > /dev/null
 
           node --input-type=module <<'NODE'
           import assert from "node:assert/strict";
@@ -107,3 +112,33 @@ jobs:
             await browser.close({ persist: "skip" });
           }
           NODE
+
+  browser:
+    name: Browser (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Enable pnpm from packageManager
+        run: corepack enable && pnpm --version
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build SDK packages
+        run: pnpm build
+      - name: Install Chromium for the browser test
+        run: |
+          npm install --prefix "$RUNNER_TEMP/playwright" --no-audit --no-fund playwright-core@1.64.0
+          "$RUNNER_TEMP/playwright/node_modules/.bin/playwright-core" install --with-deps chromium
+      - name: Test domjet/web in Chromium
+        working-directory: packages/browser
+        env:
+          DOMJET_PLAYWRIGHT_CORE: ${{ runner.temp }}/playwright/node_modules/playwright-core
+        run: ../../node_modules/.bin/tsx --test ./test/web.test.mts
