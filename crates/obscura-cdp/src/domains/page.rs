@@ -544,7 +544,7 @@ fn encode_screencast_frame(
 }
 
 /// Queue a visible-viewport frame through normal CDP event transport. This is
-/// intentionally command-driven until Obscura has a compositor frame pump.
+/// intentionally command-driven until Domjet has a compositor frame pump.
 #[cfg(feature = "render")]
 pub(crate) fn queue_screencast_frame(
     ctx: &mut CdpContext,
@@ -639,7 +639,7 @@ pub(crate) fn queue_screencast_frame(
 /// Advance active page task queues for one bounded compositor slice and emit
 /// a frame when connected-document activity has changed. Chromium feeds
 /// `Page.screencastFrame` from its video consumer on compositor frames; this
-/// is Obscura's single-threaded equivalent until it owns a real compositor.
+/// is Domjet's single-threaded equivalent until it owns a real compositor.
 ///
 /// Generation tracking avoids full-page raster work while the page is idle.
 /// A dirty generation is retained across `everyNthFrame` sampling and the
@@ -1031,8 +1031,8 @@ pub fn parse_wait_until(params: &Value) -> WaitUntil {
         // streams `DOMContentLoaded` as soon as the parser is done; we
         // batch our event emission at the end of navigation, so the
         // closest we can get is to default to `DomContentLoaded` and skip
-        // the full-load wait. CLI callers that pass `--wait-until load`
-        // (or `networkidle*`) are unaffected; they get the old behaviour.
+        // the full-load wait. Callers that explicitly request `load` (or
+        // `networkidle*`) are unaffected; they get the old behaviour.
         .unwrap_or(WaitUntil::DomContentLoaded)
 }
 
@@ -1047,8 +1047,8 @@ async fn do_navigate(
     // Block CDP-initiated file:// navigation by default.
     // Anyone who can reach the CDP port (default localhost,
     // but Docker images bind 0.0.0.0) could otherwise read
-    // any file the obscura process can read. Opt in via
-    // `obscura serve --allow-file-access` when local-HTML
+    // any file the Domjet process can read. Opt in via
+    // Configure `allow_file_access` on the server context when local-HTML
     // testing is the intended workflow.
     let allow_file_access = ctx
         .get_session_page(session_id)
@@ -1056,7 +1056,7 @@ async fn do_navigate(
         .unwrap_or(ctx.default_context.allow_file_access);
     if url_is_file_scheme(url) && !allow_file_access {
         return Err(
-            "Page.navigate to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string()
+            "Page.navigate to file:// is disabled. Enable allow_file_access on the server context to allow it.".to_string()
         );
     }
 
@@ -1243,7 +1243,7 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),
-        // Obscura does not download files to disk, so there is no behavior to
+        // Domjet does not download files to disk, so there is no behavior to
         // configure; ack it so clients that set it do not warn (issue #340).
         "setDownloadBehavior" => Ok(json!({})),
         "getLayoutMetrics" => {
@@ -1464,7 +1464,7 @@ pub async fn handle(
                 let options = parse_screenshot_options(params)?;
                 if !options.from_surface {
                     return Err(
-                        "Page.captureScreenshot fromSurface=false is not supported: Obscura has no separate browser-window compositor surface"
+                        "Page.captureScreenshot fromSurface=false is not supported: Domjet has no separate browser-window compositor surface"
                             .to_string(),
                     );
                 }
@@ -1589,9 +1589,9 @@ pub async fn handle(
             // A DOM/layer-tree snapshot (not a raster image). Distinct from
             // captureScreenshot; keep the clear error so clients fail fast.
             Err(format!(
-                "Page.{method} is not supported by Obscura: no layout or paint engine. \
+                "Page.{method} is not supported by Domjet: no layout or paint engine. \
                  For visual snapshots, drive a real headless Chromium for the \
-                 screenshot leg of your pipeline and use Obscura for the scraping leg."
+                 screenshot leg of your pipeline and use Domjet for the scraping leg."
             ))
         }
         _ => Err(format!("Unknown Page method: {}", method)),

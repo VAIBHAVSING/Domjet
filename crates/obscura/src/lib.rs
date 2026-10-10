@@ -1,4 +1,4 @@
-//! Rust API for the Obscura headless browser.
+//! Rust API for the Domjet headless browser.
 //!
 //! ```rust,no_run
 //! use obscura::Browser;

@@ -6,7 +6,8 @@
 //! by `backendNodeId`. Without this domain their DOM build aborts and the agent
 //! sees zero elements.
 //!
-//! Obscura has no layout/paint engine, so there is no real geometry to report.
+//! Domjet has no layout/paint engine without the render feature, so there is no
+//! real geometry to report in that configuration.
 //! We synthesize it: every node gets a distinct, on-screen, non-icon-sized box
 //! (a simple vertical stack) plus plausible computed styles (visible, opaque,
 //! pointer cursor on interactive tags). That is enough for the element

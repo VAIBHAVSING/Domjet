@@ -1,6 +1,6 @@
 //! Shared markdown extraction script used by the LP.getMarkdown CDP method
-//! and the CLI `--dump markdown` mode. Lives in obscura-browser so both
-//! obscura-cdp and obscura-cli can call it without depending on each other.
+//! and other browser integrations. Lives in obscura-browser so the CDP layer
+//! and embedders can call it without depending on each other.
 
 /// JS expression that walks `document.body` and returns a markdown string.
 /// Must be evaluated against a Page that has a fully-bootstrapped JS runtime.

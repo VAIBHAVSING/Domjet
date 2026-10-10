@@ -50,7 +50,7 @@
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
-    'CSSStyleDeclaration', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
+    'CSSStyleDeclaration', 'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
@@ -93,7 +93,7 @@ let _domMutationEpoch = 0;
 let _treeMutationEpoch = 0;
 const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
-  "set_attribute", "remove_attribute",
+  "set_attribute", "remove_attribute", "set_attribute_ns", "remove_attribute_ns",
   "set_text_content", "set_inner_html", "set_inner_html_context",
   "set_fragment_html_executable",
 ]);
@@ -144,7 +144,7 @@ function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); ret
 function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
 _nativeFns.add(Function.prototype.toString);
 
-// unusualWindowProperties: obscura's internal globals are made non-enumerable
+// unusualWindowProperties: Domjet's internal globals are made non-enumerable
 // (see _preHideInternals and __obscura_init), which hides them from
 // Object.keys / for-in. But fingerprinting scripts enumerate the global object
 // with Object.getOwnPropertyNames and Reflect.ownKeys, which return
@@ -561,7 +561,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
 // event before revealing their content; firing it while discarding the CSS
 // left the DOM loaded but unstyled. Issue #409.
 async function _loadLinkedStylesheet(c) {
-  // obscura does not yet reflect the `rel` IDL attribute back to the content
+  // Domjet does not yet reflect the `rel` IDL attribute back to the content
   // attribute, so `link.rel = "stylesheet"` leaves getAttribute('rel') null.
   // Read both so the property-assignment form (the common framework pattern)
   // and the parsed-from-HTML form are both recognized.
@@ -743,11 +743,32 @@ globalThis.console = {
   assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
 };
 
+const _MAX_TIMER_ID = 0x7fffffff;
 let _tid = 0;
-const _clearedTimers = new Set();
+// HTML timers and animation callbacks share one positive, bounded ID space in
+// this realm. Keeping only live IDs avoids the unbounded cancellation
+// tombstones the old `_clearedTimers` set accumulated, including for unknown
+// IDs passed by page code.
+const _activeTimerIds = new Set();
 const _intervals = new Set();
 const _nativeTimerIds = new Map();
 const __obscuraPendingTimeoutDeadlines = new Map();
+function _allocateTimerId() {
+  // The HTML timer algorithm requires an implementation-defined positive
+  // integer which is not already active. Wrap before Number loses integer
+  // precision, and scan only on wrap/collision in normal use.
+  for (let attempts = 0; attempts < _MAX_TIMER_ID; attempts++) {
+    _tid = _tid >= _MAX_TIMER_ID ? 1 : _tid + 1;
+    if (!_activeTimerIds.has(_tid)) {
+      _activeTimerIds.add(_tid);
+      return _tid;
+    }
+  }
+  throw new RangeError("No browser timer IDs are available");
+}
+function _releaseTimerId(id) {
+  _activeTimerIds.delete(id);
+}
 Object.defineProperty(globalThis, '__obscura_nextPendingTimeoutDelay', {
   value: function() {
     const now = performance.now();
@@ -809,51 +830,96 @@ const _coerceTimerFn = (fn) => {
 
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
-  if (f === null) return ++_tid;
-  const id = ++_tid;
+  if (f === null) {
+    const id = _allocateTimerId();
+    _releaseTimerId(id);
+    return id;
+  }
   const normalizedDelay = Math.max(0, Number(delay) || 0);
-  const nativeId = _scheduleAfter(normalizedDelay, () => {
-    _nativeTimerIds.delete(id);
-    __obscuraPendingTimeoutDeadlines.delete(id);
-    if (_clearedTimers.has(id)) return;
-    try { f(...args); } catch(e) { console.error("Timer error:", e); }
-  });
+  const id = _allocateTimerId();
+  let nativeId;
+  try {
+    nativeId = _scheduleAfter(normalizedDelay, () => {
+      _nativeTimerIds.delete(id);
+      __obscuraPendingTimeoutDeadlines.delete(id);
+      _releaseTimerId(id);
+      try { f(...args); } catch(e) { console.error("Timer error:", e); }
+    });
+  } catch (error) {
+    _releaseTimerId(id);
+    throw error;
+  }
   if (nativeId !== undefined) {
     _nativeTimerIds.set(id, nativeId);
     __obscuraPendingTimeoutDeadlines.set(id, performance.now() + normalizedDelay);
+  } else {
+    _releaseTimerId(id);
   }
   return id;
 };
 
 globalThis.clearTimeout = (id) => {
-  _clearedTimers.add(id);
+  // setTimeout() and setInterval() draw from the same ordered map. Either
+  // clear function may therefore cancel either kind, including an interval
+  // clearing itself from inside its currently running callback.
+  const ownedId = _intervals.delete(id)
+    || _nativeTimerIds.has(id)
+    || __obscuraPendingTimeoutDeadlines.has(id);
   __obscuraPendingTimeoutDeadlines.delete(id);
   const nativeId = _nativeTimerIds.get(id);
   if (nativeId !== undefined) {
     Deno.core.cancelTimer(nativeId);
     _nativeTimerIds.delete(id);
   }
+  if (ownedId) _releaseTimerId(id);
 };
 
 globalThis.setInterval = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
-  if (f === null) return ++_tid;
-  const id = ++_tid;
-  _intervals.add(id);
+  if (f === null) {
+    const id = _allocateTimerId();
+    _releaseTimerId(id);
+    return id;
+  }
+  const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const id = _allocateTimerId();
   const tick = () => {
+    _nativeTimerIds.delete(id);
     if (!_intervals.has(id)) return;
     try { f(...args); } catch(e) { console.error("Interval error:", e); }
     if (!_intervals.has(id)) return;
-    const nativeId = _scheduleAfter(delay, tick);
-    if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
+    let nativeId;
+    try {
+      nativeId = _scheduleAfter(normalizedDelay, tick);
+    } catch (error) {
+      _intervals.delete(id);
+      _releaseTimerId(id);
+      throw error;
+    }
+    if (nativeId !== undefined) {
+      _nativeTimerIds.set(id, nativeId);
+    } else {
+      _intervals.delete(id);
+      _releaseTimerId(id);
+    }
   };
-  const nativeId = _scheduleAfter(delay, tick);
-  if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
+  let nativeId;
+  try {
+    nativeId = _scheduleAfter(normalizedDelay, tick);
+  } catch (error) {
+    _releaseTimerId(id);
+    throw error;
+  }
+  if (nativeId !== undefined) {
+    _intervals.add(id);
+    _nativeTimerIds.set(id, nativeId);
+  } else {
+    _releaseTimerId(id);
+  }
   return id;
 };
 
 globalThis.clearInterval = (id) => {
-  _intervals.delete(id);
   globalThis.clearTimeout(id);
 };
 
@@ -889,7 +955,12 @@ function _scheduleRenderingOpportunity() {
   if (_renderOpportunityScheduled || _renderOpportunityRunning
       || !_renderOpportunityHasWork()) return;
   _renderOpportunityScheduled = true;
-  _scheduleAfter(_RAF_FRAME_DELAY_MS, _runRenderingOpportunity);
+  try {
+    _scheduleAfter(_RAF_FRAME_DELAY_MS, _runRenderingOpportunity);
+  } catch (error) {
+    _renderOpportunityScheduled = false;
+    throw error;
+  }
 }
 
 function _runRenderingOpportunity() {
@@ -929,6 +1000,7 @@ function _runAnimationFrameBatch() {
       // callback in the same frame is running.
       if (!batch.has(id)) continue;
       batch.delete(id);
+      _releaseTimerId(id);
       try { callback(timestamp); }
       catch (e) { console.error("Animation frame error:", e); }
     }
@@ -945,17 +1017,34 @@ globalThis.requestAnimationFrame = (fn) => {
       "Failed to execute 'requestAnimationFrame' on 'Window': parameter 1 is not of type 'Function'."
     );
   }
-  const id = ++_tid;
+  const id = _allocateTimerId();
   _rafPending.set(id, fn);
-  _scheduleAnimationFrame();
+  try {
+    _scheduleAnimationFrame();
+  } catch (error) {
+    _rafPending.delete(id);
+    _releaseTimerId(id);
+    throw error;
+  }
   return id;
 };
 
 globalThis.cancelAnimationFrame = (id) => {
-  _rafPending.delete(id);
-  if (_rafCurrentBatch) _rafCurrentBatch.delete(id);
+  const ownedId = _rafPending.delete(id)
+    || (_rafCurrentBatch ? _rafCurrentBatch.delete(id) : false);
+  if (ownedId) _releaseTimerId(id);
 };
-globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
+const _resolvedMicrotaskPromise = Promise.resolve();
+globalThis.queueMicrotask = function queueMicrotask(callback) {
+  if (typeof callback !== "function") {
+    throw new TypeError(
+      "Failed to execute 'queueMicrotask' on 'Window': parameter 1 is not of type 'Function'."
+    );
+  }
+  // Do not return the Promise: queueMicrotask returns undefined. The host's
+  // end-of-task checkpoint drains this reaction before the next browser task.
+  _resolvedMicrotaskPromise.then(callback).catch((error) => globalThis.reportError(error));
+};
 
 // Browser posted tasks need an event-loop boundary but no clock delay. Tokio's
 // timer wheel imposes roughly a one-millisecond floor even for delay zero,
@@ -1489,14 +1578,32 @@ class CSSStyleDeclaration {
   // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
   // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
   // getPropertyValue('font-size') and el.style.fontSize stay in sync.
+  // CSSOM: the style attribute is only rewritten when the declaration
+  // changed. Rewriting it on a no-op set queued a mutation record, so a
+  // MutationObserver that re-applies the same style re-triggered itself
+  // forever (a page pinning body `top: 0` spun at 100% CPU).
   setProperty(name, value) {
     this._pull();
     const k = _cssCamelToKebab(String(name));
-    if (value === "" || value == null) delete this._props[k];
-    else this._props[k] = String(value);
+    const old = this._props[k];
+    if (value === "" || value == null) {
+      if (old === undefined) return;
+      delete this._props[k];
+    } else {
+      if (old === String(value)) return;
+      this._props[k] = String(value);
+    }
     this._push();
   }
-  removeProperty(name) { this._pull(); const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; this._push(); return old || ""; }
+  removeProperty(name) {
+    this._pull();
+    const k = _cssCamelToKebab(String(name));
+    const old = this._props[k];
+    if (old === undefined) return "";
+    delete this._props[k];
+    this._push();
+    return old;
+  }
   getPropertyValue(name) { this._pull(); return this._props[_cssCamelToKebab(String(name))] || ""; }
   getPropertyPriority() { return ""; }
   get cssText() { this._pull(); return _serializeCss(this._props); }
@@ -1935,6 +2042,12 @@ class Node {
   }
   appendChild(c) {
     if (!c) return c;
+    if (this instanceof CharacterData) {
+      throw new DOMException(
+        "Failed to execute 'appendChild' on 'Node': This node type cannot have children.",
+        "HierarchyRequestError",
+      );
+    }
     if (c instanceof DocumentFragment) {
       const children = Array.from(c.childNodes);
       for (const child of children) this.appendChild(child);
@@ -2024,7 +2137,15 @@ class Node {
     _detachStyleSheetsInSubtree(oldChild);
     _registerWindowNamedTree(newChild);
     _reconcileWindowNamedProperties(removedWindowNames);
+    // As in appendChild and removeChild. A replacement is an insertion and a removal, an
+    // observer saw neither one nor the other.
+    if (globalThis.__mutationObservers?.length) {
+      globalThis.__notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid]);
+    }
     __prepareInsertedSubtree(newChild);
+    if (newChild instanceof Element && newChild.tagName === 'LINK') {
+      _loadLinkedStylesheet(newChild);
+    }
     return oldChild;
   }
   insertBefore(n, ref) {
@@ -2055,7 +2176,13 @@ class Node {
     _seedUnchangedConnection(this, parentConnected);
     _seedInsertedTreeState(n, this, parentConnected);
     _registerWindowNamedTree(n);
+    // The same steps as in appendChild. Where a node is inserted does not decide whether an
+    // observer sees it and whether a <link> loads its stylesheet.
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [n._nid], []);
     __prepareInsertedSubtree(n);
+    if (n instanceof Element && n.tagName === 'LINK') {
+      _loadLinkedStylesheet(n);
+    }
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -2184,27 +2311,46 @@ class CharacterData extends Node {
   }
   set data(v) {
     const oldValue = _domParse("text_content", this._nid) ?? "";
-    _dom("set_text_content", this._nid, String(v ?? ""));
+    _dom("set_text_content", this._nid, v === null ? "" : String(v));
     if (globalThis.__mutationObservers?.length) {
       globalThis.__notifyMutation('characterData', this._nid, [], [], null, oldValue);
     }
   }
   get length() { return this.data.length; }
   substringData(offset, count) {
-    return this.data.substring(offset, offset + count);
-  }
-  appendData(s) { this.data += s; }
-  insertData(offset, s) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.substringData requires 2 arguments");
     const d = this.data;
-    this.data = d.slice(0, offset) + s + d.slice(offset);
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    return d.slice(offset, offset + count);
+  }
+  appendData(s) {
+    if (arguments.length < 1) throw new TypeError("CharacterData.appendData requires 1 argument");
+    this.data = this.data + String(s);
+  }
+  insertData(offset, s) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.insertData requires 2 arguments");
+    const d = this.data;
+    offset = offset >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    this.data = d.slice(0, offset) + String(s) + d.slice(offset);
   }
   deleteData(offset, count) {
+    if (arguments.length < 2) throw new TypeError("CharacterData.deleteData requires 2 arguments");
     const d = this.data;
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
     this.data = d.slice(0, offset) + d.slice(offset + count);
   }
   replaceData(offset, count, s) {
+    if (arguments.length < 3) throw new TypeError("CharacterData.replaceData requires 3 arguments");
     const d = this.data;
-    this.data = d.slice(0, offset) + s + d.slice(offset + count);
+    offset = offset >>> 0;
+    count = count >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    this.data = d.slice(0, offset) + String(s) + d.slice(offset + count);
   }
 }
 
@@ -2214,8 +2360,10 @@ class Text extends CharacterData {
   get wholeText() { return this.data; }
   splitText(offset) {
     const d = this.data;
-    const tail = d.substring(offset);
-    this.data = d.substring(0, offset);
+    offset = offset >>> 0;
+    if (offset > d.length) throw new DOMException("Offset is outside the data", "IndexSizeError");
+    const tail = d.slice(offset);
+    this.data = d.slice(0, offset);
     const newNid = +_dom("create_text_node", tail);
     const parent = this.parentNode;
     if (parent) {
@@ -2337,6 +2485,16 @@ class DOMTokenList {
   toString() { return this.value; }
 }
 
+const _domStringMapConstructionKey = {};
+class DOMStringMap {
+  constructor(key) {
+    if (key !== _domStringMapConstructionKey) {
+      throw new TypeError("Failed to construct 'DOMStringMap': Illegal constructor");
+    }
+  }
+  get [Symbol.toStringTag]() { return "DOMStringMap"; }
+}
+
 // CDATASection: a Text-derived node (nodeType 4) used only in XML documents.
 // Extends Text so data/length/textContent/childNodes reuse the working text
 // node machinery; only the type-identifying getters differ.
@@ -2348,17 +2506,21 @@ class CDATASection extends Text {
   cloneNode() { return new CDATASection(+_dom("create_text_node", this.data)); }
 }
 
-// ProcessingInstruction: nodeType 7, nodeName === target. Extends CharacterData
-// and carries a separate target. Backed by a text node so data/nodeValue/
-// textContent/length work without native PI support.
+// ProcessingInstruction: nodeType 7, nodeName === target. The immutable target
+// is stored in the native node; wrappers created by traversal recover it lazily.
 class ProcessingInstruction extends CharacterData {
   constructor(nid, target) { super(nid); this._target = target; }
-  get target() { return this._target; }
-  get nodeName() { return this._target; }
+  get target() {
+    if (this._target === undefined) {
+      this._target = _domParse("pi_target", this._nid) ?? "";
+    }
+    return this._target;
+  }
+  get nodeName() { return this.target; }
   get nodeType() { return 7; }
   get nodeValue() { return this.data; }
   set nodeValue(v) { this.data = v; }
-  cloneNode() { return new ProcessingInstruction(+_dom("create_text_node", this.data), this._target); }
+  cloneNode() { return document.createProcessingInstruction(this.target, this.data); }
 }
 
 // Document character encoding (WHATWG canonical name, e.g. "UTF-8", "EUC-JP").
@@ -3572,17 +3734,18 @@ class Element extends Node {
     }
     if (tag === 'select') {
       // Set selected on matching option, clear on others. Puppeteer's
-      // page.select(selector, value) round-trips through this setter.
+      // page.select(selector, value) round-trips through this setter and
+      // dispatches its own input/change events in-page afterwards, like a
+      // real browser: a programmatic value assignment never fires change
+      // itself. Dispatching here fed pages that assign inside a change
+      // handler back into that handler in an infinite loop.
       const wanted = String(v);
       const opts = this.querySelectorAll('option');
-      let matched = false;
       for (let i = 0; i < opts.length; i++) {
         const attrV = opts[i].getAttribute('value');
         const optVal = attrV !== null ? attrV : opts[i].textContent;
-        if (optVal === wanted) { opts[i].selected = true; matched = true; }
-        else { opts[i].selected = false; }
+        opts[i].selected = optVal === wanted;
       }
-      if (matched) try { this.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
       return;
     }
     _formValues[this._nid] = String(v);
@@ -3703,12 +3866,22 @@ class Element extends Node {
   }
   get disabled() { return this.hasAttribute("disabled"); }
   set disabled(v) { if (v) this.setAttribute("disabled", ""); else this.removeAttribute("disabled"); }
-  get type() { return this.getAttribute("type") || (this.localName === "input" ? "text" : ""); }
+  get type() {
+    // select and textarea report fixed IDL types, not the content attribute.
+    // jQuery's select valHook branches on type === "select-one" to decide
+    // scalar vs array .val(); "" here made every single select read as an
+    // array, so value comparisons against strings never matched.
+    if (this.localName === "select") return this.hasAttribute("multiple") ? "select-multiple" : "select-one";
+    if (this.localName === "textarea") return "textarea";
+    return this.getAttribute("type") || (this.localName === "input" ? "text" : "");
+  }
   set type(v) { this.setAttribute("type", v); }
   get name() { return this.getAttribute("name") || ""; }
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
+  get accept() { return this.getAttribute("accept") || ""; }
+  set accept(v) { this.setAttribute("accept", v); }
   // For <a>/<area>, href returns the resolved absolute URL (the spec behavior,
   // and what scrapers want). It uses op_url_resolve, which returns just the
   // resolved string, rather than the full-component op the decomposition
@@ -3878,7 +4051,9 @@ class Element extends Node {
     for (let i = 0; i < opts.length; i++) {
       if (opts[i].selected || opts[i].hasAttribute('selected')) return i;
     }
-    return opts.length ? 0 : -1;
+    // Only a single select implicitly selects its first option; a multiple
+    // select with nothing chosen idles at -1 like a real browser.
+    return opts.length && !this.hasAttribute('multiple') ? 0 : -1;
   }
   set selectedIndex(v) {
     const opts = this.options;
@@ -3972,17 +4147,30 @@ class Element extends Node {
     const dataKeys = () => el.getAttributeNames()
       .filter((n) => n.startsWith("data-"))
       .map((n) => _cssKebabToCamel(n.slice(5)));
-    this._dataset = new Proxy({}, {
-      get(_, k) { if (typeof k !== "string") return undefined; return el.hasAttribute(attrFor(k)) ? el.getAttribute(attrFor(k)) : undefined; },
-      set(_, k, v) { el.setAttribute(attrFor(k), String(v)); return true; },
-      has(_, k) { return typeof k === "string" && el.hasAttribute(attrFor(k)); },
-      deleteProperty(_, k) { if (typeof k === "string") el.removeAttribute(attrFor(k)); return true; },
+    this._dataset = new Proxy(new DOMStringMap(_domStringMapConstructionKey), {
+      get(target, k, receiver) {
+        if (typeof k === "string" && el.hasAttribute(attrFor(k))) return el.getAttribute(attrFor(k));
+        return Reflect.get(target, k, receiver);
+      },
+      set(target, k, v, receiver) {
+        if (typeof k !== "string") return Reflect.set(target, k, v, receiver);
+        el.setAttribute(attrFor(k), String(v));
+        return true;
+      },
+      has(target, k) {
+        return (typeof k === "string" && el.hasAttribute(attrFor(k))) || Reflect.has(target, k);
+      },
+      deleteProperty(target, k) {
+        if (typeof k !== "string") return Reflect.deleteProperty(target, k);
+        el.removeAttribute(attrFor(k));
+        return true;
+      },
       ownKeys() { return dataKeys(); },
-      getOwnPropertyDescriptor(_, k) {
+      getOwnPropertyDescriptor(target, k) {
         if (typeof k === "string" && el.hasAttribute(attrFor(k))) {
           return { value: el.getAttribute(attrFor(k)), writable: true, enumerable: true, configurable: true };
         }
-        return undefined;
+        return Reflect.getOwnPropertyDescriptor(target, k);
       },
     });
     return this._dataset;
@@ -4037,7 +4225,7 @@ class Element extends Node {
   // engine is present but this element has no associated CSS box (for
   // example, display:none or a detached element). Keep those states distinct:
   // CSSOM View returns an empty rect list for the latter, while the former
-  // deliberately retains Obscura's compatibility geometry.
+  // deliberately retains Domjet's compatibility geometry.
   _renderBoxGeometry() {
     if (typeof Deno.core.ops.op_layout_geometry !== 'function') return undefined;
     try {
@@ -4872,7 +5060,7 @@ class Document extends Node {
     if (str.indexOf("?>") !== -1) {
       throw new DOMException("Processing instruction data must not contain '?>'", "InvalidCharacterError");
     }
-    const nid = +_dom("create_text_node", str);
+    const nid = +_dom("create_processing_instruction", tgt, str);
     const n = new ProcessingInstruction(nid, tgt);
     _seedDetachedTreeState(n);
     _cache.set(nid, n);
@@ -4890,19 +5078,18 @@ class Document extends Node {
   // returned a generic Event for every type, which broke libraries that call
   // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
   createEvent(type) {
-    const normalized = String(type || '').toLowerCase();
-    if (normalized === 'promiserejectionevent') {
-      throw new DOMException(
-        "The provided event type ('PromiseRejectionEvent') is invalid",
-        'NotSupportedError'
-      );
-    }
+    const eventType = String(type || '');
+    const normalized = eventType.toLowerCase();
     const map = {
+      'event': Event, 'events': Event,
+      'htmlevents': Event, 'svgevents': Event,
       'customevent': CustomEvent, 'customevents': CustomEvent,
       'mouseevent': MouseEvent,   'mouseevents': MouseEvent,
       'keyboardevent': KeyboardEvent, 'keyboardevents': KeyboardEvent,
       'focusevent': FocusEvent,
+      'hashchangeevent': HashChangeEvent,
       'inputevent': InputEvent,
+      'messageevent': MessageEvent,
       'uievent': UIEvent, 'uievents': UIEvent,
       'compositionevent': CompositionEvent,
       'wheelevent': WheelEvent,
@@ -4913,7 +5100,13 @@ class Document extends Node {
       'transitionevent': TransitionEvent,
       'storageevent': StorageEvent,
     };
-    const Cls = map[normalized] || Event;
+    const Cls = map[normalized];
+    if (!Cls) {
+      throw new DOMException(
+        `The provided event type ('${eventType}') is invalid`,
+        'NotSupportedError'
+      );
+    }
     return new Cls('');
   }
   createRange() { return new Range(); }
@@ -5183,13 +5376,18 @@ class Document extends Node {
         if (name === "" || /[\t\n\f\r >]/.test(name)) {
           throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
         }
+        const publicIdValue = publicId === undefined ? "" : String(publicId);
+        const systemIdValue = systemId === undefined ? "" : String(systemId);
+        const nid = +_dom("create_doctype", name, publicIdValue);
         const dt = new DocumentType(
-          +_dom("create_comment_node", ""),
+          nid,
           name,
-          publicId === undefined ? "" : String(publicId),
-          systemId === undefined ? "" : String(systemId)
+          publicIdValue,
+          systemIdValue
         );
         dt._ownerDocument = ownerDoc;
+        _seedDetachedTreeState(dt);
+        _cache.set(nid, dt);
         return dt;
       },
       hasFeature() { return true; },
@@ -5293,10 +5491,20 @@ class DocumentType extends Node {
     this._systemId = systemId;
   }
   get nodeType() { return 10; }
-  get nodeName() { return this._name; }
-  get name() { return this._name; }
-  get publicId() { return this._publicId; }
-  get systemId() { return this._systemId; }
+  get nodeName() { return this.name; }
+  get name() {
+    if (this._name === undefined) {
+      this._name = _domParse("doctype_name", this._nid) ?? "";
+    }
+    return this._name;
+  }
+  get publicId() {
+    if (this._publicId === undefined) {
+      this._publicId = _domParse("doctype_public_id", this._nid) ?? "";
+    }
+    return this._publicId;
+  }
+  get systemId() { return this._systemId ?? ""; }
   get nodeValue() { return null; }
   set nodeValue(v) {}
   get ownerDocument() { return this._ownerDocument || globalThis.document; }
@@ -5884,8 +6092,10 @@ function _wrap(nid) {
   let n;
   if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
   else if (t === 3) n = new Text(nid);
+  else if (t === 7) n = new ProcessingInstruction(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
+  else if (t === 10) n = new DocumentType(nid);
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -5904,6 +6114,7 @@ globalThis.self = globalThis;
 
 globalThis.document = null;
 function _resolveUrl(url) {
+  url = String(url);
   if (!url) return url;
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
   try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
@@ -6443,7 +6654,7 @@ function _bodyToUint8Array(body) {
   if (body instanceof Uint8Array) return body;
   if (body instanceof ArrayBuffer) return new Uint8Array(body);
   if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
-  // obscura's Blob materializes its data into _bytes in the constructor.
+  // Domjet's Blob materializes its data into _bytes in the constructor.
   if (body._bytes instanceof Uint8Array) return body._bytes;
   return new TextEncoder().encode(String(body));
 }
@@ -6532,6 +6743,28 @@ function _serializeBody(initBody, headers) {
   return typeof initBody === 'string' ? initBody : String(initBody);
 }
 
+// Keep fetch cancellation in the page realm. The host request remains behind
+// its own bounded deadline, while an AbortSignal immediately rejects the
+// page-owned promise without exposing a host Promise or controller.
+function _fetchAbortReason(signal) {
+  if (signal && signal.reason !== undefined && signal.reason !== null) return signal.reason;
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
+function _awaitFetchWithSignal(promise, signal) {
+  if (!signal || typeof signal.addEventListener !== 'function') return promise;
+  if (signal.aborted) return Promise.reject(_fetchAbortReason(signal));
+  let remove = null;
+  const aborted = new Promise((resolve, reject) => {
+    const onAbort = () => reject(_fetchAbortReason(signal));
+    remove = () => {
+      try { signal.removeEventListener('abort', onAbort); } catch (_) {}
+    };
+    try { signal.addEventListener('abort', onAbort); } catch (_) {}
+    if (signal.aborted) onAbort();
+  });
+  return Promise.race([promise, aborted]).finally(() => { if (remove) remove(); });
+}
+
 globalThis.fetch = async (input, init = {}) => {
   init = init || {};
   let url = typeof input === "string"
@@ -6545,7 +6778,11 @@ globalThis.fetch = async (input, init = {}) => {
       url = new URL(url, base).href;
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
-  const method = init.method || (input instanceof Request ? input.method : "GET");
+  // Normalize the method to uppercase, matching the Request constructor, so
+  // fetch(url, {method:"delete"}) and new Request(url, {method:"delete"}) agree
+  // and lowercase standard methods are not rejected by the case-sensitive CORS
+  // checks (#969).
+  const method = String(init.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
   let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
   const body = _serializeBody(init.body, _h);
   const hdrs = JSON.stringify(_h);
@@ -6556,8 +6793,13 @@ globalThis.fetch = async (input, init = {}) => {
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
+  const fetchSignal = init.signal || (input instanceof Request ? input.signal : undefined);
+  if (fetchSignal && fetchSignal.aborted) throw _fetchAbortReason(fetchSignal);
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
+  const raw = await _awaitFetchWithSignal(
+    Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials),
+    fetchSignal,
+  );
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -6662,6 +6904,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
+    this._timedOut = false;
+    this._requestToken = 0;
+    this._requestController = null;
+    this._timeoutId = null;
+    this._sendActive = false;
+    this._async = true;
     this._listeners = {};
     this.onreadystatechange = null;
     this.onload = null;
@@ -6674,8 +6922,17 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   }
 
   open(method, url, async_) {
-    this._method = method;
-    this._url = url;
+    if (async_ === false) {
+      throw new DOMException('Synchronous XMLHttpRequest is not supported.', 'NotSupportedError');
+    }
+    if (this._timeoutId !== null) { clearTimeout(this._timeoutId); this._timeoutId = null; }
+    try { this._requestController?.abort(); } catch (_) {}
+    this._requestController = null;
+    this._requestToken += 1;
+    this._sendActive = false;
+    this._method = String(method || 'GET').toUpperCase();
+    this._url = String(url || '');
+    this._async = true;
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
@@ -6687,7 +6944,13 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   }
 
   setRequestHeader(name, value) {
-    this._headers[name] = value;
+    if (this.readyState !== this.OPENED || this._sendActive) {
+      throw new DOMException('The XHR is not in the OPENED state.', 'InvalidStateError');
+    }
+    const key = String(name);
+    const next = String(value);
+    const previous = Object.keys(this._headers).find((entry) => entry.toLowerCase() === key.toLowerCase());
+    this._headers[previous || key] = previous ? `${this._headers[previous]}, ${next}` : next;
   }
 
   getResponseHeader(name) {
@@ -6707,11 +6970,31 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   overrideMimeType(mime) { this._overrideMime = mime; }
 
   send(body) {
-    if (this.readyState !== 1) return;
+    if (this.readyState !== this.OPENED || this._sendActive) {
+      throw new DOMException('The XHR is not in the OPENED state.', 'InvalidStateError');
+    }
     if (this._aborted) return;
 
     const xhr = this;
+    const token = ++this._requestToken;
+    this._sendActive = true;
+    this._timedOut = false;
+    this._requestController = typeof AbortController === 'function' ? new AbortController() : null;
     this._fireEvent('loadstart');
+    if (this._requestToken !== token || this._aborted) return;
+
+    const current = () => xhr._requestToken === token && !xhr._aborted && !xhr._timedOut;
+    const clearRequestTimer = () => {
+      if (xhr._timeoutId !== null) {
+        clearTimeout(xhr._timeoutId);
+        xhr._timeoutId = null;
+      }
+    };
+    const completeRequest = () => {
+      clearRequestTimer();
+      xhr._sendActive = false;
+      xhr._requestController = null;
+    };
 
     let url = this._url;
     if (url && !url.includes('://')) {
@@ -6721,14 +7004,38 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       } catch(e) {}
     }
 
+    const timeout = Number(xhr.timeout);
+    if (Number.isFinite(timeout) && timeout > 0) {
+      xhr._timeoutId = setTimeout(() => {
+        if (!current()) return;
+        xhr._timedOut = true;
+        xhr._aborted = true;
+        xhr._requestToken += 1;
+        const terminalToken = xhr._requestToken;
+        const controller = xhr._requestController;
+        try { controller?.abort(new DOMException('The XHR request timed out.', 'TimeoutError')); } catch (_) {}
+        completeRequest();
+        xhr.status = 0;
+        xhr.statusText = '';
+        xhr.response = null;
+        xhr.responseText = '';
+        xhr._setReadyState(4);
+        if (xhr._requestToken !== terminalToken) return;
+        xhr._fireEvent('timeout');
+        if (xhr._requestToken !== terminalToken) return;
+        xhr._fireEvent('loadend');
+      }, Math.min(timeout, 2 ** 31 - 1));
+    }
+
     fetch(url, {
       method: this._method,
       headers: this._headers,
       body: body || undefined,
       mode: 'cors',
       credentials: this.withCredentials ? 'include' : 'same-origin',
+      signal: this._requestController?.signal,
     }).then(async (resp) => {
-      if (xhr._aborted) return;
+      if (!current()) return;
 
       xhr.status = resp.status;
       xhr.statusText = resp.statusText || '';
@@ -6739,12 +7046,16 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
       }
 
       xhr._setReadyState(2); // HEADERS_RECEIVED
+      if (!current()) return;
 
       const text = await resp.text();
-      if (xhr._aborted) return;
+      if (!current()) return;
 
       xhr.responseText = text;
       xhr._setReadyState(3); // LOADING
+      if (!current()) return;
+      xhr._fireEvent('progress', { loaded: text.length, total: text.length, lengthComputable: true });
+      if (!current()) return;
 
       switch (xhr.responseType) {
         case 'json':
@@ -6767,33 +7078,49 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
           xhr.response = text;
       }
 
+      completeRequest();
       xhr._setReadyState(4); // DONE
+      if (xhr._requestToken !== token) return;
       xhr._fireEvent('load');
+      if (xhr._requestToken !== token) return;
       xhr._fireEvent('loadend');
     }).catch((err) => {
-      if (xhr._aborted) return;
+      if (xhr._requestToken !== token || xhr._aborted || xhr._timedOut) return;
+      completeRequest();
       xhr.status = 0;
       xhr.readyState = 4;
       xhr._fireEvent('readystatechange');
+      if (xhr._requestToken !== token) return;
       if (err && err.__aborted) {
         xhr._aborted = true;
         xhr._fireEvent('abort');
+        if (xhr._requestToken !== token) return;
         xhr._fireEvent('loadend');
-        if (xhr.onabort) xhr.onabort(err);
       } else {
         xhr._fireEvent('error');
+        if (xhr._requestToken !== token) return;
         xhr._fireEvent('loadend');
-        if (xhr.onerror) xhr.onerror(err);
       }
     });
   }
 
   abort() {
+    if (this.readyState === this.UNSENT || (this.readyState === this.DONE && !this._sendActive)) return;
     this._aborted = true;
+    this._requestToken += 1;
+    const terminalToken = this._requestToken;
+    if (this._timeoutId !== null) { clearTimeout(this._timeoutId); this._timeoutId = null; }
+    try { this._requestController?.abort(); } catch (_) {}
+    this._requestController = null;
+    this._sendActive = false;
     if (this.readyState > 0 && this.readyState < 4) {
+      this.status = 0;
       this._setReadyState(4);
+      if (this._requestToken !== terminalToken) return;
       this._fireEvent('abort');
+      if (this._requestToken !== terminalToken) return;
       this._fireEvent('loadend');
+      if (this._requestToken !== terminalToken) return;
     }
     this.readyState = 0;
   }
@@ -6834,8 +7161,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     }
   }
 
-  _fireEvent(type) {
-    const event = { type, target: this, currentTarget: this, bubbles: false };
+  _fireEvent(type, detail = {}) {
+    const event = { type, target: this, currentTarget: this, bubbles: false, ...detail };
     const handlers = this._listeners[type] || [];
     for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
     const prop = 'on' + type;
@@ -7015,11 +7342,49 @@ if (typeof Response === 'undefined') {
       this.ok = this.status >= 200 && this.status < 300;
       this.headers = new Headers(init.headers);
       this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
+      // #818: body/bodyUsed. A null-body response (null or no body passed)
+      // has body === null; every other body is a one-chunk stream, created
+      // lazily so merely touching .body does not copy the bytes.
+      this._bodyNull = body === null || body === undefined;
+      this._bodyStream = null;
+      this._bodyUsed = false;
     }
-    async text() { return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
-    async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes); }
-    async blob() { return new Blob([this._bodyBytes]); }
+    _consumeBody() {
+      if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      this._bodyUsed = true;
+    }
+    get body() {
+      if (this._bodyNull) return null;
+      if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      if (!this._bodyStream) {
+        this._bodyStream = new ReadableStream({
+          start: (controller) => {
+            if (this._bodyBytes.length) controller.enqueue(this._bodyBytes);
+            controller.close();
+          },
+        });
+        // bodyUsed flips the moment the stream is locked for reading
+        // (spec: the body becomes "disturbed"), which no state probe can
+        // observe on a native ReadableStream, so hook getReader instead.
+        const response = this;
+        const stream = this._bodyStream;
+        const getReader = stream.getReader.bind(stream);
+        stream.getReader = function () {
+          response._bodyUsed = true;
+          return getReader();
+        };
+        stream.releaseLock = function () {
+          response._bodyUsed = true;
+          stream.locked = false;
+        };
+      }
+      return this._bodyStream;
+    }
+    get bodyUsed() { return this._bodyUsed; }
+    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
+    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._bodyBytes, this.headers)); }
+    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._bodyBytes); }
+    async blob() { this._consumeBody(); return new Blob([this._bodyBytes]); }
     clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
     static error() { return new Response(null, { status: 0 }); }
     static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
@@ -8337,7 +8702,7 @@ globalThis.MutationObserver = class MutationObserver {
   }
   observe(target, options) {
     this._targets.push({ target, options: options || {} });
-    globalThis.__mutationObservers.push(this);
+    if (!globalThis.__mutationObservers.includes(this)) globalThis.__mutationObservers.push(this);
   }
   disconnect() {
     this._targets = [];
@@ -8365,7 +8730,7 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
   // direct cache poke. The previous code referenced `globalThis._cache`,
   // but `_cache` is a module-local Map — the lookup always returned
   // undefined, so the function silently bailed every time. Result: no
-  // MutationObserver fired in obscura, ever, despite the call sites being
+  // MutationObserver fired in Domjet, ever, despite the call sites being
   // wired up at appendChild / setAttribute. _wrap also lazily creates a
   // wrapper for nodes that didn't have one yet (e.g. children parsed from
   // `set innerHTML`), which we need for record.target/added/removed.
@@ -8400,6 +8765,8 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
         (type === 'characterData' && t.options.characterData) ||
         (type === 'childList' && t.options.childList);
       if (!wantsType) continue;
+      if (type === 'attributes' && t.options.attributeFilter !== undefined
+          && !t.options.attributeFilter.includes(attributeName)) continue;
       if (root._nid === target_nid) { matched = true; break; }
       if (t.options.subtree) {
         // Walk parents until we hit the observed root or run off the tree.
@@ -9043,7 +9410,7 @@ globalThis.DOMException = (function () {
 // `new Event(...)` must report isTrusted === false (issue #303). Returning true
 // for everything is a trivial bot-detection tell. Trusted events are tracked in
 // a closure-private WeakSet so page JS can neither read nor forge the flag.
-// obscura's CDP input pipeline marks its synthetic events via the
+// Domjet's CDP input pipeline marks its synthetic events via the
 // non-enumerable __obscura_markTrusted helper.
 const _trustedEvents = new WeakSet();
 globalThis.__obscura_markTrusted = function(ev) { try { if (ev) _trustedEvents.add(ev); } catch (_e) {} return ev; };
@@ -9416,7 +9783,52 @@ if (typeof File === "undefined") globalThis.File = class File extends Blob {
   }
   get [Symbol.toStringTag]() { return "File"; }
 };
-if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
+// A FormData value keeps Blob/File objects as-is (the multipart serializer reads
+// their bytes); every other value is coerced to a string per the Fetch spec.
+function _isFormBlob(v) {
+  return v != null && typeof v === "object" &&
+    (v._bytes !== undefined || (typeof Blob === "function" && v instanceof Blob));
+}
+if (typeof FormData === "undefined") globalThis.FormData = class FormData {
+  constructor(form) {
+    this._d = [];
+    // `new FormData(form)` reads the form's current successful controls (the
+    // spec's "constructing the entry list"): skip disabled controls, buttons,
+    // and unchecked checkboxes/radios; a checkbox with no value submits "on".
+    if (form === undefined || form === null) return;
+    const isForm = form.nodeType === 1 && String(form.tagName || "").toUpperCase() === "FORM";
+    if (!isForm) {
+      throw new TypeError("Failed to construct 'FormData': parameter 1 is not of type 'HTMLFormElement'.");
+    }
+    if (typeof form.querySelectorAll === "function") {
+      const controls = form.querySelectorAll("input,select,textarea");
+      for (let i = 0; i < controls.length; i++) {
+        const el = controls[i];
+        const name = el.getAttribute ? el.getAttribute("name") : el.name;
+        if (!name || el.disabled) continue;
+        const tag = (el.tagName || "").toLowerCase();
+        const type = (((el.getAttribute && el.getAttribute("type")) || el.type || "")).toLowerCase();
+        if (tag === "input" && (type === "checkbox" || type === "radio")) {
+          if (el.checked) this._d.push([name, el.value != null ? String(el.value) : "on"]);
+          continue;
+        }
+        if (type === "submit" || type === "reset" || type === "button" || type === "image" || type === "file") continue;
+        this._d.push([name, el.value != null ? String(el.value) : ""]);
+      }
+    }
+  }
+  append(k, v) { this._d.push([String(k), _isFormBlob(v) ? v : String(v)]); }
+  set(k, v) { k = String(k); this._d = this._d.filter(([a]) => a !== k); this._d.push([k, _isFormBlob(v) ? v : String(v)]); }
+  delete(k) { k = String(k); this._d = this._d.filter(([a]) => a !== k); }
+  get(k) { const e = this._d.find(([a]) => a === k); return e ? e[1] : null; }
+  getAll(k) { return this._d.filter(([a]) => a === k).map(([, v]) => v); }
+  has(k) { return this._d.some(([a]) => a === k); }
+  entries() { return this._d[Symbol.iterator](); }
+  keys() { return this._d.map(([k]) => k)[Symbol.iterator](); }
+  values() { return this._d.map(([, v]) => v)[Symbol.iterator](); }
+  forEach(cb) { this._d.forEach(([k, v]) => cb(v, k, this)); }
+  [Symbol.iterator]() { return this.entries(); }
+};
 // application/x-www-form-urlencoded serializer: like encodeURIComponent but
 // space -> '+' and also percent-encoding the chars encodeURIComponent leaves
 // bare ( ! ~ ' ( ) ), keeping the form-urlencoded safe set ( * - . _ ).
@@ -9495,7 +9907,7 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
 // input into a detached `<html>` element and wrap it so the common Document
 // API surface (body / head / documentElement / querySelector* / getElementById /
 // getElementsByTagName / getElementsByClassName / title / cloneNode) works.
-// Conservative XML well-formedness check. obscura has no XML parser, so this
+// Conservative XML well-formedness check. Domjet has no XML parser, so this
 // only decides whether to surface a <parsererror> (it does not build an XML
 // tree). It flags clear structural errors — mismatched or unclosed tags,
 // multiple/no root elements, unterminated comment/CDATA/PI — and defaults to
@@ -9558,7 +9970,7 @@ globalThis.DOMParser = class DOMParser {
 
     // For XML mime types, surface a <parsererror> on clearly-malformed input so
     // error-detection code (doc.querySelector('parsererror')) works, matching
-    // Chrome. obscura has no XML parser, so the tree stays HTML-parsed.
+    // Chrome. Domjet has no XML parser, so the tree stays HTML-parsed.
     if (isXml && !_xmlWellFormed(html)) {
       try {
         root.innerHTML = '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>error while parsing XML</div></parsererror>';
@@ -9657,7 +10069,11 @@ globalThis.DOMParser = class DOMParser {
         const t = String(target), s = String(data);
         if (!_isValidPITarget(t)) throw new DOMException("Invalid processing instruction target", "InvalidCharacterError");
         if (s.indexOf("?>") !== -1) throw new DOMException("Processing instruction data must not contain '?>'", "InvalidCharacterError");
-        return new ProcessingInstruction(+_dom("create_text_node", s), t);
+        const nid = +_dom("create_processing_instruction", t, s);
+        const n = new ProcessingInstruction(nid, t);
+        _seedDetachedTreeState(n);
+        _cache.set(nid, n);
+        return n;
       },
       adoptNode: (n) => n,
       importNode: (n) => n,
@@ -9946,7 +10362,7 @@ const _mkStore = () => {
 globalThis.localStorage = _mkStore();
 globalThis.sessionStorage = _mkStore();
 
-globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
+globalThis.btoa = globalThis.btoa || ((s) => { s = String(s); const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) { const cp = s.charCodeAt(i); if (cp > 0xFF) throw new DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError"); b[i] = cp; } const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {
   const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   const r=[];
@@ -9980,12 +10396,37 @@ globalThis.atob = globalThis.atob || ((s) => {
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
   const historyToken = Symbol("History");
-  const resolveOrFallback = (url) => {
+  const resolveHistoryUrl = (url, method) => {
     // A missing url (pushState/replaceState called with < 3 args) keeps the
     // current document URL per the HTML spec — capture it so the entry does not
     // reset location back to the original document URL.
     if (url === null || url === undefined) return __currentUrl();
-    try { return new URL(String(url), __currentUrl()).href; } catch (e) { return String(url); }
+    const base = __currentUrl();
+    let target;
+    try {
+      target = new URL(String(url), base);
+    } catch (e) {
+      // HTML spec: a URL that fails to parse throws a SecurityError.
+      throw new DOMException(
+        "Failed to execute '" + method + "' on 'History': Invalid URL '" + String(url) + "'.",
+        "SecurityError"
+      );
+    }
+    // Same-origin restriction (HTML spec): pushState/replaceState may only
+    // rewrite the URL within the document's origin. Without this a page could
+    // spoof its own URL to a cross-origin or file:// value, which the host then
+    // adopts as page.url via sync_virtual_url (#1055). Opaque-origin documents
+    // (about:blank, file:) have no comparable origin, so they are left as-is.
+    let baseUrl = null;
+    try { baseUrl = new URL(base); } catch (e) {}
+    if (baseUrl && baseUrl.origin && baseUrl.origin !== "null" && target.origin !== baseUrl.origin) {
+      throw new DOMException(
+        "Failed to execute '" + method + "' on 'History': A history state object with URL '" +
+          target.href + "' cannot be created in a document with origin '" + baseUrl.origin + "'.",
+        "SecurityError"
+      );
+    }
+    return target.href;
   };
   const applyVirtual = () => {
     const entry = stack[idx];
@@ -10018,7 +10459,7 @@ globalThis.atob = globalThis.atob || ((s) => {
     }
     pushState(state, _title, url) {
       const prevUrl = __currentUrl();
-      const resolved = resolveOrFallback(url);
+      const resolved = resolveHistoryUrl(url, 'pushState');
       // Truncate forward entries (real Chrome drops the forward stack on a
       // new push) then append + advance.
       stack.length = idx + 1;
@@ -10029,7 +10470,7 @@ globalThis.atob = globalThis.atob || ((s) => {
     }
     replaceState(state, _title, url) {
       const prevUrl = __currentUrl();
-      const resolved = resolveOrFallback(url);
+      const resolved = resolveHistoryUrl(url, 'replaceState');
       stack[idx] = {state: state ?? null, url: resolved};
       applyVirtual();
       fireHashChangeIfNeeded(prevUrl);
@@ -10224,7 +10665,7 @@ function _cssSupportsColor(value) {
   if (/^rgba?\(/.test(lower) && lower.endsWith(")")) {
     // Keep the non-render build aligned with the renderer's capability
     // evaluator: relative colors are valid CSS, but are not implemented by
-    // Obscura yet and therefore must not select an unsupported @supports arm.
+    // Domjet yet and therefore must not select an unsupported @supports arm.
     if (/\bfrom\b/.test(lower)) {
       return false;
     }
@@ -10814,7 +11255,7 @@ globalThis.Comment = Comment;
 
 globalThis.CDATASection = CDATASection;
 globalThis.ProcessingInstruction = ProcessingInstruction;
-// True when the document was loaded from an XML/XHTML source. Obscura has no
+// True when the document was loaded from an XML/XHTML source. Domjet has no
 // native XML tree, so this is inferred from contentType (derived from the URL).
 function _isXMLDocument(doc) {
   const ct = (doc && doc.contentType) || "text/html";
@@ -10838,6 +11279,7 @@ globalThis.Document = Document;
 // undefined (so `el.style instanceof CSSStyleDeclaration` threw). Assigning here
 // only fills the value; the property stays enumerable:false, matching Chrome.
 globalThis.CSSStyleDeclaration = CSSStyleDeclaration;
+globalThis.DOMStringMap = DOMStringMap;
 globalThis.Animation = Animation;
 globalThis.KeyframeEffect = KeyframeEffect;
 globalThis.DocumentTimeline = DocumentTimeline;
@@ -10928,9 +11370,9 @@ function _nodeList(els) {
 // small legacy set of HTML elements, as properties of the WindowProxy. V8's
 // global object cannot be replaced with a WindowProxy after snapshot startup,
 // so install lazy accessors for the supported names present in this document.
-// The accessor resolves against the live tree: one match returns that element
-// (or an iframe's Window), while duplicates return a live-shaped
-// HTMLCollection in tree order.
+// The accessor resolves against the live tree: named child contexts take
+// priority, otherwise one match returns its element and duplicate elements
+// return a live-shaped HTMLCollection in tree order.
 const _windowNamedPropertyNames = new Set();
 const _windowNamedNameTags = new Set(["embed", "form", "iframe", "img", "object"]);
 
@@ -10973,11 +11415,15 @@ function _windowNamedCandidates(name) {
 function _windowNamedValue(name) {
   const matches = _windowNamedCandidates(name);
   if (matches.length === 0) return undefined;
+  for (const element of matches) {
+    if (element.localName === "iframe" && _windowNameEligibleElement(element)
+        && element.getAttribute("name") === name) {
+      const window = element.contentWindow;
+      if (window) return window;
+    }
+  }
   if (matches.length > 1) return HTMLCollection._from(matches);
-  const element = matches[0];
-  return element.localName === "iframe" && element.contentWindow
-    ? element.contentWindow
-    : element;
+  return matches[0];
 }
 
 function _ensureWindowNamedProperty(name) {
@@ -12260,7 +12706,7 @@ _markNative(SpeechSynthesisUtterance);
 _markNative(MediaStream); _markNative(MediaStreamTrack);
 _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
 
-// Timezone is driven by the process TZ (set by the CLI, default Europe/Berlin),
+// Timezone is driven by the process TZ (set by the host or embedding runtime),
 // so native Intl.DateTimeFormat and Date report the same zone. No JS override:
 // forcing a fixed zone here only on Intl left Date on UTC, which is the exact
 // cross-surface mismatch a fingerprinting script looks for.
@@ -12412,14 +12858,42 @@ globalThis.Worker = class Worker {
 
 globalThis.__blobStore = globalThis.__blobStore || {};
 URL.createObjectURL = function(blob) {
-  if (blob) {
-    const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
+  // Chrome mints blob:<document-origin>/<v4-uuid> (blob:null/<uuid> on an opaque
+  // origin) and throws a TypeError on missing/non-Blob input. The old code named
+  // the engine ("blob:obscura/") — a one-line anti-bot tell — used a base36 token
+  // no UUID parser accepts, and handed back a well-formed-looking string for
+  // invalid input so the caller only failed later at the fetch (issue #751).
+  if (arguments.length === 0) {
+    throw new TypeError("Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present.");
+  }
+  // Only a real Blob/File (or obscura's Blob, which carries _bytes) is valid —
+  // Chrome throws for anything else. Duck-typing on `.text()` used to accept
+  // Response and other unrelated objects.
+  const isBlob = blob != null && typeof blob === 'object' &&
+    (blob._bytes !== undefined ||
+     (typeof Blob === 'function' && blob instanceof Blob));
+  if (!isBlob) {
+    throw new TypeError("Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.");
+  }
+  {
+    let origin = 'null';
+    try { origin = new URL(location.href).origin || 'null'; } catch (e) {}
+    const uuid = (globalThis.crypto && typeof crypto.randomUUID === 'function')
+      ? crypto.randomUUID()
+      : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+          // CSPRNG, not Math.random() — blob IDs must not be predictable.
+          const b = new Uint8Array(1);
+          crypto.getRandomValues(b);
+          const r = b[0] & 0x0f;
+          return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+        });
+    const id = 'blob:' + origin + '/' + uuid;
     // Store synchronously so a Worker built from the blob URL in the same
     // tick sees its source. Blob-URL Worker construction is synchronous in
     // real browsers; the previous async blob.text().then() store raced the
     // Worker constructor, so new Worker(blobURL) fell through to fetch() and
     // failed (net::ERR_FAILED), which broke AWS WAF's proof-of-work worker.
-    // The obscura Blob materializes _bytes in its constructor; fall back to
+    // The Domjet Blob materializes _bytes in its constructor; fall back to
     // the async text() store only for foreign Blob shims without _bytes.
     if (blob._bytes) {
       let text = '';
@@ -12432,7 +12906,6 @@ URL.createObjectURL = function(blob) {
     }
     return id;
   }
-  return 'blob:obscura/fallback';
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
@@ -13093,6 +13566,25 @@ if (typeof Image === 'undefined') {
   globalThis.Image.prototype = globalThis.HTMLImageElement.prototype;
 }
 
+if (typeof Option === 'undefined') {
+  // HTML legacy factory function: `new Option(text, value, defaultSelected,
+  // selected)` is a real <option> element, like `new Image()` above. WPForms
+  // calls `new Option().style` and threw a ReferenceError without it (#1168).
+  globalThis.Option = function Option(text, value, defaultSelected, selected) {
+    const option = document.createElement('option');
+    const label = text === undefined ? '' : String(text);
+    if (label !== '') option.appendChild(document.createTextNode(label));
+    if (value !== undefined) option.setAttribute('value', String(value));
+    if (defaultSelected) option.setAttribute('selected', '');
+    // Selectedness follows `selected` alone, so defaultSelected without
+    // selected leaves the attribute in place on an unselected option.
+    if (selected) option.selected = true;
+    else if (defaultSelected) option._selected = false;
+    return option;
+  };
+  globalThis.Option.prototype = globalThis.HTMLOptionElement.prototype;
+}
+
 if (typeof Audio === 'undefined') {
   globalThis.Audio = class Audio {
     constructor(src) { this.src = src || ''; this.paused = true; this.volume = 1; this.currentTime = 0; this.duration = 0; }
@@ -13249,7 +13741,7 @@ if (typeof WebSocket === 'undefined') {
 if (typeof BroadcastChannel === 'undefined') {
   // BroadcastChannel is used by authentication/session coordinators and by
   // modern framework dev/runtime clients. Keep the registry realm-local: one
-  // Obscura page is one origin-bound browsing context today, so every channel
+  // A Domjet page is one origin-bound browsing context today, so every channel
   // in this registry has the same storage key and origin by construction.
   const channelsByName = new Map();
   const channelState = new WeakMap();
@@ -13919,7 +14411,7 @@ globalThis.__obscura_init = function() {
   globalThis.visualViewport = { width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
-  // standalone runtime has the same 1x default as Obscura's render surface.
+  // standalone runtime has the same 1x default as Domjet's render surface.
   globalThis.devicePixelRatio = 1;
   globalThis.innerWidth = vw; globalThis.innerHeight = vh;
   globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
@@ -13929,7 +14421,9 @@ globalThis.__obscura_init = function() {
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
-  const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
+  // A navigation start precedes the wall clock, so skew into the past only: an
+  // origin ahead of it makes performance.now() and the rAF timestamp negative.
+  const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
@@ -14450,7 +14944,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // engine's Response provides it natively, so it is intentionally not shimmed
 // here (a JS fallback could only recurse into itself).
 
-// tamperedFunctions: obscura reimplements much of the DOM/Web platform in JS.
+// tamperedFunctions: Domjet reimplements much of the DOM/Web platform in JS.
 // Real Chrome reports "[native code]" from toString() for every builtin method,
 // accessor, and constructor; any JS-backed member that leaks its source is a
 // detection tell (pixelscan's tamperedFunctions check flags e.g.

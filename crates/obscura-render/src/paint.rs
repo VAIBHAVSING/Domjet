@@ -14,6 +14,25 @@ use tiny_skia::{
     Pixmap, Point, RadialGradient, Rect, SpreadMode, Transform,
 };
 
+/// Encode an owned framebuffer without cloning its full RGBA allocation.
+///
+/// `tiny_skia::Pixmap::encode_png` must preserve its borrowed pixmap, so it
+/// clones every pixel before demultiplying alpha. Screenshot callers discard
+/// the framebuffer after encoding and can consume it instead.
+pub fn encode_png_owned(pixmap: Pixmap) -> Result<Vec<u8>, png::EncodingError> {
+    let width = pixmap.width();
+    let height = pixmap.height();
+    let demultiplied = pixmap.take_demultiplied();
+    let mut output = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut output, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header()?.write_image_data(&demultiplied)?;
+    }
+    Ok(output)
+}
+
 static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
 static SYSTEM_FONT_BYTES: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 static SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-serif.ttf");
@@ -23,9 +42,8 @@ static FONT_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-obl
 static FONT_BOLD_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-sans-boldoblique.ttf");
 
 use crate::dom::{
-    layout_dom_with_web_fonts_and_retained_styles_with_animation_state,
+    RetainedStyleMaps, layout_dom_with_query_seed,
     layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state,
-    RetainedStyleMaps,
 };
 
 const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
@@ -34,14 +52,16 @@ const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// bounded set of successful selections so repeated prepares can seed their
 /// intrinsic geometry before that cascade instead of always laying out twice.
 const DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES: usize = 256;
+#[cfg(not(target_arch = "wasm32"))]
 const MISSING_RESOURCE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 /// Exact formats the renderer can decode. Do not use `image/*` or `*/*` here:
 /// either wildcard permits a content-negotiating server to choose AVIF,
 /// JPEG-XL, or another format that this build cannot rasterize.
+#[cfg(feature = "native-resource-loader")]
 const IMAGE_ACCEPT: &str = "image/webp,image/apng,image/svg+xml,image/png,image/jpeg,image/gif,image/bmp,image/x-icon,image/vnd.microsoft.icon";
 
 /// Synchronous byte loader used by [`RenderResourceCache`]. The default
-/// implementation uses Obscura's pooled image agent; tests and embedding
+/// implementation uses Domjet's pooled image agent; tests and embedding
 /// callers can provide a local loader without changing preparation or paint.
 pub trait RenderResourceLoader {
     fn load(&mut self, url: &str) -> Option<Vec<u8>>;
@@ -69,17 +89,75 @@ where
     }
 }
 
+#[cfg(not(feature = "native-resource-loader"))]
+struct EmptyResourceLoader;
+
+#[cfg(not(feature = "native-resource-loader"))]
+impl RenderResourceLoader for EmptyResourceLoader {
+    fn load(&mut self, _url: &str) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+#[cfg(feature = "native-resource-loader")]
 struct HttpResourceLoader;
 
+#[cfg(feature = "native-resource-loader")]
 impl RenderResourceLoader for HttpResourceLoader {
     fn load(&mut self, url: &str) -> Option<Vec<u8>> {
         http_get_bytes(url)
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+type MissingResourceStamp = std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+struct MissingResourceStamp;
+
+fn missing_resource_stamp() -> MissingResourceStamp {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::Instant::now()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        MissingResourceStamp
+    }
+}
+
+fn missing_resource_is_live(stamp: &MissingResourceStamp) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        stamp.elapsed() < MISSING_RESOURCE_RETRY_AFTER
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = stamp;
+        true
+    }
+}
+
 enum CachedResource {
-    Bytes(Arc<[u8]>),
-    Missing(std::time::Instant),
+    Bytes {
+        bytes: Arc<[u8]>,
+        intrinsic: std::sync::OnceLock<Option<crate::ReplacedIntrinsic>>,
+        static_raster: std::sync::OnceLock<bool>,
+    },
+    Missing(MissingResourceStamp),
+}
+
+impl CachedResource {
+    fn image_intrinsic(&self) -> Option<crate::ReplacedIntrinsic> {
+        match self {
+            Self::Bytes { bytes, intrinsic, .. } => {
+                // Metadata belongs to these immutable bytes. Replacement and
+                // FIFO eviction discard it with the existing bounded entry.
+                *intrinsic.get_or_init(|| image_intrinsic_metadata(bytes))
+            }
+            Self::Missing(_) => None,
+        }
+    }
 }
 
 /// Fetch credentials/CORS identity for an HTML image request. No-CORS uses
@@ -125,10 +203,261 @@ fn network_resource_url(url: &str) -> String {
     parsed.to_string()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CssResourceKind {
+    Image,
+    Font,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CssResourceRequest {
+    pub url: String,
+    pub kind: CssResourceKind,
+}
+
+/// Extract network-backed `url(...)` assets while respecting CSS comments and
+/// strings. Linked sheets have already been rebased before materialization;
+/// inline declarations are resolved against the document base here.
+pub fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
+    css_resource_requests(css, base)
+        .into_iter()
+        .map(|request| request.url)
+        .collect()
+}
+
+/// Typed counterpart to [`css_resource_urls`]. URLs inside an `@font-face`
+/// block retain their font request identity even when the URL has no file
+/// extension; all other CSS URLs are paint image resources.
+pub fn css_resource_requests(css: &str, base: &url::Url) -> Vec<CssResourceRequest> {
+    let mut requests = Vec::new();
+    let mut index = 0usize;
+    let mut brace_depth = 0usize;
+    let mut font_face_depths = Vec::new();
+    let mut pending_font_face = false;
+    while index < css.len() {
+        let rest = &css[index..];
+        if rest.starts_with("/*") {
+            if let Some(end) = rest[2..].find("*/") {
+                index += end + 4;
+            } else {
+                break;
+            }
+            continue;
+        }
+        // `@import url(...)` is a stylesheet dependency, not a paint asset.
+        // It is fetched by the bounded stylesheet graph above. Letting the
+        // generic image/font warmup rediscover it issues a second request with
+        // the wrong ResourceType::Image classification.
+        if let Some(length) = css_import_rule_len(rest) {
+            index += length;
+            continue;
+        }
+        let Some(first) = rest.chars().next() else {
+            break;
+        };
+        if first == '"' || first == '\'' {
+            let quote = first;
+            let mut escaped = false;
+            let mut length = quote.len_utf8();
+            for ch in rest[quote.len_utf8()..].chars() {
+                length += ch.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    break;
+                }
+            }
+            index += length;
+            continue;
+        }
+        let font_face_prefix = rest
+            .get(..10)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("@font-face"));
+        // `get(10..)` is intentional: byte 10 is a valid boundary when the
+        // ASCII prefix matched, and returns `None` rather than panicking for
+        // unrelated non-ASCII input whose tenth byte splits a code point.
+        let font_face_boundary = font_face_prefix
+            && rest.get(10..).is_some_and(|tail| {
+                tail.is_empty()
+                    || tail.starts_with("/*")
+                    || tail
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_whitespace() || ch == '{')
+            });
+        let previous_boundary = index == 0
+            || css[..index].ends_with("*/")
+            || css[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_whitespace() || matches!(ch, '{' | '}' | ';'));
+        if font_face_boundary && previous_boundary {
+            pending_font_face = true;
+            index += 10;
+            continue;
+        }
+        match first {
+            '{' => {
+                brace_depth += 1;
+                if pending_font_face {
+                    font_face_depths.push(brace_depth);
+                    pending_font_face = false;
+                }
+                index += 1;
+                continue;
+            }
+            '}' => {
+                if font_face_depths.last() == Some(&brace_depth) {
+                    font_face_depths.pop();
+                }
+                brace_depth = brace_depth.saturating_sub(1);
+                pending_font_face = false;
+                index += 1;
+                continue;
+            }
+            ';' if pending_font_face => {
+                pending_font_face = false;
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if !rest
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("url("))
+        {
+            index += first.len_utf8();
+            continue;
+        }
+        let mut quote = None;
+        let mut escaped = false;
+        let mut end = None;
+        for (offset, ch) in rest[4..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            match quote {
+                Some(open) if ch == open => quote = None,
+                Some(_) => {}
+                None if ch == '"' || ch == '\'' => quote = Some(ch),
+                None if ch == ')' => {
+                    end = Some(4 + offset);
+                    break;
+                }
+                None => {}
+            }
+        }
+        let Some(end) = end else { break };
+        let raw = rest[4..end].trim();
+        let value = (if raw.len() >= 2
+            && ((raw.starts_with('"') && raw.ends_with('"'))
+                || (raw.starts_with('\'') && raw.ends_with('\'')))
+        {
+            &raw[1..raw.len() - 1]
+        } else {
+            raw
+        })
+        .trim();
+        if !value.is_empty()
+            && !value.starts_with('#')
+            && !value.starts_with("data:")
+            && !value.contains("var(")
+        {
+            if let Ok(mut url) = base.join(value) {
+                url.set_fragment(None);
+                if matches!(url.scheme(), "http" | "https") {
+                    requests.push(CssResourceRequest {
+                        url: url.to_string(),
+                        kind: if font_face_depths.is_empty() {
+                            CssResourceKind::Image
+                        } else {
+                            CssResourceKind::Font
+                        },
+                    });
+                }
+            }
+        }
+        index += end + 1;
+    }
+    requests
+}
+
+/// Return the byte length of a leading CSS `@import` rule, including its
+/// terminating semicolon. Semicolons inside quoted URLs, comments, or `url()`
+/// parentheses do not end the rule. A malformed import is left to the normal
+/// scanner so this helper cannot swallow following declarations.
+fn css_import_rule_len(css: &str) -> Option<usize> {
+    let prefix = css.get(..7)?;
+    if !prefix.eq_ignore_ascii_case("@import") {
+        return None;
+    }
+    if css[7..]
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return None;
+    }
+
+    let bytes = css.as_bytes();
+    let mut index = 7usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == open {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            let Some(end) = css[index + 2..].find("*/") else {
+                return None;
+            };
+            index += end + 4;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b';' if paren_depth == 0 => return Some(index + 1),
+            b'{' if paren_depth == 0 => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+    (quote.is_none() && paren_depth == 0).then_some(css.len())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct RememberedContentImageIntrinsic {
     resolved_url: String,
     intrinsic: crate::ReplacedIntrinsic,
+}
+
+const RASTER_PAINT_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const RASTER_PAINT_CACHE_ENTRIES: usize = 64;
+const RASTER_PAINT_CACHE_ENTRY_BYTES: usize = 2 * 1024 * 1024;
+
+struct CachedRasterPaint {
+    resource_key: String,
+    bytes: Arc<[u8]>,
+    raster: Arc<Pixmap>,
 }
 
 /// Page-scoped raw resource bytes shared by layout preparation and repeated
@@ -138,6 +467,8 @@ pub struct RenderResourceCache {
     entries: HashMap<String, CachedResource>,
     order: VecDeque<String>,
     retained_bytes: usize,
+    raster_paints: VecDeque<CachedRasterPaint>,
+    raster_paint_bytes: usize,
     max_entries: usize,
     max_bytes: usize,
     content_image_intrinsics: HashMap<obscura_dom::tree::NodeId, RememberedContentImageIntrinsic>,
@@ -146,13 +477,23 @@ pub struct RenderResourceCache {
     #[cfg(test)]
     content_image_layout_retries: usize,
     sync_loading_enabled: bool,
+    /// Resources a cache-only lookup missed since the last `take_sync_misses`,
+    /// with the request identity layout used (image CORS profile or none) and
+    /// whether the consumer is a font.
+    /// Deduplicated so repeated layouts do not grow the list.
+    sync_misses: Vec<(String, Option<ImageRequestProfile>, bool)>,
+    sync_miss_keys: HashSet<String>,
     loader: Box<dyn RenderResourceLoader>,
 }
 
 impl Default for RenderResourceCache {
     fn default() -> Self {
+        #[cfg(feature = "native-resource-loader")]
+        let loader = HttpResourceLoader;
+        #[cfg(not(feature = "native-resource-loader"))]
+        let loader = EmptyResourceLoader;
         Self::with_loader_and_limits(
-            HttpResourceLoader,
+            loader,
             DEFAULT_RESOURCE_CACHE_ENTRIES,
             DEFAULT_RESOURCE_CACHE_BYTES,
         )
@@ -177,6 +518,8 @@ impl RenderResourceCache {
             entries: HashMap::new(),
             order: VecDeque::new(),
             retained_bytes: 0,
+            raster_paints: VecDeque::new(),
+            raster_paint_bytes: 0,
             max_entries,
             max_bytes,
             content_image_intrinsics: HashMap::new(),
@@ -185,6 +528,8 @@ impl RenderResourceCache {
             #[cfg(test)]
             content_image_layout_retries: 0,
             sync_loading_enabled: true,
+            sync_misses: Vec::new(),
+            sync_miss_keys: HashSet::new(),
             loader: Box::new(loader),
         }
     }
@@ -197,6 +542,47 @@ impl RenderResourceCache {
         std::mem::replace(&mut self.sync_loading_enabled, enabled)
     }
 
+    /// Whether layout and paint may still open synchronous compatibility
+    /// requests. Page-owned caches disable this permanently and are fed by
+    /// the page transport instead.
+    pub fn sync_loading_enabled(&self) -> bool {
+        self.sync_loading_enabled
+    }
+
+    /// Take the resources that cache-only layout or paint asked for and did
+    /// not have, exactly as they were resolved (network URL plus the image
+    /// request profile, or `None` for CSS images and fonts). The owning page
+    /// loads them through its asynchronous transport; nothing is
+    /// reconstructed from the DOM, so script-registered fonts, shadow roots
+    /// and every other renderer-only source are covered.
+    pub fn take_sync_misses(&mut self) -> Vec<(String, Option<ImageRequestProfile>, bool)> {
+        self.sync_miss_keys.clear();
+        std::mem::take(&mut self.sync_misses)
+    }
+
+    /// Whether any cache-only miss is waiting to be taken.
+    pub fn has_sync_misses(&self) -> bool {
+        !self.sync_misses.is_empty()
+    }
+
+    fn record_sync_miss(
+        &mut self,
+        key: String,
+        url: String,
+        profile: Option<ImageRequestProfile>,
+        is_font: bool,
+    ) {
+        // Bound a hostile document's per-layout queue to the number of
+        // entries this cache could retain. A later layout reports skipped
+        // misses again after the current batch has been drained.
+        if self.sync_misses.len() >= self.max_entries {
+            return;
+        }
+        if self.sync_miss_keys.insert(key) {
+            self.sync_misses.push((url, profile, is_font));
+        }
+    }
+
     pub fn retained_entry_count(&self) -> usize {
         self.entries.len()
     }
@@ -207,8 +593,8 @@ impl RenderResourceCache {
 
     pub fn has_live_outcome(&self, url: &str) -> bool {
         match self.entries.get(&network_resource_url(url)) {
-            Some(CachedResource::Bytes(_)) => true,
-            Some(CachedResource::Missing(at)) => at.elapsed() < MISSING_RESOURCE_RETRY_AFTER,
+            Some(CachedResource::Bytes { .. }) => true,
+            Some(CachedResource::Missing(at)) => missing_resource_is_live(at),
             None => false,
         }
     }
@@ -219,7 +605,7 @@ impl RenderResourceCache {
     pub fn has_cached_bytes(&self, url: &str) -> bool {
         matches!(
             self.entries.get(&network_resource_url(url)),
-            Some(CachedResource::Bytes(_))
+            Some(CachedResource::Bytes { .. })
         )
     }
 
@@ -228,7 +614,16 @@ impl RenderResourceCache {
     }
 
     pub fn seed_image(&mut self, url: String, profile: ImageRequestProfile, bytes: Vec<u8>) {
-        self.seed(image_resource_key(&url, profile), bytes);
+        self.seed_shared(image_resource_key(&url, profile), Arc::from(bytes));
+    }
+
+    pub fn seed_image_shared(
+        &mut self,
+        url: String,
+        profile: ImageRequestProfile,
+        bytes: Arc<[u8]>,
+    ) {
+        self.seed_shared(image_resource_key(&url, profile), bytes);
     }
 
     pub fn seed_image_missing(&mut self, url: String, profile: ImageRequestProfile) {
@@ -242,9 +637,14 @@ impl RenderResourceCache {
     /// layer uses this entry point to fetch a bounded resource batch through
     /// its cookie/proxy/CORS-aware connection pool before entering layout.
     pub fn seed(&mut self, url: String, bytes: Vec<u8>) {
+        self.seed_shared(url, Arc::from(bytes));
+    }
+
+    /// Seed already-shared bytes without copying a complete response body.
+    pub fn seed_shared(&mut self, url: String, bytes: Arc<[u8]>) {
         let url = network_resource_url(&url);
         self.remove(&url);
-        self.insert_bytes(url, Arc::from(bytes));
+        self.insert_bytes(url, bytes);
     }
 
     /// Retain a page-transport failure so capture does not immediately repeat
@@ -293,11 +693,11 @@ impl RenderResourceCache {
             );
         }
         match self.entries.get(&network_resource_url(&resolved_url)) {
-            Some(CachedResource::Bytes(bytes)) => Some(
-                image_metadata_from_bytes(bytes)
+            Some(entry @ CachedResource::Bytes { .. }) => Some(
+                entry.image_intrinsic().and_then(crate::ReplacedIntrinsic::natural_size)
                     .map(|(width, height)| (resolved_url, width, height)),
             ),
-            Some(CachedResource::Missing(at)) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+            Some(CachedResource::Missing(at)) if missing_resource_is_live(at) => {
                 Some(None)
             }
             _ => None,
@@ -316,11 +716,11 @@ impl RenderResourceCache {
         }
         let key = image_resource_key(&resolved_url, profile);
         match self.entries.get(&key) {
-            Some(CachedResource::Bytes(bytes)) => Some(
-                image_metadata_from_bytes(bytes)
+            Some(entry @ CachedResource::Bytes { .. }) => Some(
+                entry.image_intrinsic().and_then(crate::ReplacedIntrinsic::natural_size)
                     .map(|(width, height)| (resolved_url, width, height)),
             ),
-            Some(CachedResource::Missing(at)) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+            Some(CachedResource::Missing(at)) if missing_resource_is_live(at) => {
                 Some(None)
             }
             _ => None,
@@ -342,8 +742,8 @@ impl RenderResourceCache {
         let (src, density) = resolve_img_url(tree, id, viewport)?;
         let resolved_url = resolve_resource_url(&src, base_url).unwrap_or(src);
         let profile = image_request_profile(tree, id);
-        let dimensions = fetch_profiled_image_bytes(&resolved_url, None, self, profile)
-            .and_then(|bytes| image_metadata_from_bytes(&bytes))
+        let dimensions = self.profiled_image_intrinsic(&resolved_url, profile)
+            .and_then(crate::ReplacedIntrinsic::natural_size)
             .map(|(width, height)| (width / density, height / density));
         Some((resolved_url, density, dimensions))
     }
@@ -406,18 +806,43 @@ impl RenderResourceCache {
         }
     }
 
-    fn get_or_load(&mut self, url: &str) -> Option<Arc<[u8]>> {
+    fn profiled_image_intrinsic(
+        &mut self,
+        resolved_url: &str,
+        profile: ImageRequestProfile,
+    ) -> Option<crate::ReplacedIntrinsic> {
+        if resolved_url.starts_with("data:") {
+            let bytes = fetch_bytes(resolved_url, None, self)?;
+            return image_intrinsic_metadata(&bytes);
+        }
+        // Preserve the loader's URL-resolution gate for unresolved paths and
+        // unsupported schemes; memoization must not create new requests.
+        let resolved_url = resolve_resource_url(resolved_url, None)?;
+        let key = image_resource_key(&resolved_url, profile);
+        if let Some(entry @ CachedResource::Bytes { .. }) = self.entries.get(&key) {
+            return entry.image_intrinsic();
+        }
+        let bytes = self.get_or_load_image(&resolved_url, profile)?;
+        match self.entries.get(&key) {
+            Some(entry @ CachedResource::Bytes { .. }) => entry.image_intrinsic(),
+            // Disabled/over-budget caches still inspect the fetched response.
+            _ => image_intrinsic_metadata(&bytes),
+        }
+    }
+
+    fn get_or_load(&mut self, url: &str, is_font: bool) -> Option<Arc<[u8]>> {
         let url = network_resource_url(url);
         if let Some(entry) = self.entries.get(&url) {
             match entry {
-                CachedResource::Bytes(bytes) => return Some(Arc::clone(bytes)),
-                CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+                CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
+                CachedResource::Missing(at) if missing_resource_is_live(at) => {
                     return None;
                 }
                 CachedResource::Missing(_) => {}
             }
         }
         if !self.sync_loading_enabled {
+            self.record_sync_miss(url.clone(), url, None, is_font);
             return None;
         }
         self.remove(&url);
@@ -435,22 +860,19 @@ impl RenderResourceCache {
         }
     }
 
-    fn get_or_load_image(
-        &mut self,
-        url: &str,
-        profile: ImageRequestProfile,
-    ) -> Option<Arc<[u8]>> {
+    fn get_or_load_image(&mut self, url: &str, profile: ImageRequestProfile) -> Option<Arc<[u8]>> {
         let key = image_resource_key(url, profile);
         if let Some(entry) = self.entries.get(&key) {
             match entry {
-                CachedResource::Bytes(bytes) => return Some(Arc::clone(bytes)),
-                CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
+                CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
+                CachedResource::Missing(at) if missing_resource_is_live(at) => {
                     return None;
                 }
                 CachedResource::Missing(_) => {}
             }
         }
         if !self.sync_loading_enabled {
+            self.record_sync_miss(key, network_resource_url(url), Some(profile), false);
             return None;
         }
         self.remove(&key);
@@ -486,7 +908,11 @@ impl RenderResourceCache {
         }
         self.retained_bytes = self.retained_bytes.saturating_add(bytes.len());
         self.order.push_back(url.clone());
-        self.entries.insert(url, CachedResource::Bytes(bytes));
+        self.entries.insert(url, CachedResource::Bytes {
+            bytes,
+            intrinsic: std::sync::OnceLock::new(),
+            static_raster: std::sync::OnceLock::new(),
+        });
     }
 
     fn insert_missing(&mut self, url: String) {
@@ -501,7 +927,7 @@ impl RenderResourceCache {
         }
         self.order.push_back(url.clone());
         self.entries
-            .insert(url, CachedResource::Missing(std::time::Instant::now()));
+            .insert(url, CachedResource::Missing(missing_resource_stamp()));
     }
 
     fn remove(&mut self, url: &str) {
@@ -512,9 +938,66 @@ impl RenderResourceCache {
     }
 
     fn remove_entry(&mut self, url: &str) {
-        if let Some(CachedResource::Bytes(bytes)) = self.entries.remove(url) {
+        if let Some(CachedResource::Bytes { bytes, .. }) = self.entries.remove(url) {
             self.retained_bytes = self.retained_bytes.saturating_sub(bytes.len());
         }
+        self.raster_paints.retain(|entry| {
+            if entry.resource_key == url {
+                self.raster_paint_bytes -= entry.raster.data().len();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn raster_paint(
+        &mut self,
+        resource_key: &str,
+        bytes: Arc<[u8]>,
+        width: u32,
+        height: u32,
+    ) -> Option<Arc<Pixmap>> {
+        if let Some(index) = self.raster_paints.iter().position(|entry| {
+            entry.resource_key == resource_key && Arc::ptr_eq(&entry.bytes, &bytes)
+                && entry.raster.width() == width && entry.raster.height() == height
+        }) {
+            let entry = self.raster_paints.remove(index)?;
+            let raster = Arc::clone(&entry.raster);
+            self.raster_paints.push_back(entry);
+            return Some(raster);
+        }
+        let raster = Arc::new(raster_to_pixmap(&bytes, width, height)?);
+        let size = raster.data().len();
+        // Cache only bytes still owned by this page's normal resource cache.
+        // This excludes disabled/over-budget caches and ephemeral data URLs.
+        if size > RASTER_PAINT_CACHE_ENTRY_BYTES {
+            return Some(raster);
+        }
+        // Inspect animation eligibility only when painting, once per immutable
+        // resource. Different raster sizes and cache eviction reuse the result;
+        // resource replacement drops it along with the original bytes.
+        let cacheable = match self.entries.get(resource_key) {
+            Some(CachedResource::Bytes { bytes: current, static_raster, .. })
+                if Arc::ptr_eq(current, &bytes) => {
+                    *static_raster.get_or_init(|| static_raster_cacheable(&bytes))
+                }
+            _ => false,
+        };
+        if !cacheable {
+            return Some(raster);
+        }
+        while self.raster_paints.len() >= RASTER_PAINT_CACHE_ENTRIES
+            || self.raster_paint_bytes.saturating_add(size) > RASTER_PAINT_CACHE_BYTES
+        {
+            let oldest = self.raster_paints.pop_front()?;
+            self.raster_paint_bytes -= oldest.raster.data().len();
+        }
+        self.raster_paint_bytes += size;
+        self.raster_paints.push_back(CachedRasterPaint {
+            resource_key: resource_key.to_owned(), bytes, raster: Arc::clone(&raster),
+        });
+        Some(raster)
     }
 
     /// Seed a prior stable `content:url(...)` selection into the ordinary
@@ -733,7 +1216,10 @@ pub enum CaptureError {
     EncodeFailed,
 }
 
-fn checked_capture_dimensions(region: CaptureRegion) -> Result<(u32, u32, u32, u32), CaptureError> {
+fn checked_capture_dimensions(
+    region: CaptureRegion,
+    allocates_native_surface: bool,
+) -> Result<(u32, u32, u32, u32), CaptureError> {
     if !region.x.is_finite()
         || !region.y.is_finite()
         || !region.width.is_finite()
@@ -778,14 +1264,21 @@ fn checked_capture_dimensions(region: CaptureRegion) -> Result<(u32, u32, u32, u
         output_width as u32,
         output_height as u32,
     );
-    for (width, height) in [(dimensions.0, dimensions.1), (dimensions.2, dimensions.3)] {
+    let checked_surfaces = if allocates_native_surface {
+        &[(dimensions.0, dimensions.1), (dimensions.2, dimensions.3)][..]
+    } else {
+        &[(dimensions.2, dimensions.3)][..]
+    };
+    for &(width, height) in checked_surfaces {
         if u64::from(width).saturating_mul(u64::from(height)) > MAX_CAPTURE_PIXELS {
             return Err(CaptureError::AllocationLimitExceeded);
         }
     }
     let native_pixels = u64::from(dimensions.0).saturating_mul(u64::from(dimensions.1));
     let output_pixels = u64::from(dimensions.2).saturating_mul(u64::from(dimensions.3));
-    let peak_pixels = if dimensions.0 == dimensions.2 && dimensions.1 == dimensions.3 {
+    let peak_pixels = if !allocates_native_surface {
+        output_pixels
+    } else if dimensions.0 == dimensions.2 && dimensions.1 == dimensions.3 {
         native_pixels
     } else {
         // Scaling owns the native RGBA surface and output RGBA surface at the
@@ -802,7 +1295,7 @@ fn checked_capture_dimensions(region: CaptureRegion) -> Result<(u32, u32, u32, u
 /// Protocol adapters use this on legacy viewport captures which preserve the
 /// renderer's native PNG bytes but must obey the same limits as region capture.
 pub fn validate_capture_region(region: CaptureRegion) -> Result<(), CaptureError> {
-    checked_capture_dimensions(region).map(|_| ())
+    checked_capture_dimensions(region, true).map(|_| ())
 }
 
 impl ResolvedScrollState {
@@ -842,6 +1335,9 @@ pub struct PreparedRender {
     selected_images: HashMap<obscura_dom::tree::NodeId, SelectedImage>,
     svg_fonts: Arc<usvg::fontdb::Database>,
     layout: crate::DomLayout,
+    // Owned by the same document preparation as the final layout; replaced on
+    // every rebuild and dropped with it on navigation or full invalidation.
+    query_seed: Option<RetainedStyleMaps>,
 }
 
 impl PreparedRender {
@@ -861,12 +1357,7 @@ impl PreparedRender {
     /// animation. Finite animations stop producing compositor damage after
     /// their active interval; paused and zero-duration animations never do.
     pub fn has_active_css_animations(&self) -> bool {
-        self.has_active_waapi_animations
-            || self
-                .layout
-                .styles
-                .values()
-                .any(css_animation_is_active)
+        self.has_active_waapi_animations || self.layout.styles.values().any(css_animation_is_active)
     }
 
     fn has_active_declarative_css_animations(&self) -> bool {
@@ -893,12 +1384,15 @@ impl PreparedRender {
         let mut updates = Vec::new();
         let mut has_transform_effect = false;
         let mut has_opacity_effect = false;
-        for node in timeline.waapi_nodes().into_iter().filter(|node| connected(*node)) {
+        for node in timeline
+            .waapi_nodes()
+            .into_iter()
+            .filter(|node| connected(*node))
+        {
             let Some(style) = self.layout.styles.get(&node) else {
                 return false;
             };
-            let Some(sampled) =
-                crate::css::resample_visual_waapi(timeline, node, style, sample)
+            let Some(sampled) = crate::css::resample_visual_waapi(timeline, node, style, sample)
             else {
                 return false;
             };
@@ -915,7 +1409,8 @@ impl PreparedRender {
             return false;
         }
         for (node, sampled) in updates {
-            let style = self.layout
+            let style = self
+                .layout
                 .styles
                 .get_mut(&node)
                 .expect("WAAPI target passed preflight");
@@ -932,11 +1427,9 @@ impl PreparedRender {
             // already rejected any containing-block topology change. Reuse
             // the immutable viewport-fixed ownership instead of walking the
             // document again on every animation frame.
-            let derived = self.layout.derived_geometry_with_fixed(
-                tree,
-                self.viewport,
-                &self.viewport_fixed,
-            );
+            let derived =
+                self.layout
+                    .derived_geometry_with_fixed(tree, self.viewport, &self.viewport_fixed);
             self.content_size = derived.content_size;
             self.sticky = derived.sticky;
             self.scroll_tree = derived.scroll_tree;
@@ -951,10 +1444,7 @@ impl PreparedRender {
     /// to `sample`. The prepared style/paint sample deliberately stays
     /// unchanged; a later computed-style or paint consumer will materialize
     /// the exact requested sample through the normal retained-style path.
-    pub fn can_reuse_geometry_for_animation_sample(
-        &self,
-        sample: crate::AnimationSample,
-    ) -> bool {
+    pub fn can_reuse_geometry_for_animation_sample(&self, sample: crate::AnimationSample) -> bool {
         sample.mode == crate::AnimationSampleMode::DocumentTime
             && self.animation_sample.mode == crate::AnimationSampleMode::DocumentTime
             && sample.time.milliseconds >= self.animation_sample.time.milliseconds
@@ -1003,11 +1493,7 @@ impl PreparedRender {
         self.clamp_scroll_for_viewport(requested, self.viewport)
     }
 
-    fn clamp_scroll_for_viewport(
-        &self,
-        requested: (f32, f32),
-        viewport: (f32, f32),
-    ) -> (f32, f32) {
+    fn clamp_scroll_for_viewport(&self, requested: (f32, f32), viewport: (f32, f32)) -> (f32, f32) {
         let clamp_axis = |requested: f32, content: f32, viewport: f32| {
             if requested.is_finite() {
                 crate::quantize_scroll_value(requested, 1.0)
@@ -1044,12 +1530,9 @@ impl PreparedRender {
             .flatten()
             .and_then(|owner| cumulative.get(owner.index()).copied())
             .unwrap_or((0.0, 0.0));
-        let sticky = self.sticky.resolved_translation_for(
-            id,
-            self.viewport,
-            &self.scroll_tree,
-            &cumulative,
-        );
+        let sticky =
+            self.sticky
+                .resolved_translation_for(id, self.viewport, &self.scroll_tree, &cumulative);
         movement.0 += sticky.0;
         movement.1 += sticky.1;
         movement
@@ -1296,6 +1779,217 @@ impl PreparedRender {
         ))
     }
 
+    /// Untransformed border-box size used by CSSOM View's `offsetWidth` and
+    /// `offsetHeight`. Unlike `getBoundingClientRect()`, transforms do not
+    /// participate in these integer layout metrics.
+    pub fn border_size(&self, id: obscura_dom::tree::NodeId) -> Option<(f32, f32)> {
+        let rect = self.layout.rects.get(&id)?;
+        let style = self.layout.styles.get(&id)?;
+        if style.ignores_used_box_sizes() {
+            return Some((0.0, 0.0));
+        }
+        Some((rect.width.max(0.0), rect.height.max(0.0)))
+    }
+
+    /// Whether hit testing must ignore this element's generated box.
+    pub fn pointer_events_none(&self, id: obscura_dom::tree::NodeId) -> bool {
+        self.layout
+            .styles
+            .get(&id)
+            .and_then(|style| style.pointer_events_none)
+            .unwrap_or(false)
+    }
+
+    /// Topmost DOM element at a viewport point, using the retained layout and
+    /// the same stacking-context bands as paint. This keeps CSSOM hit testing
+    /// off the JS-side O(elements) geometry loop and prevents a later DOM node
+    /// in a negative z-index layer from covering normal-flow controls.
+    pub fn hit_test(
+        &self,
+        tree: &DomTree,
+        scroll: &ResolvedScrollState,
+        x: f32,
+        y: f32,
+    ) -> Option<obscura_dom::tree::NodeId> {
+        fn stacking_path(
+            tree: &DomTree,
+            laid: &crate::DomLayout,
+            id: obscura_dom::tree::NodeId,
+        ) -> Vec<i32> {
+            // Stacking contexts are inherited through the DOM ancestor chain.
+            // The rendered-parent helper deliberately skips some framework
+            // wrapper boxes; using it here can detach a control from a fixed
+            // ancestor's context and make the ancestor win its own hit test.
+            let mut ancestors = tree.ancestors(id);
+            ancestors.insert(0, id);
+            ancestors.reverse();
+            ancestors
+                .into_iter()
+                .filter_map(|node| stacking_z_index(tree, laid, node))
+                .collect()
+        }
+
+        fn compare_stacking_paths(a: &[i32], b: &[i32]) -> std::cmp::Ordering {
+            use std::cmp::Ordering;
+            let common = a.len().min(b.len());
+            for index in 0..common {
+                let order = a[index].cmp(&b[index]);
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            if a.len() == b.len() {
+                return Ordering::Equal;
+            }
+            // Ending the path means normal-flow content in this stacking
+            // context: it paints after a negative child context and before a
+            // zero-or-positive child context.
+            if a.len() == common {
+                if b[common] < 0 {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            } else if a[common] < 0 {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+
+        if !x.is_finite()
+            || !y.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || x > self.viewport.0
+            || y > self.viewport.1
+        {
+            return None;
+        }
+        let point = crate::Rect {
+            x,
+            y,
+            // `f32::EPSILON` is smaller than one ULP at ordinary viewport
+            // coordinates, so x + width can round back to x and appear empty
+            // to `intersect_rect`. A sub-pixel probe remains point-like while
+            // retaining a representable extent across the supported viewport.
+            width: 0.001,
+            height: 0.001,
+        };
+        let mut best: Option<(Vec<i32>, bool, usize, usize, obscura_dom::tree::NodeId)> = None;
+        for (order, id) in crate::dom::rendered_descendants(tree, tree.document())
+            .into_iter()
+            .enumerate()
+        {
+            let Some(style) = self.layout.styles.get(&id) else {
+                continue;
+            };
+            if style.display == crate::Display::None
+                || style.display_contents
+                || style.visibility_hidden.unwrap_or(false)
+                || style.pointer_events_none.unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(rect) = self.viewport_rect_with_scroll(id, scroll) else {
+                continue;
+            };
+            if x < rect.x || x >= rect.x + rect.width || y < rect.y || y >= rect.y + rect.height {
+                continue;
+            }
+            if scroll
+                .inherited_clip_for(id)
+                .is_some_and(|clip| clip.intersect_rect(&point).is_none())
+            {
+                continue;
+            }
+            let path = stacking_path(tree, &self.layout, id);
+            let positioned = style.position.is_some() || style.position_fixed || style.position_sticky;
+            let depth = tree.ancestors(id).len();
+            let replace = best
+                .as_ref()
+                .is_none_or(|(best_path, best_positioned, best_depth, best_order, best_id)| {
+                    let stacking = compare_stacking_paths(&path, best_path);
+                    if stacking != std::cmp::Ordering::Equal {
+                        return stacking.is_gt();
+                    }
+                    if tree.ancestors(id).contains(best_id) {
+                        return true;
+                    }
+                    if tree.ancestors(*best_id).contains(&id) {
+                        return false;
+                    }
+                    positioned
+                        .cmp(best_positioned)
+                        .then_with(|| depth.cmp(best_depth))
+                        .then_with(|| order.cmp(best_order))
+                        .is_gt()
+                });
+            if replace {
+                best = Some((path, positioned, depth, order, id));
+            }
+        }
+        best.map(|(_, _, _, _, id)| id)
+    }
+
+    /// Shaped-text caret in the viewport. Hit testing selects the painted
+    /// owner first, so an occluding sibling cannot donate its text cursor.
+    pub fn caret_from_point(
+        &self,
+        tree: &DomTree,
+        scroll: &ResolvedScrollState,
+        x: f32,
+        y: f32,
+    ) -> Option<(obscura_dom::tree::NodeId, usize)> {
+        let hit = self.hit_test(tree, scroll, x, y)?;
+        for parent in std::iter::successors(Some(hit), |id| crate::dom::rendered_parent(tree, *id))
+            .take(tree.len() + 1)
+        {
+            let movement = scroll.movement_for(parent);
+            let transform = self.layout.transforms.get(&parent).copied().unwrap_or_default();
+            let Some(inverse) = transform.inverse() else { continue; };
+            let (local_x, local_y) = inverse.map_point(x - movement.0, y - movement.1);
+            let indices = self.layout.ifc_items.get(&parent).into_iter().copied()
+                .chain(self.layout.run_ifc_items.get(&parent).into_iter().flatten().copied());
+            let best = indices.filter_map(|index|
+                self.layout.text_engine.caret_from_point(index, parent, tree,
+                    &self.layout.styles, local_x, local_y, hit))
+                .min_by(|a, b| a.2.total_cmp(&b.2));
+            if let Some((node, offset, _)) = best { return Some((node, offset)); }
+        }
+        // Empty rendered line boxes have an element boundary, not a fabricated
+        // text node. This also preserves the caret of an empty editable block.
+        Some((hit, 0))
+    }
+
+    /// Geometry for a previously obtained DOM caret, using current layout and
+    /// scroll rather than the snapshot at the original mouse coordinates.
+    pub fn caret_rect(
+        &self,
+        tree: &DomTree,
+        scroll: &ResolvedScrollState,
+        node: obscura_dom::tree::NodeId,
+        offset: usize,
+    ) -> Option<crate::Rect> {
+        for parent in std::iter::successors(crate::dom::rendered_parent(tree, node),
+            |id| crate::dom::rendered_parent(tree, *id)).take(tree.len() + 1)
+        {
+            let indices = self.layout.ifc_items.get(&parent).into_iter().copied()
+                .chain(self.layout.run_ifc_items.get(&parent).into_iter().flatten().copied());
+            for index in indices {
+                let Some(rect) = self.layout.text_engine.caret_rect(index, parent,
+                    tree, &self.layout.styles, node, offset) else { continue; };
+                let mut rect = self.layout.transforms.get(&parent).copied()
+                    .unwrap_or_default().map_rect(rect);
+                let movement = scroll.movement_for(parent);
+                rect.x += movement.0;
+                rect.y += movement.1;
+                return Some(rect);
+            }
+        }
+        None
+    }
+
     /// A compact CSSOM snapshot derived from the same final cascade and
     /// layout used by paint and geometry. Keeping this on `PreparedRender`
     /// lets script fetch all high-traffic computed properties in one op,
@@ -1306,110 +2000,7 @@ impl PreparedRender {
     ) -> Option<HashMap<&'static str, String>> {
         let style = self.layout.styles.get(&id)?;
         let rect = self.layout.rects.get(&id);
-        let mut out = HashMap::new();
-
-        let active_webkit_clamp = style.webkit_box_display.is_some()
-            && style.webkit_box_orient_vertical
-            && style.webkit_line_clamp.is_some();
-        let display = if style.display_contents {
-            "contents"
-        } else if style.display == crate::Display::None {
-            "none"
-        } else if active_webkit_clamp && style.webkit_box_display == Some(false) {
-            "flow-root"
-        } else if style.webkit_box_display == Some(false) && !active_webkit_clamp {
-            "-webkit-box"
-        } else if style.webkit_box_display == Some(true) && !active_webkit_clamp {
-            "-webkit-inline-box"
-        } else if style.internal_flex_container {
-            "block"
-        } else {
-            match (style.display, style.is_inline_block) {
-                (crate::Display::Flex, true) => "inline-flex",
-                (crate::Display::Grid, true) => "inline-grid",
-                (crate::Display::Block, true) => "inline-block",
-                (crate::Display::Flex, false) => "flex",
-                (crate::Display::Grid, false) => "grid",
-                (crate::Display::Inline, true) => "inline-block",
-                (crate::Display::Inline, false) => "inline",
-                _ => "block",
-            }
-        };
-        out.insert("display", display.to_string());
-        out.insert(
-            "float",
-            match style.float {
-                Some(crate::Float::Left) => "left",
-                Some(crate::Float::Right) => "right",
-                None => "none",
-            }
-            .to_string(),
-        );
-        out.insert(
-            "clear",
-            match style.clear {
-                Some(crate::Clear::Left) => "left",
-                Some(crate::Clear::Right) => "right",
-                Some(crate::Clear::Both) => "both",
-                None => "none",
-            }
-            .to_string(),
-        );
-        out.insert(
-            "position",
-            if style.position_fixed {
-                "fixed"
-            } else if style.position_sticky {
-                "sticky"
-            } else {
-                match style.position {
-                    Some(taffy::Position::Absolute) => "absolute",
-                    Some(taffy::Position::Relative) => "relative",
-                    _ => "static",
-                }
-            }
-            .to_string(),
-        );
-        out.insert(
-            "z-index",
-            style
-                .z_index
-                .map_or_else(|| "auto".to_string(), |v| v.to_string()),
-        );
-        out.insert(
-            "visibility",
-            if style.visibility_hidden.unwrap_or(false) {
-                "hidden"
-            } else {
-                "visible"
-            }
-            .to_string(),
-        );
-        out.insert("opacity", css_number(style.opacity.unwrap_or(1.0)));
-        out.insert(
-            "background-color",
-            css_color(style.background_color.unwrap_or([0, 0, 0, 0])),
-        );
-        out.insert(
-            "background-origin",
-            match style.background_origin {
-                crate::BackgroundOrigin::BorderBox => "border-box",
-                crate::BackgroundOrigin::PaddingBox => "padding-box",
-                crate::BackgroundOrigin::ContentBox => "content-box",
-            }
-            .to_string(),
-        );
-        out.insert(
-            "background-clip",
-            match style.background_clip {
-                crate::BackgroundClip::BorderBox => "border-box",
-                crate::BackgroundClip::PaddingBox => "padding-box",
-                crate::BackgroundClip::ContentBox => "content-box",
-                crate::BackgroundClip::Text => "text",
-            }
-            .to_string(),
-        );
-        out.insert("color", css_color(style.color.unwrap_or([0, 0, 0, 255])));
+        let mut out = non_geometric_computed_style(style);
         out.insert("font-size", css_px(style.font_size.unwrap_or(16.0)));
         out.insert(
             "font-weight",
@@ -1534,36 +2125,16 @@ impl PreparedRender {
             .to_string(),
         );
 
-        let overflow_axis = |specified: u8, clipped: bool, scroll: bool| {
-            if scroll {
-                // The compact layout model intentionally merges
-                // hidden/auto/scroll for clipping. `auto` is the least
-                // surprising computed scroll-container value.
-                "auto"
-            } else if specified == 1 || clipped {
-                "clip"
-            } else {
-                "visible"
-            }
+        let overflow_axis = |computed: u8| match computed {
+            1 => "clip",
+            2 => "hidden",
+            3 => "scroll",
+            4 => "auto",
+            _ => "visible",
         };
-        out.insert(
-            "overflow-x",
-            overflow_axis(
-                style.overflow_specified_x,
-                style.overflow_clip_x,
-                style.overflow_scroll_x,
-            )
-            .to_string(),
-        );
-        out.insert(
-            "overflow-y",
-            overflow_axis(
-                style.overflow_specified_y,
-                style.overflow_clip_y,
-                style.overflow_scroll_y,
-            )
-            .to_string(),
-        );
+        let (overflow_x, overflow_y) = crate::style::computed_overflow_axes(style);
+        out.insert("overflow-x", overflow_axis(overflow_x).to_string());
+        out.insert("overflow-y", overflow_axis(overflow_y).to_string());
 
         for (name, value, auto) in [
             ("margin-top", style.margin.top, style.margin_auto[0]),
@@ -1731,6 +2302,23 @@ impl PreparedRender {
         Some(out)
     }
 
+    pub fn computed_pseudo_content(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        before: bool,
+    ) -> Option<(Option<&str>, &'static str)> {
+        let style = self.layout.styles.get(&id)?;
+        let pseudo = if before {
+            style.before_pseudo.as_deref()
+        } else {
+            style.after_pseudo.as_deref()
+        };
+        Some((
+            pseudo.and_then(|style| style.before_content.as_deref()),
+            pseudo.map_or("none", computed_display),
+        ))
+    }
+
     /// Cascaded custom properties exposed by CSSOM alongside the compact
     /// fixed-property snapshot above. These maps are shared across unchanged
     /// inherited subtrees by `DomLayout`, so reading one does not require a
@@ -1863,52 +2451,196 @@ impl PreparedRender {
         profile: ImageRequestProfile,
     ) -> bool {
         self.selected_images.iter().any(|(id, selected)| {
-            if selected.resolved_url != url || selected.profile != profile {
-                return false;
-            }
-            if !tree.get_node(*id).is_some_and(|node| {
-                node.as_element()
-                    .is_some_and(|name| name.local.as_ref() == "img")
-            }) {
-                return true;
-            }
-            let Some(style) = self.layout.styles.get(id) else {
-                return true;
-            };
-            // CSS replaced content has its own selected intrinsic metadata;
-            // do not mistake an <img> owner for an ordinary fixed source
-            // image merely because both selections share the element id.
-            if style.content_image.is_some() {
-                return true;
-            }
-            let fixed_box = matches!(style.width, crate::Dimension::Px(_))
-                && matches!(style.height, crate::Dimension::Px(_))
-                && matches!(style.min_width, crate::Dimension::Auto | crate::Dimension::Px(_))
-                && matches!(style.min_height, crate::Dimension::Auto | crate::Dimension::Px(_))
-                && matches!(style.max_width, crate::Dimension::Auto | crate::Dimension::Px(_))
-                && matches!(style.max_height, crate::Dimension::Auto | crate::Dimension::Px(_))
-                && !style.width_fit_content
-                && style.size_expressions.iter().all(Option::is_none);
-            if !fixed_box {
-                return true;
-            }
-
-            let mut parent = crate::dom::rendered_parent(tree, *id);
-            while let Some(parent_id) = parent {
-                let Some(parent_style) = self.layout.styles.get(&parent_id) else {
-                    parent = crate::dom::rendered_parent(tree, parent_id);
-                    continue;
-                };
-                if parent_style.display_contents {
-                    parent = crate::dom::rendered_parent(tree, parent_id);
-                    continue;
-                }
-                return parent_style.display == crate::Display::Grid
-                    || (parent_style.display == crate::Display::Flex
-                        && !parent_style.internal_flex_container);
-            }
-            false
+            selected.resolved_url == url && selected.profile == profile
+                && self.image_intrinsics_affect_geometry(tree, *id)
         })
+    }
+
+    fn image_is_display_suppressed(&self, tree: &DomTree, id: obscura_dom::tree::NodeId) -> bool {
+        let mut ancestor = Some(id);
+        while let Some(node) = ancestor {
+            if self.layout.styles.get(&node).is_some_and(|style| style.display == crate::Display::None) {
+                return true;
+            }
+            ancestor = crate::dom::rendered_parent(tree, node);
+        }
+        false
+    }
+
+    fn image_intrinsics_affect_geometry(&self, tree: &DomTree, id: obscura_dom::tree::NodeId) -> bool {
+        if !tree.get_node(id).is_some_and(|node| {
+            node.as_element()
+                .is_some_and(|name| name.local.as_ref() == "img")
+        }) {
+            return true;
+        }
+        let Some(style) = self.layout.styles.get(&id) else {
+            return true;
+        };
+        // CSS replaced content has its own selected intrinsic metadata;
+        // do not mistake an <img> owner for an ordinary fixed source
+        // image merely because both selections share the element id.
+        if style.content_image.is_some() {
+            return true;
+        }
+        let fixed_box = matches!(style.width, crate::Dimension::Px(_))
+            && matches!(style.height, crate::Dimension::Px(_))
+            && matches!(
+                style.min_width,
+                crate::Dimension::Auto | crate::Dimension::Px(_)
+            )
+            && matches!(
+                style.min_height,
+                crate::Dimension::Auto | crate::Dimension::Px(_)
+            )
+            && matches!(
+                style.max_width,
+                crate::Dimension::Auto | crate::Dimension::Px(_)
+            )
+            && matches!(
+                style.max_height,
+                crate::Dimension::Auto | crate::Dimension::Px(_)
+            )
+            && !style.width_fit_content
+            && style.size_expressions.iter().all(Option::is_none);
+        if !fixed_box {
+            return true;
+        }
+
+        let mut parent = crate::dom::rendered_parent(tree, id);
+        while let Some(parent_id) = parent {
+            let Some(parent_style) = self.layout.styles.get(&parent_id) else {
+                parent = crate::dom::rendered_parent(tree, parent_id);
+                continue;
+            };
+            if parent_style.display_contents {
+                parent = crate::dom::rendered_parent(tree, parent_id);
+                continue;
+            }
+            return parent_style.display == crate::Display::Grid
+                || (parent_style.display == crate::Display::Flex
+                    && !parent_style.internal_flex_container);
+        }
+        false
+    }
+}
+
+pub(crate) fn non_geometric_computed_style(style: &crate::LayoutStyle) -> HashMap<&'static str, String> {
+    let mut out = HashMap::new();
+
+    out.insert("display", computed_display(style).to_string());
+    out.insert(
+        "float",
+        match style.float {
+            Some(crate::Float::Left) => "left",
+            Some(crate::Float::Right) => "right",
+            None => "none",
+        }
+        .to_string(),
+    );
+    out.insert(
+        "clear",
+        match style.clear {
+            Some(crate::Clear::Left) => "left",
+            Some(crate::Clear::Right) => "right",
+            Some(crate::Clear::Both) => "both",
+            None => "none",
+        }
+        .to_string(),
+    );
+    out.insert(
+        "position",
+        if style.position_fixed {
+            "fixed"
+        } else if style.position_sticky {
+            "sticky"
+        } else {
+            match style.position {
+                Some(taffy::Position::Absolute) => "absolute",
+                Some(taffy::Position::Relative) => "relative",
+                _ => "static",
+            }
+        }
+        .to_string(),
+    );
+    out.insert(
+        "z-index",
+        style
+            .z_index
+            .map_or_else(|| "auto".to_string(), |v| v.to_string()),
+    );
+    out.insert(
+        "visibility",
+        if style.visibility_hidden.unwrap_or(false) {
+            "hidden"
+        } else {
+            "visible"
+        }
+        .to_string(),
+    );
+    out.insert(
+        "pointer-events",
+        if style.pointer_events_none.unwrap_or(false) {
+            "none"
+        } else {
+            "auto"
+        }
+        .to_string(),
+    );
+    out.insert("opacity", css_number(style.opacity.unwrap_or(1.0)));
+    out.insert(
+        "background-color",
+        css_color(style.background_color.unwrap_or([0, 0, 0, 0])),
+    );
+    out.insert(
+        "background-origin",
+        match style.background_origin {
+            crate::BackgroundOrigin::BorderBox => "border-box",
+            crate::BackgroundOrigin::PaddingBox => "padding-box",
+            crate::BackgroundOrigin::ContentBox => "content-box",
+        }
+        .to_string(),
+    );
+    out.insert(
+        "background-clip",
+        match style.background_clip {
+            crate::BackgroundClip::BorderBox => "border-box",
+            crate::BackgroundClip::PaddingBox => "padding-box",
+            crate::BackgroundClip::ContentBox => "content-box",
+            crate::BackgroundClip::Text => "text",
+        }
+        .to_string(),
+    );
+    out.insert("color", css_color(style.color.unwrap_or([0, 0, 0, 255])));
+    out
+}
+
+fn computed_display(style: &crate::LayoutStyle) -> &'static str {
+    let active_webkit_clamp = style.webkit_box_display.is_some()
+        && style.webkit_box_orient_vertical
+        && style.webkit_line_clamp.is_some();
+    if style.display_contents {
+        "contents"
+    } else if style.display == crate::Display::None {
+        "none"
+    } else if active_webkit_clamp && style.webkit_box_display == Some(false) {
+        "flow-root"
+    } else if style.webkit_box_display == Some(false) && !active_webkit_clamp {
+        "-webkit-box"
+    } else if style.webkit_box_display == Some(true) && !active_webkit_clamp {
+        "-webkit-inline-box"
+    } else if style.internal_flex_container {
+        "block"
+    } else {
+        match (style.display, style.is_inline_block) {
+            (crate::Display::Flex, true) => "inline-flex",
+            (crate::Display::Grid, true) => "inline-grid",
+            (crate::Display::Block | crate::Display::Inline, true) => "inline-block",
+            (crate::Display::Flex, false) => "flex",
+            (crate::Display::Grid, false) => "grid",
+            (crate::Display::Inline, false) => "inline",
+            _ => "block",
+        }
     }
 }
 
@@ -1954,11 +2686,7 @@ fn radius_value_css(value: crate::RadiusValue) -> String {
 fn corner_radius_css(radius: crate::CornerRadius) -> String {
     let x = radius_value_css(radius.x);
     let y = radius_value_css(radius.y);
-    if x == y {
-        x
-    } else {
-        format!("{x} {y}")
-    }
+    if x == y { x } else { format!("{x} {y}") }
 }
 
 fn css_color([r, g, b, a]: [u8; 4]) -> String {
@@ -2104,14 +2832,36 @@ pub fn paint_dom_scrolled_at_animation_time_with_surface_color(
     surface_color: [u8; 4],
 ) -> Option<Pixmap> {
     let mut resources = RenderResourceCache::default();
-    let mut prepared = prepare_dom_at_animation_time(
+    paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
         tree,
         viewport,
         base_url,
-        &mut resources,
+        scroll,
         animation_sample_time,
-    )?;
-    paint_prepared_with_surface_color(tree, &mut prepared, &mut resources, scroll, surface_color)
+        surface_color,
+        &mut resources,
+    )
+}
+
+/// As [`paint_dom_scrolled_at_animation_time_with_surface_color`], but painting
+/// against a caller-owned resource cache instead of a fresh one.
+///
+/// The default-cache version starts empty, so every image is fetched again on
+/// every call. A caller that already holds a warm cache for this document — a
+/// page repeating a capture, for instance — can pass it here and pay the
+/// network cost once rather than per frame.
+pub fn paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+    surface_color: [u8; 4],
+    resources: &mut RenderResourceCache,
+) -> Option<Pixmap> {
+    let mut prepared =
+        prepare_dom_at_animation_time(tree, viewport, base_url, resources, animation_sample_time)?;
+    paint_prepared_with_surface_color(tree, &mut prepared, resources, scroll, surface_color)
 }
 
 /// Resolve image candidates and web fonts, then create the single final layout
@@ -2278,6 +3028,7 @@ pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animat
         dynamic_fonts,
         stylesheet_cache,
         None,
+        None,
         media_type,
         animation_sample,
         animation_timeline,
@@ -2409,23 +3160,115 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
     {
         return Some(previous);
     }
+    if previous.viewport == viewport
+        && previous.base_url.as_deref() == base_url
+        && !previous.has_dynamic_fonts
+        && dynamic_fonts.is_empty()
+        && crate::dom::can_retain_layout_for_metadata(tree, viewport, stylesheet_cache, mutations)
+        && (!sample_changed
+            || (forward_document_sample
+                && previous.advance_inactive_animation_sample_time(animation_sample.time)))
+    {
+        return Some(previous);
+    }
+    if previous.viewport == viewport
+        && previous.base_url.as_deref() == base_url
+        && !previous.has_dynamic_fonts
+        && dynamic_fonts.is_empty()
+    {
+        if let Some(images) = crate::dom::image_source_updates_without_style_damage(
+            tree, viewport, stylesheet_cache, mutations,
+        ) {
+            let updates = images.into_iter().map(|id| {
+                // A display-suppressed image has no box or intrinsic layout
+                // contribution. Refresh its resource metadata now; revealing
+                // the subtree still goes through normal style/layout damage.
+                let display_suppressed = previous.image_is_display_suppressed(tree, id);
+                if previous.layout.styles.get(&id)?.content_image.is_some() {
+                    return None;
+                }
+                let old_intrinsic = previous.layout.styles.get(&id)?.replaced_intrinsic?;
+                let (url, density) = resolve_img_url(tree, id, viewport)?;
+                let resolved_url = resolve_resource_url(&url, base_url).unwrap_or(url);
+                let profile = image_request_profile(tree, id);
+                let mut intrinsic = resources.profiled_image_intrinsic(&resolved_url, profile)?;
+                intrinsic.width = intrinsic.width.map(|width| width / density);
+                intrinsic.height = intrinsic.height.map(|height| height / density);
+                // Identical density-adjusted metadata leaves every intrinsic
+                // contribution unchanged, including percentage, flex and grid
+                // sizing. The selected resource and its pixels still refresh.
+                // Changed metadata keeps the conservative geometry check.
+                if intrinsic != old_intrinsic
+                    && previous.image_intrinsics_affect_geometry(tree, id)
+                    && !display_suppressed
+                {
+                    return None;
+                }
+                // The eligibility check above excludes changed intrinsic-dependent
+                // boxes: hidden images contribute no geometry, and two fixed
+                // image axes are sized independently of the natural ratio.
+                // Partial SVG metadata still needs the normal layout path to
+                // resolve ratio-only available widths.
+                let complete_intrinsics = [old_intrinsic, intrinsic].iter().all(|metadata| {
+                    metadata.width.is_some_and(|width| width.is_finite() && width > 0.0)
+                        && metadata.height.is_some_and(|height| height.is_finite() && height > 0.0)
+                });
+                if intrinsic.natural_size().is_none()
+                    || (intrinsic.ratio != old_intrinsic.ratio && !complete_intrinsics)
+                {
+                    return None;
+                }
+                Some((id, SelectedImage { resolved_url, density, profile }, intrinsic))
+            }).collect::<Option<Vec<_>>>();
+            if let Some(updates) = updates {
+                if !sample_changed || (forward_document_sample
+                    && previous.advance_inactive_animation_sample_time(animation_sample.time))
+                {
+                    for (id, selected, intrinsic) in updates {
+                        let style = previous.layout.styles.get_mut(&id)?;
+                        style.intrinsic_size = intrinsic.natural_size();
+                        style.replaced_intrinsic = Some(intrinsic);
+                        // Preserve an authored ratio; the decoded ratio still
+                        // follows the selected source for replaced-object paint.
+                        if style.aspect_ratio_is_intrinsic && !style.aspect_ratio_is_mapped {
+                            style.aspect_ratio = intrinsic.ratio;
+                        }
+                        previous.selected_images.insert(id, selected);
+                    }
+                    return Some(previous);
+                }
+            }
+        }
+    }
+    // A query-disabled seed can contain a different animation owner than the
+    // converged layout. Always resample its named CSS animations, including
+    // provisionally hidden ones, against the current document timeline.
+    let query_seed = previous.query_seed.take();
+    let seed_animation_mutations = query_seed.as_ref().map(|seed| {
+        seed.styles.iter().filter_map(|(node, style)| {
+            style.animation_name.is_some().then_some(crate::dom::RetainedStyleMutation::Animation { node: *node })
+        }).chain(seed.styles.iter().filter_map(|(node, style)| {
+            // Cancellation removes the current timeline record. The cached
+            // sample still needs clearing even after its owner disappears.
+            style.waapi_sample_state.is_some().then_some(crate::dom::RetainedStyleMutation::WaapiAnimation { node: *node })
+        })).chain(animation_timeline.waapi_nodes().into_iter().map(|node| {
+            crate::dom::RetainedStyleMutation::WaapiAnimation { node }
+        })).collect::<Vec<_>>()
+    }).unwrap_or_default();
     let sampled_animation_mutations = sample_changed
         .then(|| {
-            retained_animation_restyle_mutations(
-                tree,
-                &previous.layout.styles,
-                animation_timeline,
-            )
+            retained_animation_restyle_mutations(tree, &previous.layout.styles, animation_timeline)
         })
         .unwrap_or_default();
     let animation_mutations;
-    let mutations = if sampled_animation_mutations.is_empty() {
+    let mutations = if sampled_animation_mutations.is_empty() && seed_animation_mutations.is_empty() {
         mutations
     } else {
         animation_mutations = mutations
             .iter()
             .cloned()
             .chain(sampled_animation_mutations)
+            .chain(seed_animation_mutations)
             .collect::<Vec<_>>();
         animation_mutations.as_slice()
     };
@@ -2442,6 +3285,7 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         dynamic_fonts,
         stylesheet_cache,
         Some((retained, mutations)),
+        query_seed,
         crate::CssMediaType::Screen,
         animation_sample,
         animation_timeline,
@@ -2460,8 +3304,7 @@ fn retained_animation_restyle_mutations(
     let mut css_nodes = styles
         .iter()
         .filter_map(|(node, style)| {
-            (style.animation_name.is_some() && style.animation_has_render_effect)
-                .then_some(*node)
+            (style.animation_name.is_some() && style.animation_has_render_effect).then_some(*node)
         })
         .collect::<std::collections::HashSet<_>>();
     css_nodes.retain(|node| connected(*node));
@@ -2487,6 +3330,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     dynamic_fonts: &[DynamicFontFace],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     retained: Option<(RetainedStyleMaps, &[crate::dom::RetainedStyleMutation])>,
+    mut query_seed: Option<RetainedStyleMaps>,
     media_type: crate::CssMediaType,
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
@@ -2530,29 +3374,13 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     } else {
         svg_font_database()
     };
-    let mut laid = match retained {
-        Some((retained, mutations)) => layout_dom_with_web_fonts_and_retained_styles_with_animation_state(
-            tree,
-            viewport,
-            &intrinsic,
-            &fonts,
-            stylesheet_cache,
-            retained,
-            mutations,
-            animation_sample,
-            animation_timeline,
-        ),
-        None => layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
-            tree,
-            viewport,
-            &intrinsic,
-            &fonts,
-            stylesheet_cache,
-            media_type,
-            animation_sample,
-            animation_timeline,
-        ),
-    };
+    let (retained, mutations) = retained.map_or((None, &[][..]), |(styles, mutations)| {
+        (Some(styles), mutations)
+    });
+    let mut laid = layout_dom_with_query_seed(
+        tree, viewport, &intrinsic, &fonts, stylesheet_cache, retained, mutations,
+        media_type, animation_sample, animation_timeline, &mut query_seed,
+    );
     // `content:url(...)` is computed by the author cascade, whereas ordinary
     // HTML image sources are available before layout. Pay for a second layout
     // only on the uncommon pages that actually use a CSS image as replaced
@@ -2572,6 +3400,10 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         {
             resources.content_image_layout_retries += 1;
         }
+        // The retry has different image intrinsics. Drop the initial-pass
+        // cache together with the provisional layout; the next prepare may
+        // populate it again from a complete cascade.
+        query_seed = None;
         laid = layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
             tree,
             viewport,
@@ -2615,6 +3447,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         selected_images,
         svg_fonts,
         layout: laid,
+        query_seed,
     })
 }
 
@@ -2878,7 +3711,7 @@ fn paint_prepared_region_with_scroll_policy(
     canvas_surfaces: &dyn CanvasSurfaceSource,
 ) -> Result<Pixmap, CaptureError> {
     let (native_width, native_height, output_width, output_height) =
-        checked_capture_dimensions(region)?;
+        checked_capture_dimensions(region, false)?;
     let scale_matches_output =
         (output_width as f64 - f64::from(region.width) * f64::from(region.scale)).abs() <= 1.0
             && (output_height as f64 - f64::from(region.height) * f64::from(region.scale)).abs()
@@ -2886,6 +3719,9 @@ fn paint_prepared_region_with_scroll_policy(
     let native_scaled = (output_width != native_width || output_height != native_height)
         && scale_matches_output
         && native_raster_scale_supported(tree, &prepared.layout);
+    if !native_scaled {
+        checked_capture_dimensions(region, true)?;
+    }
     let (paint_width, paint_height, raster_scale) = if native_scaled {
         (output_width, output_height, region.scale)
     } else {
@@ -3231,9 +4067,7 @@ fn paint_canvas_background(
 
     if let Some(color) = style.background_color {
         let mut paint = Paint::default();
-        paint.set_color(Color::from_rgba8(
-            color[0], color[1], color[2], color[3],
-        ));
+        paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
         pixmap.fill_path(
             &path,
             &paint,
@@ -3544,7 +4378,11 @@ fn paint_laid_dom_scrolled(
         Vec<crate::dom::GeneratedBox>,
     > = std::collections::HashMap::new();
     let mut generated_after_at: Vec<Vec<crate::dom::GeneratedBox>> =
-        vec![Vec::new(); paint_order.len()];
+        if laid.generated_boxes.is_empty() {
+            Vec::new()
+        } else {
+            vec![Vec::new(); paint_order.len()]
+        };
     if !laid.generated_boxes.is_empty() {
         let paint_indices: std::collections::HashMap<obscura_dom::tree::NodeId, usize> =
             paint_order
@@ -3554,8 +4392,7 @@ fn paint_laid_dom_scrolled(
                 .collect();
         let mut last_index: std::collections::HashMap<obscura_dom::tree::NodeId, usize> =
             paint_indices.clone();
-        let dom_preorder = paint_nodes.clone();
-        for nid in dom_preorder.into_iter().rev() {
+        for nid in paint_nodes.iter().copied().rev() {
             let Some(index) = last_index.get(&nid).copied() else {
                 continue;
             };
@@ -3702,7 +4539,7 @@ fn paint_laid_dom_scrolled(
             } else {
                 paint_text_node(tree, nid, laid, &scroll_state, &mut pixmap, raster_scale);
             }
-            for generated in &generated_after_at[paint_index] {
+            for generated in generated_after_at.get(paint_index).into_iter().flatten() {
                 paint_in_flow_generated_box(
                     &mut pixmap,
                     generated,
@@ -3815,8 +4652,22 @@ fn paint_laid_dom_scrolled(
             let bottom = (source_bounds.y + source_bounds.height).ceil();
             let layer_width = (right - left).max(1.0) as u32;
             let layer_height = (bottom - top).max(1.0) as u32;
+            // A near-singular transform can inverse-map the viewport to a layer
+            // far larger than any sane allocation. tiny-skia's Pixmap::new would
+            // try to allocate the buffer and OOM-abort the process, so cap the
+            // dimensions here (same limits as the capture path) and skip that
+            // one element rather than aborting the whole page paint (#1019).
+            if layer_width > MAX_CAPTURE_DIMENSION
+                || layer_height > MAX_CAPTURE_DIMENSION
+                || u64::from(layer_width).saturating_mul(u64::from(layer_height))
+                    > MAX_CAPTURE_PIXELS
+            {
+                continue;
+            }
             let layer_delta = (-left, -top);
-            let layer = Pixmap::new(layer_width, layer_height)?;
+            let Some(layer) = Pixmap::new(layer_width, layer_height) else {
+                continue;
+            };
             let layer = paint_laid_dom_scrolled(
                 tree,
                 viewport,
@@ -3893,7 +4744,42 @@ fn paint_laid_dom_scrolled(
             // Opacity is applied to the finished stacking context, never to
             // each primitive. Otherwise two opaque overlapping children at
             // opacity:.5 incorrectly become .75 alpha in their overlap.
-            let layer = Pixmap::new(pixmap.width(), pixmap.height())?;
+            //
+            // Keep the isolated surface to the visible subtree bounds. A
+            // viewport-sized allocation here made every nested opacity group
+            // retain another complete RGBA screenshot until its child paint
+            // returned. Real pages commonly use opacity on small icons and
+            // controls, so that multiplied peak memory by the nesting depth.
+            let surface = paint_surface_rect(&pixmap, raster_scale);
+            // Source bounds do not include scale/rotation of descendants.
+            // Until transformed ink bounds are available, preserve their
+            // overflow using the destination surface instead of clipping it.
+            let transformed_descendant = crate::dom::rendered_descendants(tree, nid)
+                .into_iter()
+                .any(|id| match (laid.styles.get(&id), laid.rects.get(&id)) {
+                    (Some(style), Some(rect)) if has_authored_transform(style) =>
+                        !crate::dom::resolved_transform_matrix(
+                            style, rect, root_font_size, viewport,
+                        ).is_translation(),
+                    _ => false,
+                });
+            let bounds = if transformed_descendant {
+                Some(surface)
+            } else {
+                transform_subtree_source_bounds(tree, laid, &scroll_state, nid)
+                    .and_then(|bounds| bounds.intersect(&surface))
+            };
+            let Some(layer_bounds) = bounds else {
+                continue;
+            };
+            let left = layer_bounds.x.floor();
+            let top = layer_bounds.y.floor();
+            let right = (layer_bounds.x + layer_bounds.width).ceil();
+            let bottom = (layer_bounds.y + layer_bounds.height).ceil();
+            let layer_width = (right - left).max(1.0) as u32;
+            let layer_height = (bottom - top).max(1.0) as u32;
+            let layer_delta = (-left, -top);
+            let layer = Pixmap::new(layer_width, layer_height)?;
             let layer = paint_laid_dom_scrolled(
                 tree,
                 viewport,
@@ -3917,7 +4803,10 @@ fn paint_laid_dom_scrolled(
                 suppress_transform_for,
                 clip_scope_root,
                 surface_extent,
-                surface_offset,
+                (
+                    surface_offset.0 + layer_delta.0,
+                    surface_offset.1 + layer_delta.1,
+                ),
                 raster_scale,
                 print_economy,
                 canvas_background,
@@ -3927,8 +4816,8 @@ fn paint_laid_dom_scrolled(
                 ..tiny_skia::PixmapPaint::default()
             };
             pixmap.draw_pixmap(
-                0,
-                0,
+                left as i32,
+                top as i32,
                 layer.as_ref(),
                 &group_paint,
                 Transform::identity(),
@@ -3940,8 +4829,8 @@ fn paint_laid_dom_scrolled(
         if style.effectively_invisible {
             continue;
         }
-        let background_transfers_to_canvas = canvas_background
-            .is_some_and(|canvas| nid == canvas.root || nid == canvas.source);
+        let background_transfers_to_canvas =
+            canvas_background.is_some_and(|canvas| nid == canvas.root || nid == canvas.source);
 
         // A `transform: translate()` on this element or any ancestor offsets
         // this element's whole painted box (and, applied per node, its whole
@@ -4339,21 +5228,9 @@ fn paint_laid_dom_scrolled(
         }
 
         if !paints_inline_fragments {
-            paint_css_border(
-                &mut pixmap,
-                &rect,
-                style,
-                element_clip_mask,
-                raster_scale,
-            );
+            paint_css_border(&mut pixmap, &rect, style, element_clip_mask, raster_scale);
         }
-        paint_css_outline(
-            &mut pixmap,
-            &rect,
-            style,
-            element_clip_mask,
-            raster_scale,
-        );
+        paint_css_outline(&mut pixmap, &rect, style, element_clip_mask, raster_scale);
 
         if box_on_surface && matches!(name.local.as_ref(), "img" | "video") {
             if let Some(source) = selected_images.get(&nid) {
@@ -4536,11 +5413,24 @@ fn paint_laid_dom_scrolled(
             }
         }
 
-        // `::before`/`::after` generated text (see `dom::build_pseudo_content`)
-        // has no DOM text node of its own; its word runs are registered under
-        // the host element's own id instead, so paint them here rather than
-        // through `paint_text_node` (which only runs for real text nodes).
-        if let Some(runs) = laid.text_runs.get(&nid) {
+        // `::before`/`::after` generated text has no DOM text node of its own.
+        // Its shaped word items are registered under the host element, so
+        // paint them here. The static path remains for layout-only builds and
+        // for a face that cosmic-text cannot decode.
+        if let Some(items) = laid.word_ifc_items.get(&nid) {
+            let offset = scroll_state.translation_for(laid, nid);
+            for &item in items {
+                laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
+                    item,
+                    &mut pixmap,
+                    offset,
+                    clip,
+                    element_clip_mask,
+                    raster_scale,
+                    print_economy,
+                );
+            }
+        } else if let Some(runs) = laid.text_runs.get(&nid) {
             let color = style.color.unwrap_or([0, 0, 0, 255]);
             let fsize = style.font_size.unwrap_or(16.0);
             let is_bold = crate::style::used_font_weight(style) >= 600;
@@ -4610,17 +5500,165 @@ fn paint_laid_dom_scrolled(
             }
         }
 
+        let input_type =
+            (name.local.as_ref() == "input").then(|| node.get_attribute("type").unwrap_or("text"));
+        let checkable = input_type.is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
+        });
+        if checkable && rect.width > 0.0 && rect.height > 0.0 {
+            let checked = tree
+                .form_control_checked(nid)
+                .unwrap_or_else(|| node.get_attribute("checked").is_some());
+            let is_radio = input_type.is_some_and(|kind| kind.eq_ignore_ascii_case("radio"));
+            let indeterminate = !is_radio && tree.form_control_indeterminate(nid);
+            let disabled = node.get_attribute("disabled").is_some();
+            let size = rect.width.min(rect.height);
+            let x = rect.x + (rect.width - size) / 2.0;
+            let y = rect.y + (rect.height - size) / 2.0;
+            let shape = if is_radio {
+                PathBuilder::from_circle(
+                    x + size / 2.0,
+                    y + size / 2.0,
+                    (size - 1.0).max(0.0) / 2.0,
+                )
+            } else {
+                tiny_skia::Rect::from_xywh(
+                    x + 0.5,
+                    y + 0.5,
+                    (size - 1.0).max(0.0),
+                    (size - 1.0).max(0.0),
+                )
+                    .map(PathBuilder::from_rect)
+            };
+            if let Some(shape) = shape {
+                let mut control_paint = Paint::default();
+                let selected = checked || indeterminate;
+                let color = if disabled {
+                    [160, 160, 160, 255]
+                } else if selected {
+                    [0, 117, 255, 255]
+                } else {
+                    [118, 118, 118, 255]
+                };
+                control_paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+                control_paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke {
+                    width: 1.0,
+                    ..Default::default()
+                };
+                if !is_radio && selected {
+                    pixmap.fill_path(
+                        &shape,
+                        &control_paint,
+                        FillRule::Winding,
+                        raster_transform(raster_scale),
+                        element_clip_mask,
+                    );
+                } else {
+                    pixmap.stroke_path(
+                        &shape,
+                        &control_paint,
+                        &stroke,
+                        raster_transform(raster_scale),
+                        element_clip_mask,
+                    );
+                }
+                if selected {
+                    if is_radio {
+                        if let Some(dot) =
+                            PathBuilder::from_circle(x + size / 2.0, y + size / 2.0, size * 0.25)
+                        {
+                            pixmap.fill_path(
+                                &dot,
+                                &control_paint,
+                                FillRule::Winding,
+                                raster_transform(raster_scale),
+                                element_clip_mask,
+                            );
+                        }
+                    } else {
+                        let mut mark = PathBuilder::new();
+                        mark.move_to(x + size * 0.2, y + size * 0.5);
+                        if indeterminate {
+                            mark.line_to(x + size * 0.8, y + size * 0.5);
+                        } else {
+                            mark.line_to(x + size * 0.43, y + size * 0.73);
+                            mark.line_to(x + size * 0.82, y + size * 0.25);
+                        }
+                        if let Some(mark) = mark.finish() {
+                            control_paint.set_color(Color::WHITE);
+                            let stroke = tiny_skia::Stroke {
+                                width: (size * 0.14).max(1.0),
+                                ..Default::default()
+                            };
+                            pixmap.stroke_path(
+                                &mark,
+                                &control_paint,
+                                &stroke,
+                                raster_transform(raster_scale),
+                                element_clip_mask,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // An empty text `<input>`/`<textarea>` shows its `placeholder`
         // attribute as muted text; there is no DOM text node for it (it is
         // not real content), so paint it directly from the attribute instead
         // of going through `paint_text_node`.
-        if name.local.as_ref() == "input" || name.local.as_ref() == "textarea" {
-            let has_value = node
-                .get_attribute("value")
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
-                || (name.local.as_ref() == "textarea"
-                    && !tree.text_content(nid).is_empty());
+        if !checkable && (name.local.as_ref() == "input" || name.local.as_ref() == "textarea") {
+            let live_value = tree
+                .form_control_state(nid)
+                .and_then(|control| control.value);
+            let value = live_value
+                .as_deref()
+                .or_else(|| node.get_attribute("value"));
+            let has_value = value.is_some_and(|v| !v.is_empty())
+                || (name.local.as_ref() == "textarea" && !tree.text_content(nid).is_empty());
+            // A text `<input>`'s value is not a DOM text node either, so it
+            // needs painting from its live state, falling back to the attribute.
+            // Without this the
+            // control renders empty however it was filled in — from markup,
+            // from script, or by typing — while its `value` reads back
+            // correctly, so only a screenshot or PDF shows anything wrong.
+            // `<textarea>` is unaffected: its value *is* a text node.
+            if has_value && name.local.as_ref() == "input" {
+                if let Some(value) = value {
+                    if !value.is_empty() {
+                        let fsize = style.font_size.unwrap_or(16.0);
+                        let text_x = rect.x + style.padding.left + style.border.left;
+                        let text_y = rect.y + style.padding.top + style.border.top;
+                        let color = style.color.unwrap_or([0, 0, 0, 255]);
+                        let masked;
+                        let shown = if input_type
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
+                        {
+                            masked = "\u{2022}".repeat(value.chars().count());
+                            masked.as_str()
+                        } else {
+                            value
+                        };
+                        if color[3] != 0 {
+                            draw_text(
+                                &mut pixmap,
+                                shown,
+                                text_x,
+                                text_y,
+                                color,
+                                fsize,
+                                false,
+                                style.font_family.as_deref(),
+                                style.letter_spacing.unwrap_or(0.0),
+                                clip,
+                                element_clip_mask,
+                                raster_scale,
+                            );
+                        }
+                    }
+                }
+            }
             if !has_value {
                 if let Some(placeholder) = node.get_attribute("placeholder") {
                     if !placeholder.is_empty() {
@@ -4656,7 +5694,7 @@ fn paint_laid_dom_scrolled(
                 }
             }
         }
-        for generated in &generated_after_at[paint_index] {
+        for generated in generated_after_at.get(paint_index).into_iter().flatten() {
             paint_in_flow_generated_box(
                 &mut pixmap,
                 generated,
@@ -4761,14 +5799,12 @@ fn paint_surface_rect(pixmap: &Pixmap, raster_scale: f32) -> crate::Rect {
     }
 }
 
-fn rect_intersects_paint_surface(
-    rect: &crate::Rect,
-    pixmap: &Pixmap,
-    raster_scale: f32,
-) -> bool {
+fn rect_intersects_paint_surface(rect: &crate::Rect, pixmap: &Pixmap, raster_scale: f32) -> bool {
     rect.width > 0.0
         && rect.height > 0.0
-        && rect.intersect(&paint_surface_rect(pixmap, raster_scale)).is_some()
+        && rect
+            .intersect(&paint_surface_rect(pixmap, raster_scale))
+            .is_some()
 }
 
 /// Conservative ink overflow for the non-text primitives emitted by one CSS
@@ -4860,8 +5896,7 @@ fn paint_inline_fragment_decorations(
             Some(clip) => ink.intersect(&clip),
             None => Some(ink),
         };
-        if !visible_ink
-            .is_some_and(|ink| rect_intersects_paint_surface(&ink, pixmap, raster_scale))
+        if !visible_ink.is_some_and(|ink| rect_intersects_paint_surface(&ink, pixmap, raster_scale))
         {
             continue;
         }
@@ -4887,7 +5922,7 @@ fn paint_inline_fragment_decorations(
         let background_origin = background_geometry(&union, style).origin_rect;
         let background_path = background_clip_path(background);
         let element_clip_mask = background_extra_clip(ancestor_clip_mask, clip_path_mask.as_ref());
-        let background_mask = element_clip_mask.clone();
+        let background_mask = &element_clip_mask;
 
         if let Some(shadow) = fragment_style.box_shadow {
             paint_box_shadow(
@@ -5051,12 +6086,8 @@ struct ScrollPaintState<'a> {
     viewport_fixed: &'a std::collections::HashSet<obscura_dom::tree::NodeId>,
     sticky: Arc<std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>>,
     sticky_clips: Arc<std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>>,
-    viewport_fixed_clips: Arc<
-        std::collections::HashMap<
-            obscura_dom::tree::NodeId,
-            Option<crate::dom::OverflowClip>,
-        >,
-    >,
+    viewport_fixed_clips:
+        Arc<std::collections::HashMap<obscura_dom::tree::NodeId, Option<crate::dom::OverflowClip>>>,
     resolved: Option<&'a ResolvedScrollState>,
     clip_scope_root: Option<obscura_dom::tree::NodeId>,
     surface_extent: Option<(f32, f32)>,
@@ -5069,10 +6100,7 @@ fn viewport_fixed_clip_map(
     laid: &crate::DomLayout,
     viewport_fixed: &std::collections::HashSet<obscura_dom::tree::NodeId>,
     sticky: &std::collections::HashMap<obscura_dom::tree::NodeId, (f32, f32)>,
-) -> std::collections::HashMap<
-    obscura_dom::tree::NodeId,
-    Option<crate::dom::OverflowClip>,
-> {
+) -> std::collections::HashMap<obscura_dom::tree::NodeId, Option<crate::dom::OverflowClip>> {
     fn walk(
         tree: &DomTree,
         laid: &crate::DomLayout,
@@ -5107,15 +6135,7 @@ fn viewport_fixed_clip_map(
         };
         for child in crate::dom::rendered_children(tree, id) {
             if viewport_fixed.contains(&child) {
-                walk(
-                    tree,
-                    laid,
-                    viewport_fixed,
-                    sticky,
-                    child,
-                    next.clone(),
-                    out,
-                );
+                walk(tree, laid, viewport_fixed, sticky, child, next.clone(), out);
             }
         }
     }
@@ -5125,15 +6145,7 @@ fn viewport_fixed_clip_map(
         let starts_subtree = crate::dom::rendered_parent(tree, id)
             .is_none_or(|parent| !viewport_fixed.contains(&parent));
         if starts_subtree {
-            walk(
-                tree,
-                laid,
-                viewport_fixed,
-                sticky,
-                id,
-                None,
-                &mut out,
-            );
+            walk(tree, laid, viewport_fixed, sticky, id, None, &mut out);
         }
     }
     out
@@ -5185,12 +6197,8 @@ impl<'a> ScrollPaintState<'a> {
                 std::collections::HashMap::new()
             });
             let sticky_clips = Arc::new(sticky_layout.clip_translations_from(&sticky));
-            let viewport_fixed_clips = Arc::new(viewport_fixed_clip_map(
-                tree,
-                laid,
-                viewport_fixed,
-                &sticky,
-            ));
+            let viewport_fixed_clips =
+                Arc::new(viewport_fixed_clip_map(tree, laid, viewport_fixed, &sticky));
             (sticky, sticky_clips, viewport_fixed_clips)
         };
         Self {
@@ -5981,10 +6989,10 @@ fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
 /// tiny-skia has no gaussian blur, so the blur is approximated by nested
 /// rounded rects from a solid core out to the blur radius, each at a fraction of
 /// the shadow alpha so source-over accumulation ramps the coverage from full at
-/// the core to near-zero at the outer edge. `inset` shadows are parsed but not
-/// painted (an inner shadow needs a hole-punched fill this box model does not
-/// build). `clip`, when set, is the ancestor `overflow: hidden` region and is
-/// applied as a mask so the shadow is clipped like the element itself.
+/// the core to near-zero at the outer edge. A shared mask removes the element's
+/// original border box from every outset layer. `inset` shadows are parsed but
+/// not painted. `clip`, when set, is the ancestor `overflow: hidden` region and
+/// is intersected with the shadow mask.
 fn paint_box_shadow(
     pixmap: &mut Pixmap,
     shadow: &crate::BoxShadow,
@@ -6003,7 +7011,8 @@ fn paint_box_shadow(
     if w0 <= 0.0 || h0 <= 0.0 {
         return;
     }
-    let radius = border_radius.resolve(rect.width, rect.height).top_left;
+    let border_radii = border_radius.resolve(rect.width, rect.height);
+    let radius = border_radii.top_left;
     let rx0 = (radius.0 + spread).max(0.0);
     let ry0 = (radius.1 + spread).max(0.0);
     let blur = shadow.blur.max(0.0);
@@ -6018,41 +7027,83 @@ fn paint_box_shadow(
     if !rect_intersects_paint_surface(&shadow_bounds, pixmap, 1.0) {
         return;
     }
-    // Ancestor overflow clip is already the complete rect/rounded chain.
-    let mask = ancestor_clip;
+    let left = shadow_bounds.x.floor().max(0.0) as i32;
+    let top = shadow_bounds.y.floor().max(0.0) as i32;
+    let right = (shadow_bounds.x + shadow_bounds.width)
+        .ceil()
+        .min(pixmap.width() as f32) as i32;
+    let bottom = (shadow_bounds.y + shadow_bounds.height)
+        .ceil()
+        .min(pixmap.height() as f32) as i32;
+    let Some(mut shadow_pixmap) = Pixmap::new((right - left) as u32, (bottom - top) as u32) else {
+        return;
+    };
+    let local_rect = crate::Rect {
+        x: rect.x - left as f32,
+        y: rect.y - top as f32,
+        ..*rect
+    };
+    let Some(mut shadow_mask) = rounded_box_clip_mask_radii(
+            shadow_pixmap.width(),
+            shadow_pixmap.height(),
+            &local_rect,
+            border_radii,
+    ) else {
+        return;
+    };
+    shadow_mask.invert();
     let color = shadow.color;
     if blur < 0.5 {
         // No blur: a single crisp, offset (and spread) rounded rect.
-        fill_shadow_rect(pixmap, x0, y0, w0, h0, rx0, ry0, color, mask);
-        return;
-    }
-    let steps: u32 = (blur.ceil() as u32).clamp(2, 24);
-    // Per-layer alpha chosen so `steps` source-over composites reach the target
-    // alpha at the core: 1 - (1 - a)^steps == A  =>  a = 1 - (1 - A)^(1/steps).
-    let a_frac = color[3] as f32 / 255.0;
-    let per = 1.0 - (1.0 - a_frac).powf(1.0 / steps as f32);
-    let layer_alpha = (per * 255.0).round().clamp(1.0, 255.0) as u8;
-    let layer_color = [color[0], color[1], color[2], layer_alpha];
-    for j in 0..steps {
-        // j = 0 is the solid core (expansion 0); j = steps-1 reaches the blur
-        // radius. Larger rects paint first, smaller (more-covered) ones on top.
-        let e = blur * (j as f32) / ((steps - 1) as f32);
         fill_shadow_rect(
-            pixmap,
-            x0 - e,
-            y0 - e,
-            w0 + 2.0 * e,
-            h0 + 2.0 * e,
-            rx0 + e,
-            ry0 + e,
-            layer_color,
-            mask,
+            &mut shadow_pixmap,
+            x0 - left as f32,
+            y0 - top as f32,
+            w0,
+            h0,
+            rx0,
+            ry0,
+            color,
+            Some(&shadow_mask),
         );
+    } else {
+        let steps: u32 = (blur.ceil() as u32).clamp(2, 24);
+        // Per-layer alpha chosen so `steps` source-over composites reach the target
+        // alpha at the core: 1 - (1 - a)^steps == A  =>  a = 1 - (1 - A)^(1/steps).
+        let a_frac = color[3] as f32 / 255.0;
+        let per = 1.0 - (1.0 - a_frac).powf(1.0 / steps as f32);
+        let layer_alpha = (per * 255.0).round().clamp(1.0, 255.0) as u8;
+        let layer_color = [color[0], color[1], color[2], layer_alpha];
+        for j in 0..steps {
+            // j = 0 is the solid core (expansion 0); j = steps-1 reaches the blur
+            // radius. Larger rects paint first, smaller (more-covered) ones on top.
+            let e = blur * (j as f32) / ((steps - 1) as f32);
+            fill_shadow_rect(
+                &mut shadow_pixmap,
+                x0 - e - left as f32,
+                y0 - e - top as f32,
+                w0 + 2.0 * e,
+                h0 + 2.0 * e,
+                rx0 + e,
+                ry0 + e,
+                layer_color,
+                Some(&shadow_mask),
+            );
+        }
     }
+    // Ancestor overflow clip is already the complete rect/rounded chain.
+    pixmap.draw_pixmap(
+        left,
+        top,
+        shadow_pixmap.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        Transform::identity(),
+        ancestor_clip,
+    );
 }
 
 /// Fill one (possibly rounded) shadow rectangle with a flat color, optionally
-/// masked to an ancestor clip region. A helper for `paint_box_shadow`'s layers.
+/// constrained by an alpha mask. A helper for `paint_box_shadow`'s layers.
 fn fill_shadow_rect(
     pixmap: &mut Pixmap,
     x: f32,
@@ -6181,13 +7232,7 @@ pub fn screenshot_png_scrolled_at_animation_time(
     scroll: (f32, f32),
     animation_sample_time: crate::AnimationSampleTime,
 ) -> Option<Vec<u8>> {
-    paint_dom_scrolled_at_animation_time(
-        tree,
-        viewport,
-        base_url,
-        scroll,
-        animation_sample_time,
-    )
+    paint_dom_scrolled_at_animation_time(tree, viewport, base_url, scroll, animation_sample_time)
     .and_then(|pixmap| pixmap.encode_png().ok())
 }
 
@@ -6206,6 +7251,28 @@ pub fn screenshot_png_scrolled_at_animation_time_with_surface_color(
         scroll,
         animation_sample_time,
         surface_color,
+    )
+    .and_then(|pixmap| pixmap.encode_png().ok())
+}
+
+/// PNG wrapper for [`paint_dom_scrolled_at_animation_time_with_surface_color_and_resources`].
+pub fn screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+    surface_color: [u8; 4],
+    resources: &mut RenderResourceCache,
+) -> Option<Vec<u8>> {
+    paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        animation_sample_time,
+        surface_color,
+        resources,
     )
     .and_then(|pixmap| pixmap.encode_png().ok())
 }
@@ -6240,13 +7307,7 @@ pub fn screenshot_prepared_with_scroll_and_surface_color(
     scroll: &ResolvedScrollState,
     surface_color: [u8; 4],
 ) -> Option<Vec<u8>> {
-    paint_prepared_with_scroll_and_surface_color(
-        tree,
-        prepared,
-        resources,
-        scroll,
-        surface_color,
-    )?
+    paint_prepared_with_scroll_and_surface_color(tree, prepared, resources, scroll, surface_color)?
     .encode_png()
     .ok()
 }
@@ -6713,15 +7774,13 @@ fn draw_text(
                 if px >= 0 && px < width && py >= 0 && py < height {
                     let alpha = (a_full as f32 * c) as u8;
                     if alpha > 0 {
-                        let mut px_indices = vec![(py * width + px) as usize];
-                        if is_bold {
-                            for dx in 1..raster_scale.ceil().max(1.0) as i32 {
-                                if px + dx < width {
-                                    px_indices.push((py * width + px + dx) as usize);
-                                }
-                            }
-                        }
-                        for idx in px_indices {
+                        let spread = if is_bold {
+                            raster_scale.ceil().max(1.0) as i32
+                        } else {
+                            1
+                        };
+                        for dx in 0..spread.min(width - px) {
+                            let idx = (py * width + px + dx) as usize;
                             let mask_alpha = clip_mask
                                 .and_then(|mask| mask.data().get(idx))
                                 .copied()
@@ -6783,6 +7842,23 @@ fn fetch_bytes(
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
 ) -> Option<Arc<[u8]>> {
+    fetch_bytes_with_kind(src, base_url, cache, false)
+}
+
+fn fetch_font_bytes(
+    src: &str,
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+) -> Option<Arc<[u8]>> {
+    fetch_bytes_with_kind(src, base_url, cache, true)
+}
+
+fn fetch_bytes_with_kind(
+    src: &str,
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+    is_font: bool,
+) -> Option<Arc<[u8]>> {
     if let Some(rest) = src.strip_prefix("data:") {
         let comma_idx = rest.find(',')?;
         let (meta, data) = (&rest[..comma_idx], &rest[comma_idx + 1..]);
@@ -6798,7 +7874,7 @@ fn fetch_bytes(
         return Some(Arc::from(bytes));
     }
     let resolved = resolve_resource_url(src, base_url)?;
-    cache.get_or_load(&resolved)
+    cache.get_or_load(&resolved, is_font)
 }
 
 fn fetch_profiled_image_bytes(
@@ -6854,19 +7930,22 @@ fn collect_web_fonts(
     cache: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
 ) -> Vec<crate::inline::WebFont> {
+    struct FontRule {
+        sources: Vec<(String, String)>,
+        family: Option<String>,
+        weight: Option<(u16, u16)>,
+        italic: Option<bool>,
+    }
+
     let mut seen = std::collections::HashSet::new();
     let mut fonts = Vec::new();
     let mut rules = Vec::new();
 
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
-        let Some(node) = tree.get_node(nid) else {
-            continue;
-        };
-        if node
-            .as_element()
-            .map(|element| element.local.as_ref() != "style")
-            .unwrap_or(true)
-        {
+        // Inspect tags without copying unrelated script/text payloads.
+        if !tree.with_node(nid, |node| {
+            node.as_element().is_some_and(|element| element.local.as_ref() == "style")
+        }).unwrap_or(false) {
             continue;
         }
         let css = tree.text_content(nid);
@@ -6874,16 +7953,20 @@ fn collect_web_fonts(
             if !font_face_covers_ascii(face) {
                 continue;
             }
-            let Some(src) = font_face_urls(face).into_iter().next() else {
+            let sources: Vec<_> = font_face_urls(face)
+                .into_iter()
+                .filter(|src| font_source_may_be_supported(src))
+                .map(|src| (font_resource_key(&src, base_url), src))
+                .collect();
+            if sources.is_empty() {
                 continue;
-            };
-            rules.push((
-                font_resource_key(&src, base_url),
-                src,
-                font_face_family(face),
-                font_face_weight(face),
-                font_face_italic(face),
-            ));
+            }
+            rules.push(FontRule {
+                sources,
+                family: font_face_family(face),
+                weight: font_face_weight(face),
+                italic: font_face_italic(face),
+            });
         }
     }
     for face in dynamic_fonts {
@@ -6894,16 +7977,20 @@ fn collect_web_fonts(
         if !font_face_covers_ascii(&descriptor_block) {
             continue;
         }
-        let Some(src) = font_face_urls(&descriptor_block).into_iter().next() else {
+        let sources: Vec<_> = font_face_urls(&descriptor_block)
+            .into_iter()
+            .filter(|src| font_source_may_be_supported(src))
+            .map(|src| (font_resource_key(&src, base_url), src))
+            .collect();
+        if sources.is_empty() {
             continue;
-        };
-        rules.push((
-            font_resource_key(&src, base_url),
-            src,
-            (!face.family.is_empty()).then(|| face.family.clone()),
-            font_face_weight(&descriptor_block),
-            font_face_italic(&descriptor_block),
-        ));
+        }
+        rules.push(FontRule {
+            sources,
+            family: (!face.family.is_empty()).then(|| face.family.clone()),
+            weight: font_face_weight(&descriptor_block),
+            italic: font_face_italic(&descriptor_block),
+        });
     }
 
     // Critical web fonts are normally preloaded from the document with a URL
@@ -6911,26 +7998,22 @@ fn collect_web_fonts(
     // the matching @font-face descriptors needed for CSS family/weight lookup.
     let mut preloads = Vec::new();
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
-        let Some(node) = tree.get_node(nid) else {
-            continue;
-        };
-        if node
-            .as_element()
-            .map(|element| element.local.as_ref() != "link")
-            .unwrap_or(true)
-        {
-            continue;
-        }
-        let rel = node.get_attribute("rel").unwrap_or("");
-        let as_value = node.get_attribute("as").unwrap_or("");
-        if rel
-            .split_ascii_whitespace()
-            .any(|token| token.eq_ignore_ascii_case("preload"))
-            && as_value.eq_ignore_ascii_case("font")
-        {
-            if let Some(href) = node.get_attribute("href") {
-                preloads.push(href.to_string());
+        let preload = tree.with_node(nid, |node| {
+            if node.as_element()?.local.as_ref() != "link" {
+                return None;
             }
+            let rel = node.get_attribute("rel").unwrap_or("");
+            let as_value = node.get_attribute("as").unwrap_or("");
+            if rel.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case("preload"))
+                && as_value.eq_ignore_ascii_case("font")
+            {
+                node.get_attribute("href").map(str::to_owned)
+            } else {
+                None
+            }
+        }).flatten();
+        if let Some(href) = preload {
+            preloads.push(href);
         }
     }
     for src in preloads.iter().take(16) {
@@ -6939,33 +8022,52 @@ fn collect_web_fonts(
             continue;
         }
         if let Some(decoded) = fetch_and_decode_font(src, base_url, cache) {
-            let metadata = rules.iter().find(|rule| rule.0 == key);
+            let metadata = rules.iter().find(|rule| {
+                rule.sources
+                    .iter()
+                    .any(|(source_key, _)| *source_key == key)
+            });
             fonts.push(crate::inline::WebFont {
                 data: decoded,
-                family: metadata.and_then(|rule| rule.2.clone()),
-                weight: metadata.and_then(|rule| rule.3),
-                italic: metadata.and_then(|rule| rule.4),
+                family: metadata.and_then(|rule| rule.family.clone()),
+                weight: metadata.and_then(|rule| rule.weight),
+                italic: metadata.and_then(|rule| rule.italic),
             });
         }
     }
 
-    for (key, src, family, weight, italic) in rules {
+    for rule in rules {
         if fonts.len() >= 16 {
             break;
         }
-        if !seen.insert(key) {
-            continue;
-        }
-        if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
-            fonts.push(crate::inline::WebFont {
-                data: decoded,
-                family,
-                weight,
-                italic,
-            });
+        for (key, src) in rule.sources {
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
+                fonts.push(crate::inline::WebFont {
+                    data: decoded,
+                    family: rule.family,
+                    weight: rule.weight,
+                    italic: rule.italic,
+                });
+                break;
+            }
         }
     }
     fonts
+}
+
+/// Exclude source formats that fontdb cannot consume before issuing a request.
+/// Unknown and extensionless URLs are retained because their response bytes can
+/// still identify a supported sfnt, WOFF, or WOFF2 resource.
+fn font_source_may_be_supported(src: &str) -> bool {
+    let path = src
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(src)
+        .to_ascii_lowercase();
+    !path.ends_with(".eot") && !path.ends_with(".svg")
 }
 
 fn font_resource_key(src: &str, base_url: Option<&str>) -> String {
@@ -6984,17 +8086,23 @@ fn fetch_and_decode_font(
     src: &str,
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
-) -> Option<Vec<u8>> {
-    let compressed = fetch_bytes(src, base_url, cache)?;
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    let compressed = fetch_font_bytes(src, base_url, cache)?;
     if compressed.len() > 8 * 1024 * 1024 {
         return None;
     }
     let decoded = match compressed.get(..4) {
-        Some(b"wOF2") => wuff::decompress_woff2(&compressed).ok(),
-        Some(b"wOFF") => wuff::decompress_woff1(&compressed).ok(),
+        Some(b"wOF2") => wuff::decompress_woff2(&compressed)
+            .ok()
+            .map(std::sync::Arc::new),
+        Some(b"wOFF") => wuff::decompress_woff1(&compressed)
+            .ok()
+            .map(std::sync::Arc::new),
         // TrueType/OpenType collections and raw sfnt fonts already have the
         // representation fontdb expects.
-        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => Some(compressed.as_ref().to_vec()),
+        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => {
+            Some(std::sync::Arc::new(compressed.as_ref().to_vec()))
+        }
         _ => None,
     }?;
     (decoded.len() <= 32 * 1024 * 1024).then_some(decoded)
@@ -7055,13 +8163,14 @@ fn font_face_blocks(css: &str) -> Vec<&str> {
 fn font_face_declaration<'a>(face: &'a str, name: &str) -> Option<&'a str> {
     split_css_top_level(face, ';')
         .into_iter()
-        .find_map(|declaration| {
+        .filter_map(|declaration| {
             let (property, value) = declaration.split_once(':')?;
             property
                 .trim()
                 .eq_ignore_ascii_case(name)
                 .then_some(value.trim())
         })
+        .last()
 }
 
 fn font_face_family(face: &str) -> Option<String> {
@@ -7206,6 +8315,7 @@ fn split_css_top_level(value: &str, separator: char) -> Vec<&str> {
 /// retry the rate-limited images (e.g. an infobox photo montage fetched late in
 /// the burst) came back blank, and the failure was cached permanently. The
 /// backoff both recovers them and paces the burst back under the limit.
+#[cfg(feature = "native-resource-loader")]
 fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
     let mut backoff = std::time::Duration::from_millis(200);
     for attempt in 0..3 {
@@ -7231,6 +8341,12 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
                 std::thread::sleep(backoff);
                 backoff *= 2;
             }
+            // A resolution failure is not transient at this timescale, and it
+            // is also how the SSRF guard below refuses a host: never sleep
+            // through the backoff for a request that will not be made.
+            Err(ureq::Error::Transport(err)) if err.kind() == ureq::ErrorKind::Dns => {
+                return None;
+            }
             Err(ureq::Error::Transport(_)) if attempt < 2 => {
                 std::thread::sleep(backoff);
                 backoff *= 2;
@@ -7247,6 +8363,7 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
 /// old per-call `ureq::get`) reads as a burst and gets 429'd, whereas reusing
 /// one pooled connection to the same host (as a browser does) both avoids most
 /// throttling and is much faster on an image-heavy page.
+#[cfg(feature = "native-resource-loader")]
 fn image_agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT.get_or_init(|| {
@@ -7258,8 +8375,44 @@ fn image_agent() -> &'static ureq::Agent {
             // cnbc, techcrunch, arstechnica), so the images Chrome loads came
             // back blank; a real browser UA loads the same bytes Chrome does.
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+            .resolver(SsrfGuardResolver)
             .build()
     })
+}
+
+/// The renderer's copy of the SSRF gate every page transport applies. This
+/// loader only runs for standalone callers (the `paint_file` tool, library
+/// users rendering a bare DOM, a JS runtime with no page transport); a
+/// page-owned runtime is cache-only and fetches through `obscura-net`, which
+/// has its own resolver. Checking at resolution time covers literal
+/// addresses, names that resolve to a private address (DNS rebinding), and
+/// every redirect hop, since ureq resolves each connection through here.
+/// `OBSCURA_ALLOW_PRIVATE_NETWORK` lifts the restriction, as it does for the
+/// transports; the renderer has no per-context flag to consult.
+#[cfg(feature = "native-resource-loader")]
+struct SsrfGuardResolver;
+
+#[cfg(feature = "native-resource-loader")]
+impl ureq::Resolver for SsrfGuardResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+        if !obscura_ssrf::env_allows_private_network() {
+            if let Some(bad) = addrs
+                .iter()
+                .find(|addr| obscura_ssrf::is_forbidden_ip(addr.ip()))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "SSRF blocked: '{netloc}' resolves to forbidden address {}",
+                        bad.ip()
+                    ),
+                ));
+            }
+        }
+        Ok(addrs)
+    }
 }
 
 /// Decode a percent-escaped data: URI payload (`%23` -> `#`, etc). Bytes that
@@ -7290,11 +8443,77 @@ fn percent_decode(s: &str) -> Vec<u8> {
     out
 }
 
+/// Largest intermediate raster, in pixels, that painting one image or mask may
+/// allocate (256 MiB of RGBA, the same budget as a canvas surface). CSS sizes
+/// the destination box, so without a cap a 1x1 image styled 30000px square
+/// allocated ~3.6 GB in the resize.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_IMAGE_RASTER_PIXELS: u64 = 64 * 1024 * 1024;
+/// The WASM module's whole linear memory is capped at 256 MiB, so the native
+/// budget alone would exhaust it and trap. Use the capture budget (64 MiB of
+/// RGBA) instead; the oversized raster is still scaled up on draw.
+#[cfg(target_arch = "wasm32")]
+const MAX_IMAGE_RASTER_PIXELS: u64 = MAX_CAPTURE_PIXELS;
+
+/// The raster size for a `w`x`h` destination: unchanged within the budget,
+/// otherwise scaled down uniformly (each side at least 1px) so the caller can
+/// scale it back up on draw. Real images are far below the budget and stay
+/// pixel-exact.
+fn bounded_raster_size(w: u32, h: u32) -> (u32, u32) {
+    let area = w as u64 * h as u64;
+    if area <= MAX_IMAGE_RASTER_PIXELS {
+        return (w, h);
+    }
+    let scale = (MAX_IMAGE_RASTER_PIXELS as f64 / area as f64).sqrt();
+    let rw = ((w as f64 * scale).floor() as u32).clamp(1, w);
+    let rh = ((h as f64 * scale).floor() as u32).clamp(1, h);
+    // A side clamped up to 1px must not let the other side overrun the budget.
+    let rw = rw.min((MAX_IMAGE_RASTER_PIXELS / rh as u64).max(1) as u32);
+    let rh = rh.min((MAX_IMAGE_RASTER_PIXELS / rw as u64).max(1) as u32);
+    (rw, rh)
+}
+
+// Formats that cannot animate, plus PNG only after its decoder explicitly
+// excludes APNG. Unknown formats, GIF and WebP retain the existing path.
+fn static_raster_cacheable(bytes: &[u8]) -> bool {
+    match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Jpeg | image::ImageFormat::Bmp | image::ImageFormat::Ico) => true,
+        Ok(image::ImageFormat::Png) => image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes))
+            .ok().and_then(|decoder| decoder.is_apng().ok()) == Some(false),
+        _ => false,
+    }
+}
+
 /// Decode raster image bytes (GIF/JPEG/PNG/WebP) to a premultiplied-alpha pixmap
 /// resized to `w`x`h`.
 fn raster_to_pixmap(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
-    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let resized = image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle);
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let resized = match decoded {
+        // JPEGs and ordinary RGB PNGs do not need a full source-sized RGBA
+        // copy just to add an opaque alpha channel. Resize their three color
+        // channels first, release the large source, then expand only the
+        // destination. Keep every alpha-bearing and higher-depth format on
+        // the established RGBA-first path so its sampling remains unchanged.
+        image::DynamicImage::ImageRgb8(source) => {
+            let resized = image::imageops::resize(
+                &source,
+                w,
+                h,
+                image::imageops::FilterType::Triangle,
+            );
+            drop(source);
+            image::DynamicImage::ImageRgb8(resized).into_rgba8()
+        }
+        decoded => {
+            let source = decoded.into_rgba8();
+            image::imageops::resize(
+                &source,
+                w,
+                h,
+                image::imageops::FilterType::Triangle,
+            )
+        }
+    };
     let mut raw = resized.into_raw();
     for pixel in raw.chunks_exact_mut(4) {
         let a = pixel[3] as u32;
@@ -8403,9 +9622,7 @@ fn paint_in_flow_generated_box(
         Some(clip) => ink.intersect(&clip),
         None => Some(ink),
     };
-    if !visible_ink
-        .is_some_and(|ink| rect_intersects_paint_surface(&ink, pixmap, raster_scale))
-    {
+    if !visible_ink.is_some_and(|ink| rect_intersects_paint_surface(&ink, pixmap, raster_scale)) {
         return;
     }
     let ancestor_clip_mask = overflow_clip.as_ref().and_then(|clip| {
@@ -8442,7 +9659,7 @@ fn paint_in_flow_generated_box(
     let background_path = background_clip_path(background);
     let element_clip_mask =
         background_extra_clip(ancestor_clip_mask.as_ref(), clip_path_mask.as_ref());
-    let background_mask = element_clip_mask.clone();
+    let background_mask = &element_clip_mask;
     if style.mask_image.is_none() && !style.background_clip_text {
         if let (Some(color), Some(path)) = (style.background_color, background_path.as_ref()) {
             let mut paint = Paint::default();
@@ -8657,8 +9874,7 @@ fn paint_positioned_pseudo(
         width,
         height,
     };
-    let ancestor_clip = ancestor_overflow_clip
-        .map(|clip| clip.viewport_rect(clip_extent));
+    let ancestor_clip = ancestor_overflow_clip.map(|clip| clip.viewport_rect(clip_extent));
     let visible = match ancestor_clip {
         Some(clip) => rect.intersect(&clip),
         None => Some(rect),
@@ -8667,9 +9883,8 @@ fn paint_positioned_pseudo(
     if !rect_intersects_paint_surface(&non_text_ink_bounds(&rect, style), pixmap, raster_scale) {
         return;
     }
-    let ancestor_clip_mask = ancestor_overflow_clip.and_then(|clip| {
-        overflow_clip_mask(pixmap.width(), pixmap.height(), clip, clip_extent)
-    });
+    let ancestor_clip_mask = ancestor_overflow_clip
+        .and_then(|clip| overflow_clip_mask(pixmap.width(), pixmap.height(), clip, clip_extent));
     let radius = style.border_model.radii.resolve(rect.width, rect.height);
     let clip_path_mask = style.clip_path.as_ref().and_then(|polygon| {
         polygon_clip_mask(
@@ -8686,7 +9901,7 @@ fn paint_positioned_pseudo(
     let background_path = background_clip_path(background);
     let element_clip_mask =
         background_extra_clip(ancestor_clip_mask.as_ref(), clip_path_mask.as_ref());
-    let background_mask = element_clip_mask.clone();
+    let background_mask = &element_clip_mask;
     if style.mask_image.is_none() && !style.background_clip_text {
         if let (Some(color), Some(path)) = (style.background_color, background_path.as_ref()) {
             let mut paint = Paint::default();
@@ -8886,33 +10101,32 @@ fn collect_image_intrinsics(
     HashMap<obscura_dom::tree::NodeId, crate::ReplacedIntrinsic>,
     HashMap<obscura_dom::tree::NodeId, SelectedImage>,
 ) {
+    enum Source {
+        Image,
+        VideoPoster(String),
+    }
     let mut out = std::collections::HashMap::new();
     let mut selected = HashMap::new();
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
-        let Some(node) = tree.get_node(nid) else {
-            continue;
-        };
-        let Some(element) = node.as_element() else {
-            continue;
-        };
-        let (url, density) = match element.local.as_ref() {
-            "img" => {
+        let source = tree.with_node(nid, |node| {
+            match node.as_element()?.local.as_ref() {
+                "img" => Some(Source::Image),
+                "video" => node.get_attribute("poster").map(str::trim)
+                    .filter(|poster| !poster.is_empty())
+                    .map(|poster| Source::VideoPoster(poster.to_owned())),
+                _ => None,
+            }
+        }).flatten();
+        // Release the scoped borrow before responsive selection reads the tree.
+        let (url, density) = match source {
+            Some(Source::Image) => {
                 let Some(candidate) = resolve_img_url(tree, nid, viewport) else {
                     continue;
                 };
                 candidate
             }
-            "video" => {
-                let Some(poster) = node.get_attribute("poster") else {
-                    continue;
-                };
-                let poster = poster.trim();
-                if poster.is_empty() {
-                    continue;
-                }
-                (poster.to_string(), 1.0)
-            }
-            _ => continue,
+            Some(Source::VideoPoster(poster)) => (poster, 1.0),
+            None => continue,
         };
         let resolved_url = resolve_resource_url(&url, base_url).unwrap_or(url);
         let profile = image_request_profile(tree, nid);
@@ -8924,10 +10138,7 @@ fn collect_image_intrinsics(
                 profile,
             },
         );
-        let Some(bytes) = fetch_profiled_image_bytes(&resolved_url, None, cache, profile) else {
-            continue;
-        };
-        if let Some(mut intrinsic) = image_intrinsic_metadata(&bytes) {
+        if let Some(mut intrinsic) = cache.profiled_image_intrinsic(&resolved_url, profile) {
             // A 2x (or w-descriptor) candidate's raw pixels are density times
             // its CSS size. A ratio is dimensionless and remains unchanged.
             intrinsic.width = intrinsic.width.map(|width| width / density);
@@ -8955,13 +10166,9 @@ fn collect_content_image_intrinsics(
     let mut changed = false;
     let mut active = HashSet::new();
     for (&nid, style) in styles {
-        let Some(node) = tree.get_node(nid) else {
-            continue;
-        };
-        if node
-            .as_element()
-            .map_or(true, |name| name.local.as_ref() != "img")
-        {
+        if !tree.with_node(nid, |node| {
+            node.as_element().is_some_and(|name| name.local.as_ref() == "img")
+        }).unwrap_or(false) {
             continue;
         }
         let Some(url) = style.content_image.as_deref() else {
@@ -9312,11 +10519,9 @@ fn paint_canvas_surface(
         pixel[1] = ((pixel[1] as u32 * alpha + 127) / 255) as u8;
         pixel[2] = ((pixel[2] as u32 * alpha + 127) / 255) as u8;
     }
-    let Some(content) = tiny_skia::PixmapRef::from_bytes(
-        &premultiplied,
-        surface.width,
-        surface.height,
-    ) else {
+    let Some(content) =
+        tiny_skia::PixmapRef::from_bytes(&premultiplied, surface.width, surface.height)
+    else {
         return false;
     };
 
@@ -9421,9 +10626,20 @@ fn paint_image(
     if !rect_intersects_paint_surface(visible_rect, pixmap, 1.0) {
         return false;
     }
-    let bytes = match profile {
-        Some(profile) => fetch_profiled_image_bytes(src, base_url, cache, profile),
-        None => fetch_bytes(src, base_url, cache),
+    // Resolve once for both the byte lookup and the raster-cache identity.
+    // Data URLs retain their existing uncached decoding path.
+    let resolved = if src.starts_with("data:") {
+        None
+    } else {
+        resolve_resource_url(src, base_url)
+    };
+    let bytes = if src.starts_with("data:") {
+        fetch_bytes(src, base_url, cache)
+    } else {
+        resolved.as_deref().and_then(|url| match profile {
+            Some(profile) => cache.get_or_load_image(url, profile),
+            None => cache.get_or_load(url, false),
+        })
     };
     let Some(bytes) = bytes else {
         return false;
@@ -9443,9 +10659,7 @@ fn paint_image(
             image_dimensions(&bytes).map(|(w, h)| (w as f32, h as f32))
         };
         match intrinsic {
-            Some((iw, ih)) => {
-                object_fit_dest_positioned(rect, iw, ih, object_fit, object_position)
-            }
+            Some((iw, ih)) => object_fit_dest_positioned(rect, iw, ih, object_fit, object_position),
             None => *rect,
         }
     };
@@ -9454,10 +10668,22 @@ fn paint_image(
         dest.width.round().max(1.0) as u32,
         dest.height.round().max(1.0) as u32,
     );
+    // CSS sizes the destination; rasterize within the budget and scale the
+    // result up on draw when the destination is larger.
+    let (rw, rh) = bounded_raster_size(dw, dh);
     let content = if svg {
-        render_svg(&bytes, dw, dh)
+        render_svg(&bytes, rw, rh).map(Arc::new)
+    } else if !src.starts_with("data:") {
+        let key = resolved.map(|url| match profile {
+            Some(profile) => image_resource_key(&url, profile),
+            None => network_resource_url(&url),
+        });
+        match key {
+            Some(key) => cache.raster_paint(&key, bytes, rw, rh),
+            None => raster_to_pixmap(&bytes, rw, rh).map(Arc::new),
+        }
     } else {
-        raster_to_pixmap(&bytes, dw, dh)
+        raster_to_pixmap(&bytes, rw, rh).map(Arc::new)
     };
     let Some(content) = content else { return false };
 
@@ -9509,25 +10735,37 @@ fn paint_image(
             _ => {}
         }
     }
-    pixmap.draw_pixmap(
-        dest.x as i32,
-        dest.y as i32,
-        content.as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        transform
-            .map(|transform| {
-                Transform::from_row(
-                    transform.a,
-                    transform.b,
-                    transform.c,
-                    transform.d,
-                    transform.e,
-                    transform.f,
-                )
-            })
-            .unwrap_or_else(Transform::identity),
-        clip.as_ref(),
-    );
+    let base = transform
+        .map(|transform| {
+            Transform::from_row(
+                transform.a,
+                transform.b,
+                transform.c,
+                transform.d,
+                transform.e,
+                transform.f,
+            )
+        })
+        .unwrap_or_else(Transform::identity);
+    if (rw, rh) == (dw, dh) {
+        pixmap.draw_pixmap(
+            dest.x as i32,
+            dest.y as i32,
+            content.as_ref().as_ref(),
+            &tiny_skia::PixmapPaint::default(),
+            base,
+            clip.as_ref(),
+        );
+    } else {
+        let paint = tiny_skia::PixmapPaint {
+            quality: tiny_skia::FilterQuality::Bilinear,
+            ..tiny_skia::PixmapPaint::default()
+        };
+        let scaled = base
+            .pre_translate(dest.x as i32 as f32, dest.y as i32 as f32)
+            .pre_scale(dw as f32 / rw as f32, dh as f32 / rh as f32);
+        pixmap.draw_pixmap(0, 0, content.as_ref().as_ref(), &paint, scaled, clip.as_ref());
+    }
     true
 }
 
@@ -9618,7 +10856,9 @@ fn svg_image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic
             // subset whose quoted declarations may themselves contain `>`.
             let mut quote = None;
             let mut subset_depth = 0usize;
-            let end = remaining.char_indices().find_map(|(index, ch)| match quote {
+            let end = remaining
+                .char_indices()
+                .find_map(|(index, ch)| match quote {
                 Some(open) if ch == open => {
                     quote = None;
                     None
@@ -9742,8 +10982,11 @@ fn svg_image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic
             .map(str::parse::<f32>)
             .collect::<Result<Vec<_>, _>>()
             .ok()?;
-        (values.len() == 4 && values[2].is_finite() && values[3].is_finite()
-            && values[2] > 0.0 && values[3] > 0.0)
+        (values.len() == 4
+            && values[2].is_finite()
+            && values[3].is_finite()
+            && values[2] > 0.0
+            && values[3] > 0.0)
             .then_some(values[2] / values[3])
     });
     let ratio = match (width, height) {
@@ -9858,10 +11101,7 @@ fn cached_overflow_clip_mask(
     // `clip_scope_root` can synthesize a temporary rounded chain. Keeping its
     // root Arc alongside the pointer-based key prevents allocator reuse from
     // making a later, different chain alias this entry during the same paint.
-    cache.insert(
-        key,
-        (clip.rounded_chain().cloned(), Arc::clone(&mask)),
-    );
+    cache.insert(key, (clip.rounded_chain().cloned(), Arc::clone(&mask)));
     Some(mask)
 }
 
@@ -10013,6 +11253,15 @@ fn svg_font_database() -> std::sync::Arc<usvg::fontdb::Database> {
             FONT_BOLD_OBLIQUE_BYTES,
             SERIF_FONT_BYTES,
             MONO_FONT_BYTES,
+            // The Liberation families stop at Latin/Greek/Cyrillic: an SVG
+            // text run with a symbol glyph (★/U+2605 and friends) had no face
+            // covering it anywhere in the database, so usvg's per-glyph
+            // fallback dropped the glyph and warned per character (#701).
+            // DejaVu Sans is the same embedded broad-coverage face the HTML
+            // engine already keeps for `system-ui`; family selection is
+            // unchanged (Liberation stays the sans/serif/mono default), it
+            // only extends what the fallback search can find.
+            SYSTEM_FONT_BYTES,
         ] {
             database.load_font_data(bytes.to_vec());
         }
@@ -10036,7 +11285,7 @@ fn svg_font_database_with_web_fonts(
     // is the cost of keeping the rasterizer and layout engine deterministic.
     let mut database = (*base).clone();
     for font in web_fonts {
-        database.load_font_data(font.data.clone());
+        database.load_font_data(font.data.as_ref().clone());
     }
     std::sync::Arc::new(database)
 }
@@ -10045,10 +11294,11 @@ fn has_inline_svg_text(tree: &DomTree) -> bool {
     crate::dom::rendered_descendants(tree, tree.document())
         .into_iter()
         .any(|nid| {
-        tree.get_node(nid).is_some_and(|node| {
-            node.as_element()
-                .is_some_and(|name| matches!(name.local.as_ref(), "text" | "tspan" | "textPath"))
-        })
+            tree.with_node(nid, |node| {
+                node.as_element().is_some_and(|name| {
+                    matches!(name.local.as_ref(), "text" | "tspan" | "textPath")
+                })
+            }).unwrap_or(false)
         })
 }
 
@@ -10288,11 +11538,9 @@ fn serialize_svg_node(
                 let properties = custom_properties
                     .and_then(|all| all.get(&nid))
                     .map_or(&empty, std::rc::Rc::as_ref);
-                let Some(resolved) = resolve_svg_presentation_value(
-                    aname,
-                    attr.value.as_ref(),
-                    properties,
-                ) else {
+                let Some(resolved) =
+                    resolve_svg_presentation_value(aname, attr.value.as_ref(), properties)
+                else {
                     // A var() failure makes the declaration invalid at
                     // computed value time. Omitting this low-specificity
                     // presentation attribute lets usvg apply the property's
@@ -10709,10 +11957,7 @@ fn inject_external_sprites(
         let properties = custom_properties
             .and_then(|all| all.get(&root))
             .map_or(&empty, std::rc::Rc::as_ref);
-        defs.push_str(&resolve_svg_markup_presentation_vars(
-            &symbol,
-            properties,
-        ));
+        defs.push_str(&resolve_svg_markup_presentation_vars(&symbol, properties));
         rewrites.push((href.clone(), format!("#{frag}")));
     }
     if defs.is_empty() {
@@ -10789,10 +12034,7 @@ fn resolve_svg_tag_presentation_vars(
     properties: &std::collections::HashMap<String, String>,
 ) -> String {
     let bytes = tag.as_bytes();
-    if bytes.len() < 3
-        || bytes[0] != b'<'
-        || matches!(bytes[1], b'/' | b'!' | b'?')
-    {
+    if bytes.len() < 3 || bytes[0] != b'<' || matches!(bytes[1], b'/' | b'!' | b'?') {
         return tag.to_string();
     }
     let mut cursor = 1;
@@ -11075,10 +12317,12 @@ fn paint_mask(
     let (tile_width, tile_height) = mask_size
         .map(|(width, height)| (width.max(1.0).ceil() as u32, height.max(1.0).ceil() as u32))
         .unwrap_or((box_width, box_height));
+    // CSS sizes the tile; rasterize it within the budget and sample it scaled.
+    let (mask_width, mask_height) = bounded_raster_size(tile_width, tile_height);
     let mask = if is_svg(&bytes) {
-        render_svg(&bytes, tile_width, tile_height)
+        render_svg(&bytes, mask_width, mask_height)
     } else {
-        raster_to_pixmap(&bytes, tile_width, tile_height)
+        raster_to_pixmap(&bytes, mask_width, mask_height)
     };
     let Some(mask) = mask else { return false };
 
@@ -11090,20 +12334,44 @@ fn paint_mask(
     let normalized_linear = linear_gradient.map(|(_, stops)| normalized_stops(stops));
     let normalized_conic = conic_gradient.map(|(_, _, stops)| normalized_stops(stops));
     let normalized_radial = radial_gradient.map(|(_, stops)| normalized_stops(stops));
-    let Some(mut recolored) = Pixmap::new(box_width, box_height) else {
+    // The recolored box is drawn untransformed, so only its part inside the
+    // paint surface can show. Recolor just that window instead of the whole
+    // CSS-sized box.
+    let origin_x = rect.x.floor() as i64;
+    let origin_y = rect.y.floor() as i64;
+    let x0 = (-origin_x).clamp(0, box_width as i64) as u32;
+    let x1 = (pixmap.width() as i64 - origin_x).clamp(0, box_width as i64) as u32;
+    let y0 = (-origin_y).clamp(0, box_height as i64) as u32;
+    let y1 = (pixmap.height() as i64 - origin_y).clamp(0, box_height as i64) as u32;
+    if x0 >= x1 || y0 >= y1 {
+        return false;
+    }
+    let window_width = x1 - x0;
+    let Some(mut recolored) = Pixmap::new(window_width, y1 - y0) else {
         return false;
     };
-    for y in 0..box_height {
+    let scale_to_mask = |tile: u32, tile_len: u32, mask_len: u32| {
+        if mask_len == tile_len {
+            tile
+        } else {
+            (tile as u64 * mask_len as u64 / tile_len as u64) as u32
+        }
+    };
+    for y in y0..y1 {
         if !repeat.1 && y >= tile_height {
             continue;
         }
         let tile_y = if repeat.1 { y % tile_height } else { y };
-        for x in 0..box_width {
+        let mask_y = scale_to_mask(tile_y, tile_height, mask_height);
+        for x in x0..x1 {
             if !repeat.0 && x >= tile_width {
                 continue;
             }
             let tile_x = if repeat.0 { x % tile_width } else { x };
-            let coverage = mask.pixels()[(tile_y * tile_width + tile_x) as usize].alpha() as u32;
+            let mask_x = scale_to_mask(tile_x, tile_width, mask_width);
+            let coverage = mask.pixels()
+                [mask_y as usize * mask_width as usize + mask_x as usize]
+                .alpha() as u32;
             if coverage == 0 {
                 continue;
             }
@@ -11135,7 +12403,8 @@ fn paint_mask(
                 fill
             };
             color[3] = ((color[3] as u32 * coverage) / 255) as u8;
-            recolored.pixels_mut()[(y * box_width + x) as usize] = premultiplied(color);
+            recolored.pixels_mut()[((y - y0) * window_width + (x - x0)) as usize] =
+                premultiplied(color);
         }
     }
     let mut clip = extra_clip.cloned();
@@ -11157,8 +12426,8 @@ fn paint_mask(
         }
     }
     pixmap.draw_pixmap(
-        rect.x.floor() as i32,
-        rect.y.floor() as i32,
+        (origin_x + x0 as i64) as i32,
+        (origin_y + y0 as i64) as i32,
         recolored.as_ref(),
         &tiny_skia::PixmapPaint::default(),
         Transform::identity(),
@@ -11173,6 +12442,138 @@ mod tests {
     use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
+
+    #[test]
+    fn hit_testing_excludes_bottom_and_right_box_edges() {
+        for placement in ["left:10px;top:10px", "left:0;top:0;transform:translate(10px,10px)"] {
+            let tree = parse_html(&format!(r#"<style>
+                body {{margin:0}}
+                #under {{position:absolute;left:0;top:0;width:100px;height:100px}}
+                #over {{position:absolute;{placement};width:20px;height:20px;z-index:2}}
+                </style><div id="under"></div><div id="over"></div>"#));
+            let mut cache = RenderResourceCache::default();
+            let prepared = prepare_dom(&tree, (800.0, 600.0), None, &mut cache).unwrap();
+            let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+            let under = tree.get_element_by_id("under").unwrap();
+            let over = tree.get_element_by_id("over").unwrap();
+            for (x, y, expected) in [
+                (10.0, 20.0, over), (20.0, 10.0, over),
+                (29.999, 20.0, over), (20.0, 29.999, over),
+                (30.0, 20.0, under), (20.0, 30.0, under), (30.0, 30.0, under),
+            ] {
+                assert_eq!(prepared.hit_test(&tree, &scroll, x, y), Some(expected),
+                    "{placement}, point ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn absolute_inline_control_preserves_static_position_and_hit_target() {
+        for (name, display, children, input_rules, x, y) in [
+            ("before inline", "block", "<input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 0.0),
+            ("after inline", "block", "<label for='control'></label><input id='control' type='checkbox'>", "", 32.0, 0.0),
+            ("between inlines", "block", "<label for='control'></label><input id='control' type='checkbox'><label for='control'></label>", "", 32.0, 0.0),
+            ("after block", "block", "<div style='height:16px'></div><input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 16.0),
+            ("explicit insets", "block", "<input id='control' type='checkbox'><label for='control'></label>", "top:0;left:0", 0.0, 0.0),
+            ("authored block", "block", "<input id='control' type='checkbox'><label for='control'></label>", "display:block", 0.0, 0.0),
+            ("flex control", "flex", "<input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 0.0),
+            ("grid control", "grid", "<input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 0.0),
+        ] {
+            let tree = parse_html(&format!(r#"<!doctype html><style>
+                html,body {{margin:0}}
+                #switch {{position:relative;width:80px;height:48px;display:{display};line-height:1}}
+                input {{position:absolute;width:32px;height:16px;opacity:0;z-index:-1000;margin:0;{input_rules}}}
+                label {{display:inline-block;box-sizing:border-box;width:32px;height:16px;border:1px solid}}
+                </style><div id="switch">{children}</div>"#));
+            let mut cache = RenderResourceCache::default();
+            let prepared = prepare_dom(&tree, (800.0, 600.0), None, &mut cache).unwrap();
+            let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+            let label = tree.query_selector("label").unwrap().unwrap();
+            let input = tree.get_element_by_id("control").unwrap();
+            assert_eq!(prepared.layout.rects[&label].height, 16.0);
+            assert_eq!(prepared.layout.rects[&input].height, 16.0);
+            assert_eq!(prepared.layout.rects[&input].x, x, "{name}");
+            assert_eq!(prepared.layout.rects[&input].y, y, "{name}");
+            let rect = prepared.layout.rects[&label];
+            assert_eq!(prepared.hit_test(&tree, &scroll, rect.x + 16.0, rect.y + 8.0), Some(label), "{name}");
+        }
+    }
+
+    // #1019: a near-singular transform over content far larger than the viewport
+    // makes one element's transform layer unallocatable. It must skip that
+    // element, not abort the whole page paint.
+    #[test]
+    fn oversized_transform_layer_does_not_abort_the_whole_paint() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0;background:white">
+                <div style="transform:rotate(45deg) scale(0.001)">
+                    <div style="position:absolute;width:100000px;height:100000px;background:red"></div>
+                </div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (100.0, 100.0), None);
+        assert!(
+            pixmap.is_some(),
+            "a pathological transform layer must not abort the entire page paint"
+        );
+    }
+
+    // A 1x1 opaque black PNG.
+    const BLACK_PIXEL_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+
+    // CSS sizes an image's destination box, so the intermediate raster must not
+    // scale with it: a huge destination is rasterized within the budget.
+    #[test]
+    fn bounded_raster_size_caps_css_sized_destinations() {
+        assert_eq!(bounded_raster_size(640, 480), (640, 480));
+        for (w, h) in [(30_000, 30_000), (u32::MAX, 1), (1, u32::MAX), (200_000, 3)] {
+            let (rw, rh) = bounded_raster_size(w, h);
+            assert!(rw >= 1 && rh >= 1 && rw <= w && rh <= h, "{w}x{h} -> {rw}x{rh}");
+            assert!(
+                rw as u64 * rh as u64 <= MAX_IMAGE_RASTER_PIXELS,
+                "{w}x{h} -> {rw}x{rh} exceeds the raster budget"
+            );
+        }
+        // A square destination stays square.
+        let (rw, rh) = bounded_raster_size(30_000, 30_000);
+        assert_eq!(rw, rh);
+    }
+
+    #[test]
+    fn huge_image_destination_still_paints_its_visible_part() {
+        let tree = parse_html(&format!(
+            r#"<html><body style="margin:0;background:white">
+                <img src="{BLACK_PIXEL_PNG}" style="display:block;width:30000px;height:30000px">
+            </body></html>"#
+        ));
+        let pixmap = paint_dom(&tree, (64.0, 64.0), None).expect("paint");
+        let px = pixmap.pixel(10, 10).unwrap();
+        assert_eq!((px.red(), px.green(), px.blue(), px.alpha()), (0, 0, 0, 255));
+    }
+
+    #[test]
+    fn huge_mask_box_still_paints_its_visible_part() {
+        // The mask tile is transparent on its left half, so the mask path (not a
+        // plain background fill) decides every visible pixel of the huge box.
+        let tree = parse_html(
+            r#"<html><head><style>
+                body { margin:0; background:white }
+                #masked {
+                  width:30000px; height:30000px; background-color:rgb(255,0,0);
+                  mask-image:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='10'%20height='10'%3E%3Crect%20x='5'%20width='5'%20height='10'%20fill='white'/%3E%3C/svg%3E");
+                  mask-size:10px 10px; mask-repeat:repeat;
+                }
+            </style></head><body><div id="masked"></div></body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (64.0, 64.0), None).expect("paint");
+        let rgba = |x, y| {
+            let px = pixmap.pixel(x, y).unwrap();
+            (px.red(), px.green(), px.blue(), px.alpha())
+        };
+        assert_eq!(rgba(2, 2), (255, 255, 255, 255), "masked-out column");
+        assert_eq!(rgba(7, 2), (255, 0, 0, 255), "masked-in column");
+        assert_eq!(rgba(57, 42), (255, 0, 0, 255), "repeats across the window");
+    }
 
     #[test]
     fn native_shadow_flat_tree_paints_shadow_and_slotted_content_only() {
@@ -11196,6 +12597,174 @@ mod tests {
         assert!(blue.blue() > 240 && blue.red() < 20 && blue.green() < 20);
         assert!(red.red() > 240 && red.green() < 20 && red.blue() < 20);
         assert!(yellow.red() > 240 && yellow.green() > 240 && yellow.blue() < 20);
+    }
+
+    #[test]
+    fn outset_box_shadow_stays_outside_transparent_and_opaque_border_boxes() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;background:white">
+                <div style="position:absolute;left:20px;top:20px;width:40px;height:30px;
+                            box-shadow:4px 4px 0 black"></div>
+                <div style="position:absolute;left:100px;top:20px;width:40px;height:30px;
+                            background:rgb(0,255,0);box-shadow:4px 4px 0 black"></div>
+                <div style="position:absolute;left:20px;top:70px;width:40px;height:30px;
+                            border-radius:12px;box-shadow:0 0 0 4px black"></div>
+                <div style="position:absolute;left:100px;top:70px;width:40px;height:30px;
+                            box-shadow:2px 2px 3px rgb(51,51,51)"></div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (160.0, 120.0), None).expect("box shadow paint");
+
+        let transparent_center = pixmap.pixel(35, 35).expect("transparent center");
+        assert_eq!(
+            (
+                transparent_center.red(),
+                transparent_center.green(),
+                transparent_center.blue(),
+            ),
+            (255, 255, 255),
+            "an outset shadow must not cover a transparent border box"
+        );
+        let offset_gap = pixmap.pixel(21, 35).expect("offset gap");
+        assert_eq!(
+            (offset_gap.red(), offset_gap.green(), offset_gap.blue()),
+            (255, 255, 255),
+            "the clip must not turn the shadow and border-box paths into a symmetric difference"
+        );
+        let shadow_edge = pixmap.pixel(62, 35).expect("shadow edge");
+        assert!(
+            shadow_edge.red() < 10 && shadow_edge.green() < 10 && shadow_edge.blue() < 10,
+            "shadow ink must remain outside the border box: {shadow_edge:?}"
+        );
+        let opaque_center = pixmap.pixel(115, 35).expect("opaque center");
+        assert!(
+            opaque_center.green() > 245 && opaque_center.red() < 10 && opaque_center.blue() < 10,
+            "opaque backgrounds must continue to cover the shadow: {opaque_center:?}"
+        );
+        let rounded_corner = pixmap.pixel(21, 71).expect("rounded corner shadow");
+        assert!(
+            rounded_corner.red() < 10 && rounded_corner.green() < 10 && rounded_corner.blue() < 10,
+            "the hole must follow the rounded border box rather than its rectangular bounds: {rounded_corner:?}"
+        );
+        let blurred_center = pixmap.pixel(115, 85).expect("blurred center");
+        assert_eq!(
+            (
+                blurred_center.red(),
+                blurred_center.green(),
+                blurred_center.blue(),
+            ),
+            (255, 255, 255),
+            "blurred outset shadows must keep the border-box interior transparent"
+        );
+        let blurred_edge = pixmap.pixel(142, 85).expect("blurred edge");
+        assert!(
+            blurred_edge.red() < 240 && blurred_edge.green() < 240 && blurred_edge.blue() < 240,
+            "the issue's 2px 2px 3px shadow must retain ink outside the box: {blurred_edge:?}"
+        );
+    }
+
+    #[test]
+    fn image_intrinsic_cache_tracks_replacements_failures_and_request_profiles() {
+        let url = "https://assets.test/swap.svg";
+        let profile = ImageRequestProfile::NoCorsInclude;
+        let svg = |width, height| format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}'/>"
+        ).into_bytes();
+        let mut cache = RenderResourceCache::with_loader(|_url: &str| {
+            panic!("seeded metadata must not issue a request")
+        });
+        cache.seed_image(url.into(), profile, svg(20, 10));
+        cache.seed_image(url.into(), ImageRequestProfile::CorsInclude, svg(80, 40));
+        for _ in 0..2 {
+            assert_eq!(cache.profiled_image_intrinsic(url, profile).unwrap().natural_size(), Some((20.0, 10.0)));
+            assert_eq!(cache.cached_image_metadata(url, None), Some(Some((url.into(), 20.0, 10.0))));
+            assert_eq!(cache.profiled_image_intrinsic(url, ImageRequestProfile::CorsInclude).unwrap().natural_size(), Some((80.0, 40.0)));
+        }
+        cache.seed_image(url.into(), profile, svg(40, 30));
+        assert_eq!(cache.profiled_image_intrinsic(url, profile).unwrap().natural_size(), Some((40.0, 30.0)));
+        cache.seed_image(url.into(), profile, b"not an image".to_vec());
+        assert_eq!(cache.profiled_image_intrinsic(url, profile), None);
+        assert_eq!(cache.cached_image_metadata(url, None), Some(None));
+        cache.seed_image(url.into(), profile, svg(12, 8));
+        assert_eq!(cache.profiled_image_intrinsic(url, profile).unwrap().natural_size(), Some((12.0, 8.0)));
+        cache.seed_image_missing(url.into(), profile);
+        assert_eq!(cache.profiled_image_intrinsic(url, profile), None);
+        assert_eq!(cache.cached_image_metadata(url, None), Some(None));
+        assert_eq!(cache.profiled_image_intrinsic(url, ImageRequestProfile::CorsInclude).unwrap().natural_size(), Some((80.0, 40.0)));
+    }
+
+    #[test]
+    fn image_intrinsic_cache_eviction_does_not_retain_previous_dimensions() {
+        let mut cache = RenderResourceCache::with_loader_and_limits(|_url: &str| {
+            panic!("all resources are seeded")
+        }, 1, 1024);
+        let first = "https://assets.test/first.svg";
+        let second = "https://assets.test/second.svg";
+        let profile = ImageRequestProfile::NoCorsInclude;
+        cache.seed_image(first.into(), profile, b"<svg xmlns='http://www.w3.org/2000/svg' width='20' height='10'/>".to_vec());
+        assert_eq!(cache.profiled_image_intrinsic(first, profile).unwrap().natural_size(), Some((20.0, 10.0)));
+        cache.seed_image(second.into(), profile, b"<svg xmlns='http://www.w3.org/2000/svg' width='30' height='15'/>".to_vec());
+        assert_eq!(cache.cached_image_metadata(first, None), None);
+        assert_eq!(cache.retained_entry_count(), 1);
+        cache.seed_image(first.into(), profile, b"<svg xmlns='http://www.w3.org/2000/svg' width='60' height='40'/>".to_vec());
+        assert_eq!(cache.profiled_image_intrinsic(first, profile).unwrap().natural_size(), Some((60.0, 40.0)));
+        assert_eq!(cache.cached_image_metadata(second, None), None);
+        assert_eq!(cache.retained_entry_count(), 1);
+    }
+
+    #[test]
+    fn image_intrinsic_metadata_without_retention_uses_each_loader_result() {
+        for (max_entries, max_bytes) in [(0, 1024), (1, 1)] {
+            let mut loads = 0;
+            let mut cache = RenderResourceCache::with_loader_and_limits(move |_url: &str| {
+                loads += 1;
+                Some(format!("<svg xmlns='http://www.w3.org/2000/svg' width='{}' height='10'/>", loads * 20).into_bytes())
+            }, max_entries, max_bytes);
+            let url = "https://assets.test/uncached.svg";
+            for expected in [20.0, 40.0] {
+                assert_eq!(cache.profiled_image_intrinsic(url, ImageRequestProfile::NoCorsInclude).unwrap().natural_size(), Some((expected, 10.0)));
+                assert_eq!(cache.cached_image_metadata(url, None), None);
+                assert_eq!(cache.retained_entry_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn image_intrinsic_cache_preserves_partial_svg_metadata_and_data_sources() {
+        let mut cache = RenderResourceCache::with_loader(|_url: &str| {
+            panic!("metadata probes must not fetch")
+        });
+        let profile = ImageRequestProfile::NoCorsInclude;
+        let url = "https://assets.test/ratio.svg";
+        cache.seed_image(url.into(), profile, b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'/>".to_vec());
+        let expected = crate::ReplacedIntrinsic { width: None, height: None, ratio: Some(1.0) };
+        for _ in 0..2 {
+            assert_eq!(cache.profiled_image_intrinsic(url, profile), Some(expected));
+            assert_eq!(cache.cached_image_metadata(url, None), Some(Some((url.into(), 150.0, 150.0))));
+        }
+        let data = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='24'%20height='12'/%3E";
+        assert_eq!(cache.profiled_image_intrinsic(data, profile).unwrap().natural_size(), Some((24.0, 12.0)));
+        assert_eq!(cache.retained_entry_count(), 1);
+        cache.set_sync_loading_enabled(false);
+        assert_eq!(cache.profiled_image_intrinsic("https://assets.test/unknown.svg", profile), None);
+        assert_eq!(cache.cached_image_metadata("https://assets.test/unknown.svg", None), None);
+        let misses = cache.take_sync_misses();
+        assert_eq!(misses, vec![("https://assets.test/unknown.svg".into(), Some(profile), false)]);
+    }
+
+    #[test]
+    fn image_intrinsic_lookup_preserves_url_resolution() {
+        let mut cache = RenderResourceCache::with_loader(|_url: &str| {
+            panic!("metadata must preserve the existing URL-resolution gate")
+        });
+        let profile = ImageRequestProfile::NoCorsInclude;
+        for src in ["relative.svg", "file:///tmp/image.svg", "about:blank"] {
+            assert_eq!(cache.profiled_image_intrinsic(src, profile), None);
+        }
+        assert!(cache.take_sync_misses().is_empty());
+        cache.seed_image("https://assets.test/image.svg".into(), profile,
+            b"<svg xmlns='http://www.w3.org/2000/svg' width='20' height='10'/>".to_vec());
+        assert_eq!(cache.profiled_image_intrinsic("//assets.test/image.svg", profile).unwrap().natural_size(), Some((20.0, 10.0)));
     }
 
     #[test]
@@ -11224,10 +12793,12 @@ mod tests {
         .expect("the real root after a comment");
         assert_eq!(commented.natural_size(), Some((12.0, 8.0)));
 
-        assert!(svg_image_intrinsic_metadata(
+        assert!(
+            svg_image_intrinsic_metadata(
             br#"<svg xmlns='http://www.w3.org/2000/svg' width='10' height='20'><g>"#,
         )
-        .is_none());
+            .is_none()
+        );
     }
 
     #[test]
@@ -11313,12 +12884,18 @@ mod tests {
             );
         }
         assert_eq!(
-            (rect("#intrinsic-raster").width, rect("#intrinsic-raster").height),
+            (
+                rect("#intrinsic-raster").width,
+                rect("#intrinsic-raster").height
+            ),
             (2.0, 3.0),
             "a decoded image with real intrinsic axes must not stretch-fit"
         );
         assert_eq!(
-            (rect("#positioned-image").width, rect("#positioned-image").height),
+            (
+                rect("#positioned-image").width,
+                rect("#positioned-image").height
+            ),
             (320.0, 320.0),
             "a definite positioned border-box honors edges and min/max widths"
         );
@@ -11328,17 +12905,75 @@ mod tests {
             "a floated percentage column resolves against its reliable containing width"
         );
 
-        let display = |selector| {
-            prepared
-                .computed_style(node(selector))
-                .unwrap()["display"]
-                .clone()
-        };
+        let display =
+            |selector| prepared.computed_style(node(selector)).unwrap()["display"].clone();
         assert_eq!(display("#direct"), "inline");
         assert_eq!(display("#anchored"), "inline");
         assert_eq!(display("#authored-inline"), "inline");
         assert_eq!(display("#authored-block"), "block");
         assert_eq!(display("#authored-inline-block"), "inline-block");
+    }
+
+    #[test]
+    fn ancestor_cssom_matches_full_layout_and_rejects_geometry_dependencies() {
+        let tree = parse_html(r#"<!doctype html><style>
+            body { --tone:blue; color:var(--tone); pointer-events:none }
+            body[data-active=yes] { --tone:red }
+            #flex { display:flex }
+            #contents { display:contents }
+            #item { display:inline-flex; background-color:green; opacity:.4 }
+            #suppressed { display:none }
+            #float { float:left; display:inline; position:relative; z-index:3 }
+            #inherit { display:inherit }
+            #animated { animation:fade 1s infinite }
+            @keyframes fade { to { opacity:0 } }
+            #container { container-type:inline-size }
+            @container (min-width:1px) { #query { color:green } }
+        </style><body>
+            <div id=flex><div id=contents><span id=item>label</span></div></div>
+            <section id=suppressed><span id=suppressed-child>hidden ancestor</span></section>
+            <span id=float>floating</span><div id=inherit>inherited</div>
+            <input id=hidden type=" HIDDEN "><div id=animated>animated</div>
+            <div id=container><span id=query>query</span></div>
+        </body>"#);
+        let viewport = (400.0, 200.0);
+        let mut cache = crate::StylesheetCache::default();
+        let mut resources = RenderResourceCache::default();
+        prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree, viewport, None, &mut resources, &[], &mut cache,
+        ).unwrap();
+        let body = tree.query_selector("body").unwrap().unwrap();
+        for active in ["yes", "no"] {
+            tree.with_node_mut(body, |node| node.set_attribute("data-active", active.into()));
+            let full = prepare_dom(&tree, viewport, None, &mut resources).unwrap();
+            for name in ["flex", "contents", "item", "float", "suppressed", "suppressed-child"] {
+                let id = tree.get_element_by_id(name).unwrap();
+                let fast = crate::dom::computed_style_without_layout(
+                    &tree, id, viewport, crate::CssMediaType::Screen, &cache, "color",
+                ).expect("ordinary ancestors need no layout");
+                let expected = full.computed_style(id).unwrap();
+                for (property, value) in fast {
+                    assert_eq!(value, expected[property], "{name}.{property} with {active}");
+                }
+            }
+            for name in ["inherit", "hidden", "animated", "query"] {
+                assert!(crate::dom::computed_style_without_layout(
+                    &tree, tree.get_element_by_id(name).unwrap(), viewport,
+                    crate::CssMediaType::Screen, &cache, "display",
+                ).is_none(), "{name} must use full normalization");
+            }
+        }
+        let item = tree.get_element_by_id("item").unwrap();
+        assert!(crate::dom::computed_style_without_layout(
+            &tree, item, viewport, crate::CssMediaType::Screen, &cache, "width",
+        ).is_none());
+        let source_bytes = cache.retained_source_bytes();
+        let style = tree.query_selector("style").unwrap().unwrap();
+        tree.append_text(style, "#item { color:purple }");
+        assert!(crate::dom::computed_style_without_layout(
+            &tree, item, viewport, crate::CssMediaType::Screen, &cache, "color",
+        ).is_none(), "stylesheet changes must invalidate retained styles through the normal path");
+        assert_eq!(cache.retained_source_bytes(), source_bytes);
     }
 
     #[test]
@@ -11361,8 +12996,8 @@ mod tests {
             </body></html>"#,
         );
         let mut resources = RenderResourceCache::default();
-        let mut prepared = prepare_dom(&tree, (200.0, 130.0), None, &mut resources)
-            .expect("placeholder layout");
+        let mut prepared =
+            prepare_dom(&tree, (200.0, 130.0), None, &mut resources).expect("placeholder layout");
         let node = |selector| tree.query_selector(selector).unwrap().unwrap();
 
         assert!(
@@ -11403,7 +13038,10 @@ mod tests {
                 })
                 .count()
         };
-        assert!(non_white(0) > 10, "the native default placeholder must paint");
+        assert!(
+            non_white(0) > 10,
+            "the native default placeholder must paint"
+        );
         assert!(
             (30..60).any(|y| (0..180).any(|x| {
                 let pixel = pixmap.pixel(x, y).unwrap();
@@ -11411,12 +13049,93 @@ mod tests {
             })),
             "the authored placeholder color must reach glyph paint"
         );
-        assert_eq!(non_white(60), 0, "opacity:0 must suppress placeholder glyphs");
         assert_eq!(
-            non_white(90),
+            non_white(60),
             0,
-            "a non-empty control value must suppress placeholder glyphs"
+            "opacity:0 must suppress placeholder glyphs"
         );
+        // `#filled` carries `value="actual"`, so the placeholder is suppressed
+        // and the value paints in its place — Chromium 147 renders the value
+        // here too. Assert glyphs are present *and* that they are the value's
+        // near-black text rather than the grey `rgb(117,117,117)` placeholder,
+        // so this still fails if the placeholder leaks through.
+        assert!(
+            non_white(90) > 10,
+            "a control's value must paint where its placeholder is suppressed"
+        );
+        assert!(
+            (90..120).any(|y| (0..180).any(|x| {
+                let pixel = pixmap.pixel(x, y).unwrap();
+                pixel.red() < 60 && pixel.green() < 60 && pixel.blue() < 60
+            })),
+            "the painted glyphs must be the value's color, not the grey placeholder"
+        );
+    }
+
+    /// Loopback HTTP/1.0 server that counts connections and answers every
+    /// request with `body`. The count is the evidence: a refused fetch must
+    /// never even open the socket.
+    fn loopback_http_server(
+        body: &'static [u8],
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = hits.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.0 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(body);
+            }
+        });
+        (port, hits)
+    }
+
+    #[test]
+    fn default_loader_refuses_private_network_hosts() {
+        std::env::remove_var("OBSCURA_ALLOW_PRIVATE_NETWORK");
+        let (port, hits) = loopback_http_server(b"png-bytes");
+        let mut cache = RenderResourceCache::default();
+        // A literal loopback address and a name that resolves to one: the
+        // second must be caught at DNS resolution, the same way the page
+        // transports close DNS rebinding.
+        for url in [
+            format!("http://127.0.0.1:{port}/a.png"),
+            format!("http://localhost:{port}/b.png"),
+        ] {
+            assert!(
+                fetch_bytes(&url, None, &mut cache).is_none(),
+                "{url} must be refused by the standalone loader"
+            );
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a forbidden host must never be connected to"
+        );
+    }
+
+    #[cfg(feature = "native-resource-loader")]
+    #[test]
+    fn default_loader_honors_the_private_network_opt_in() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (port, hits) = loopback_http_server(b"png-bytes");
+        let mut cache = RenderResourceCache::default();
+        let url = format!("http://127.0.0.1:{port}/a.png");
+        assert_eq!(
+            fetch_bytes(&url, None, &mut cache).as_deref(),
+            Some(b"png-bytes".as_slice())
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -11431,7 +13150,7 @@ mod tests {
 
         let previous = cache.set_sync_loading_enabled(false);
         assert!(previous);
-        assert!(cache.get_or_load(url).is_none());
+        assert!(cache.get_or_load(url, false).is_none());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(
             !cache.has_live_outcome(url),
@@ -11440,8 +13159,93 @@ mod tests {
 
         cache.set_sync_loading_enabled(previous);
         cache.seed(url.to_string(), vec![9, 8, 7]);
-        assert_eq!(cache.get_or_load(url).as_deref(), Some([9, 8, 7].as_slice()));
+        assert_eq!(
+            cache.get_or_load(url, false).as_deref(),
+            Some([9, 8, 7].as_slice())
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cache_only_misses_are_reported_with_their_request_identity() {
+        let mut cache = RenderResourceCache::with_loader(|_url: &str| Some(vec![1, 2, 3]));
+        let font = "https://example.test/font?id=late";
+        let image = "https://example.test/late.png#fragment";
+        assert!(!cache.has_sync_misses());
+
+        cache.set_sync_loading_enabled(false);
+        assert!(cache.get_or_load(font, true).is_none());
+        assert!(
+            cache.get_or_load(font, true).is_none(),
+            "a repeated miss is reported once"
+        );
+        assert!(
+            cache
+            .get_or_load_image(image, ImageRequestProfile::CorsInclude)
+                .is_none()
+        );
+        assert!(cache.has_sync_misses());
+        assert_eq!(
+            cache.take_sync_misses(),
+            vec![
+                (font.to_string(), None, true),
+                (
+                    "https://example.test/late.png".to_string(),
+                    Some(ImageRequestProfile::CorsInclude),
+                    false,
+                ),
+            ],
+            "misses carry the network URL, image request profile and resource kind"
+        );
+        assert!(!cache.has_sync_misses(), "take clears the report");
+
+        cache.seed(font.to_string(), vec![9]);
+        assert!(cache.get_or_load(font, true).is_some());
+        assert!(!cache.has_sync_misses(), "a hit is not a miss");
+
+        cache.set_sync_loading_enabled(true);
+        assert!(
+            cache
+            .get_or_load("https://example.test/other.png", false)
+                .is_some()
+        );
+        assert!(
+            !cache.has_sync_misses(),
+            "the synchronous compatibility loader never reports a miss"
+        );
+    }
+
+    #[test]
+    fn cache_only_miss_queue_respects_the_cache_entry_limit() {
+        let mut cache = RenderResourceCache::with_loader_and_limits(
+            |_url: &str| None,
+            1,
+            DEFAULT_RESOURCE_CACHE_BYTES,
+        );
+        cache.set_sync_loading_enabled(false);
+
+        assert!(
+            cache
+            .get_or_load("https://example.test/first.png", false)
+                .is_none()
+        );
+        assert!(
+            cache
+            .get_or_load("https://example.test/second.png", false)
+                .is_none()
+        );
+        assert_eq!(cache.take_sync_misses().len(), 1);
+
+        assert!(
+            cache
+            .get_or_load("https://example.test/second.png", false)
+                .is_none()
+        );
+        assert_eq!(
+            cache.take_sync_misses().len(),
+            1,
+            "a deferred miss is reported later"
+        );
     }
 
     #[test]
@@ -11476,7 +13280,13 @@ mod tests {
         let node = |selector| tree.query_selector(selector).unwrap().unwrap();
         let plain = prepared.layout().rects[&node("#plain")];
         let anonymous = prepared.layout().rects[&node("#anonymous")];
-        assert_eq!(prepared.selected_image(node("#plain")).unwrap().resolved_url, url);
+        assert_eq!(
+            prepared
+                .selected_image(node("#plain"))
+                .unwrap()
+                .resolved_url,
+            url
+        );
         assert_eq!((plain.width, plain.height), (20.0, 10.0));
         assert_eq!((anonymous.width, anonymous.height), (40.0, 30.0));
 
@@ -11494,6 +13304,817 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "native-resource-loader")]
+    #[test]
+    fn authored_image_axes_override_intrinsic_ratio_and_constraints() {
+        for display in ["block", "flex", "grid"] {
+            for (sizing, expected) in [
+                ("width:20px;height:10px", (20.0, 10.0)),
+                ("width:20%;height:10%", (20.0, 10.0)),
+                ("width:20px;height:10px;min-width:30px", (30.0, 10.0)),
+                ("width:20px;height:10px;min-height:20px", (20.0, 20.0)),
+                ("width:20px;height:10px;max-width:10px", (10.0, 10.0)),
+                ("width:20px;height:10px;max-height:5px", (20.0, 5.0)),
+                ("width:20px;height:10px;border:2px solid black;padding:3px", (30.0, 20.0)),
+                ("width:20px;height:10px;border:2px solid black;padding:3px;box-sizing:border-box", (20.0, 10.0)),
+                ("width:20px;height:auto", (20.0, 15.0)),
+                ("width:20px;height:auto;max-height:10px", (20.0, 10.0)),
+            ] {
+                let tree = parse_html(&format!(r#"<style>
+                    html,body{{margin:0}}main{{display:{display};align-items:start;width:100px;height:100px}}
+                    img{{display:block;flex:none;{sizing}}}
+                    </style><main><img id=image src=https://assets.test/image.svg></main>"#));
+                let image = tree.get_element_by_id("image").unwrap();
+                let mut resources = RenderResourceCache::with_loader(|_: &str| {
+                    Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30"/>"#.to_vec())
+                });
+                let prepared = prepare_dom(&tree, (150.0, 150.0), None, &mut resources).unwrap();
+                let rect = prepared.layout.rects[&image];
+                assert_eq!((rect.width, rect.height), expected, "{display} {sizing}");
+            }
+        }
+    }
+
+    #[test]
+    fn retained_image_source_changes_preserve_equal_intrinsics_and_refresh_pixels() {
+        let make_resources = || {
+            let mut resources = RenderResourceCache::with_loader(|_url: &str| {
+                panic!("all image resources must be seeded")
+            });
+            for (url, profile, width, height, color) in [
+                ("https://assets.test/a.svg", ImageRequestProfile::NoCorsInclude, 20, 10, "red"),
+                ("https://assets.test/equal.svg", ImageRequestProfile::NoCorsInclude, 20, 10, "lime"),
+                ("https://assets.test/b.svg", ImageRequestProfile::NoCorsInclude, 40, 30, "lime"),
+                ("https://assets.test/c.svg", ImageRequestProfile::NoCorsInclude, 40, 20, "blue"),
+                ("https://assets.test/a.svg", ImageRequestProfile::CorsSameOrigin, 40, 30, "blue"),
+            ] {
+                resources.seed_image(url.into(), profile, format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"><rect width="100%" height="100%" fill="{color}"/></svg>"#,
+                ).into_bytes());
+            }
+            resources
+        };
+        for (name, initial, value, url, density, profile, dimensions) in [
+            ("src", "", Some("https://assets.test/equal.svg"), Some("https://assets.test/equal.svg"),
+                1.0, ImageRequestProfile::NoCorsInclude, Some((20.0, 10.0))),
+            ("src", "", Some("https://assets.test/b.svg"), Some("https://assets.test/b.svg"),
+                1.0, ImageRequestProfile::NoCorsInclude, Some((40.0, 30.0))),
+            ("src", "", Some("https://assets.test/c.svg"), Some("https://assets.test/c.svg"),
+                1.0, ImageRequestProfile::NoCorsInclude, Some((40.0, 20.0))),
+            ("srcset", "", Some("https://assets.test/c.svg 2x"), Some("https://assets.test/c.svg"),
+                2.0, ImageRequestProfile::NoCorsInclude, Some((20.0, 10.0))),
+            ("src", "", None, None, 1.0, ImageRequestProfile::NoCorsInclude, None),
+            ("srcset", "", Some("https://assets.test/b.svg 2x"), Some("https://assets.test/b.svg"),
+                2.0, ImageRequestProfile::NoCorsInclude, Some((20.0, 15.0))),
+            ("srcset", "srcset='https://assets.test/b.svg 2x'", None, Some("https://assets.test/a.svg"),
+                1.0, ImageRequestProfile::NoCorsInclude, Some((20.0, 10.0))),
+            ("sizes", "srcset='https://assets.test/a.svg 20w, https://assets.test/b.svg 40w' sizes='20px'",
+                Some("40px"), Some("https://assets.test/b.svg"), 1.0,
+                ImageRequestProfile::NoCorsInclude, Some((40.0, 30.0))),
+            ("crossorigin", "", Some("anonymous"), Some("https://assets.test/a.svg"),
+                1.0, ImageRequestProfile::CorsSameOrigin, Some((40.0, 30.0))),
+            ("crossorigin", "crossorigin='anonymous'", None, Some("https://assets.test/a.svg"),
+                1.0, ImageRequestProfile::NoCorsInclude, Some((20.0, 10.0))),
+        ] {
+            // Include flow, flex and grid parents: intrinsic contributions must
+            // be recomputed even when most computed styles can be reused.
+            for (display, sizing, selector_css) in [
+                ("block", "", ""),
+                ("flex", "", ""),
+                ("grid", "", ""),
+                ("inline-block", "", ""),
+                ("block", "width:50%;height:auto", ""),
+                ("block", "width:auto;height:50%", ""),
+                ("flex", "width:50%;height:100%;min-width:0", ""),
+                ("grid", "width:100%;height:100%", ""),
+                ("block", "width:20px;height:10px", ""),
+                ("flex", "width:20px;height:10px", ""),
+                ("grid", "width:20px;height:10px", ""),
+                ("block", "width:20px;height:10px;min-width:30px", ""),
+                ("block", "width:20px;height:10px;min-height:20px", ""),
+                ("block", "width:20px;height:10px;max-width:10px", ""),
+                ("block", "width:20px;height:10px;max-height:5px", ""),
+                ("block", "width:20px;height:10px;aspect-ratio:3", ""),
+                ("block", "width:20px;height:10px;padding:3px;border:2px solid black;object-fit:cover", ""),
+                ("block", "width:20px;height:10px", "img[src='https://assets.test/b.svg']+aside{width:19px}"),
+                ("none", "", ""),
+                ("none", "width:100%;height:100%", ""),
+                ("block", "display:none", ""),
+                ("none", "", "img[src='https://assets.test/c.svg']+aside{width:19px}"),
+            ] {
+                let tree = parse_html(&format!(
+                    r#"<html><head><style>
+                        html,body{{margin:0}}main{{display:{display};width:100px}}
+                        img{{display:block;flex:none;{sizing}}}aside{{width:7px;height:9px;background:black}}
+                        {selector_css}
+                    </style></head><body><main>
+                        <img id="image" src="https://assets.test/a.svg" {initial}><aside></aside>
+                    </main><div style="height:12px;background:yellow"></div></body></html>"#,
+                ));
+                let image = tree.get_element_by_id("image").unwrap();
+                let viewport = (120.0, 100.0);
+                let mut resources = make_resources();
+                let mut cache = crate::css::StylesheetCache::default();
+                let previous = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+                    &tree, viewport, None, &mut resources, &[], &mut cache,
+                ).unwrap();
+                let old_value = tree.get_node(image).unwrap().get_attribute(name).map(str::to_owned);
+                tree.with_node_mut(image, |node| match value {
+                    Some(value) => node.set_attribute(name, value.into()),
+                    None => node.remove_attribute_ns("", name),
+                });
+                let mut retained = prepare_dom_with_retained_attribute_styles(
+                    &tree, viewport, None, &mut resources, &[], &mut cache, previous,
+                    &[crate::dom::AttributeStyleMutation {
+                        node: image, name: name.into(), old_value,
+                        new_value: value.map(str::to_owned),
+                    }],
+                ).unwrap();
+                let mut oracle_resources = make_resources();
+                let mut oracle = prepare_dom(&tree, viewport, None, &mut oracle_resources).unwrap();
+                assert_eq!(retained.selected_images, oracle.selected_images, "{name} {display}");
+                assert_eq!(retained.selected_image(image).map(|s| (s.resolved_url.as_str(), s.density, s.profile)),
+                    url.map(|url| (url, density, profile)), "{name} {display}");
+                if display == "block" {
+                    if let Some(dimensions) = dimensions.filter(|_| sizing.is_empty()) {
+                        let rect = retained.layout.rects[&image];
+                        assert_eq!((rect.width, rect.height), dimensions, "{name}");
+                    }
+                }
+                assert_eq!(retained.layout.rects, oracle.layout.rects, "{name} {display}");
+                assert_eq!(retained.content_size, oracle.content_size, "{name} {display}");
+                for (node, style) in &oracle.layout.styles {
+                    assert_eq!(format!("{:?}", retained.layout.styles[node]), format!("{style:?}"),
+                        "{name} {display} {node:?}");
+                }
+                let pixels = paint_prepared(&tree, &mut retained, &mut resources, (0.0, 0.0)).unwrap();
+                let expected = paint_prepared(&tree, &mut oracle, &mut oracle_resources, (0.0, 0.0)).unwrap();
+                assert_eq!(pixels.data(), expected.data(), "{name} {display}");
+            }
+        }
+    }
+
+    #[test]
+    fn retained_hidden_image_ratio_and_style_are_current_when_revealed() {
+        for own in [false, true] {
+            for display in ["block", "flex", "grid"] {
+                for height in [20, 30, 40] {
+                    for (sizing, attributes) in [
+                        ("", ""),
+                        ("aspect-ratio:3", ""),
+                        ("width:100%;height:100%", ""),
+                        ("width:20px;height:10px", ""),
+                        ("width:auto;height:auto", "width=80 height=40"),
+                    ] {
+                        let tree = parse_html(&format!(r#"<style>
+                            html,body{{margin:0}}main{{display:{display};width:120px;height:70px}}
+                            .off{{display:none}}img{{display:block;{sizing}}}aside{{width:7px;height:9px}}
+                            </style><main id=parent class='{}'><img id=image class='{}'
+                            src='https://assets.test/a.svg' {attributes}><aside></aside></main>"#,
+                            if own { "" } else { "off" }, if own { "off" } else { "" }));
+                        let image = tree.get_element_by_id("image").unwrap();
+                        let hidden = if own { image } else { tree.get_element_by_id("parent").unwrap() };
+                        let make_resources = || {
+                            let mut resources = RenderResourceCache::with_loader(|_: &str| panic!("unseeded image"));
+                            for (name, width, height, color) in [("a", 20, 10, "red"), ("b", 40, height, "blue")] {
+                                resources.seed(format!("https://assets.test/{name}.svg"), format!(
+                                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"><rect width="100%" height="100%" fill="{color}"/></svg>"#,
+                                ).into_bytes());
+                            }
+                            resources
+                        };
+                        let mut resources = make_resources();
+                        let mut cache = crate::css::StylesheetCache::default();
+                        let mut previous = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+                            &tree, (150.0, 100.0), None, &mut resources, &[], &mut cache,
+                        ).unwrap();
+                        for (node, name, before, after) in [
+                            (image, "src", "https://assets.test/a.svg", "https://assets.test/b.svg"),
+                            (hidden, "class", "off", ""),
+                        ] {
+                            tree.with_node_mut(node, |node| node.set_attribute(name, after.into()));
+                            previous = prepare_dom_with_retained_attribute_styles(
+                                &tree, (150.0, 100.0), None, &mut resources, &[], &mut cache, previous,
+                                &[crate::dom::AttributeStyleMutation {
+                                    node, name: name.into(), old_value: Some(before.into()), new_value: Some(after.into()),
+                                }],
+                            ).unwrap();
+                            let mut oracle_resources = make_resources();
+                            let mut oracle = prepare_dom(&tree, (150.0, 100.0), None, &mut oracle_resources).unwrap();
+                            assert_eq!(previous.selected_images, oracle.selected_images, "{own} {display} {height} {sizing} {attributes} {name}");
+                            assert_eq!(previous.layout.rects, oracle.layout.rects, "{own} {display} {height} {sizing} {attributes} {name}");
+                            for (node, style) in &oracle.layout.styles {
+                                assert_eq!(format!("{:?}", previous.layout.styles[node]), format!("{style:?}"),
+                                    "{own} {display} {height} {sizing} {attributes} {name} {node:?}");
+                            }
+                            let actual = paint_prepared(&tree, &mut previous, &mut resources, (0.0, 0.0)).unwrap();
+                            let expected = paint_prepared(&tree, &mut oracle, &mut oracle_resources, (0.0, 0.0)).unwrap();
+                            assert_eq!(actual.data(), expected.data(), "{own} {display} {height} {sizing} {attributes} {name}");
+                        }
+                        assert_eq!(previous.layout.styles[&image].intrinsic_size, Some((40.0, height as f32)));
+                        if sizing.is_empty() {
+                            assert_eq!(previous.layout.rects[&image].width, 40.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn css_display_none_suppresses_and_restarts_own_and_descendant_animations() {
+        for (own, important) in [(false, false), (true, false), (false, true), (true, true)] {
+            let tree = parse_html(&format!(r#"<style>
+                @keyframes grow {{ from {{ width:20px }} to {{ width:100px }} }}
+                #target {{ width:20px;height:10px;animation:grow 1000ms linear infinite }}
+                .off {{ display:none{} }}
+                .on {{ display:block{} }}
+                </style><div id=ancestor class='{}'><div id=target class='{}'></div></div>"#,
+                if important { " !important" } else { "" },
+                if important { " !important" } else { "" },
+                if own { "" } else { "off" }, if own { "off" } else { "" },
+            ));
+            let target = tree.get_element_by_id("target").unwrap();
+            let owner = if own { target } else { tree.get_element_by_id("ancestor").unwrap() };
+            let mut resources = RenderResourceCache::default();
+            let mut cache = crate::css::StylesheetCache::default();
+            let mut timeline = crate::AnimationTimelineState::default();
+            for (sample, class, expected_width, active) in [
+                (250.0, None, 20.0, false),
+                (500.0, Some("on"), 20.0, true),
+                (750.0, None, 40.0, true),
+                (800.0, Some("off"), 20.0, false),
+                (900.0, Some("on"), 20.0, true),
+                (1150.0, None, 40.0, true),
+            ] {
+                if let Some(class) = class {
+                    tree.with_node_mut(owner, |node| node.set_attribute("class", class.into()));
+                    timeline.note_start_candidate(owner, sample);
+                }
+                let prepared = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                    &tree, (200.0, 100.0), None, &mut resources, &[], &mut cache,
+                    crate::AnimationSample::document(sample), &mut timeline,
+                ).unwrap();
+                let style = &prepared.layout.styles[&target];
+                assert_eq!(style.width, crate::Dimension::Px(expected_width),
+                    "own={own} important={important} sample={sample}");
+                assert_eq!(style.animation_has_render_effect, active);
+                assert_eq!(prepared.has_active_declarative_css_animations(), active);
+                timeline.clear_start_candidates();
+            }
+        }
+    }
+
+    #[test]
+    fn css_animation_visibility_and_contents_are_not_display_none() {
+        for parent in ["visibility:hidden", "display:contents"] {
+            let tree = parse_html(&format!(r#"<style>
+                @keyframes grow {{ from {{ width:20px }} to {{ width:100px }} }}
+                #target {{ width:20px;height:10px;animation:grow 1000ms linear infinite }}
+                </style><div style='{parent}'><div id=target></div></div>"#));
+            let target = tree.get_element_by_id("target").unwrap();
+            let mut resources = RenderResourceCache::default();
+            let prepared = prepare_dom_at_animation_time(
+                &tree, (200.0, 100.0), None, &mut resources,
+                crate::AnimationSampleTime { milliseconds: 250.0 },
+            ).unwrap();
+            assert_eq!(prepared.layout.styles[&target].width, crate::Dimension::Px(40.0), "{parent}");
+            assert!(prepared.has_active_declarative_css_animations());
+        }
+    }
+
+    fn assert_query_seed_render_matches(
+        tree: &DomTree,
+        actual: &mut PreparedRender,
+        expected: &mut PreparedRender,
+        resources: &mut RenderResourceCache,
+        oracle_resources: &mut RenderResourceCache,
+        context: &str,
+    ) {
+        assert_eq!(actual.layout.rects, expected.layout.rects, "{context}");
+        assert_eq!(actual.layout.inline_fragments, expected.layout.inline_fragments, "{context}");
+        assert_eq!(actual.layout.transforms, expected.layout.transforms, "{context}");
+        assert_eq!(actual.layout.clip_rects, expected.layout.clip_rects, "{context}");
+        assert_eq!(actual.content_size, expected.content_size, "{context}");
+        for (node, style) in &actual.layout.styles {
+            let reference = &expected.layout.styles[node];
+            assert_eq!(style.color, reference.color, "{context} node={node:?}");
+            assert_eq!(style.opacity, reference.opacity, "{context} node={node:?}");
+            assert_eq!(style.font_size, reference.font_size, "{context} node={node:?}");
+            assert_eq!(style.width, reference.width, "{context} node={node:?}");
+            assert_eq!(style.display, reference.display, "{context} node={node:?}");
+        }
+        let pixels = paint_prepared(tree, actual, resources, (0.0, 0.0)).unwrap();
+        let reference = paint_prepared(tree, expected, oracle_resources, (0.0, 0.0)).unwrap();
+        assert_eq!(pixels.data(), reference.data(), "{context}");
+    }
+
+    // Compare retained preparations with fresh layout using independent resource
+    // caches and animation histories, including geometry and painted pixels.
+    struct QuerySeedCase {
+        resources: RenderResourceCache,
+        oracle_resources: RenderResourceCache,
+        cache: crate::css::StylesheetCache,
+        oracle_cache: crate::css::StylesheetCache,
+        timeline: crate::AnimationTimelineState,
+        oracle_timeline: crate::AnimationTimelineState,
+        previous: Option<PreparedRender>,
+    }
+
+    impl QuerySeedCase {
+        fn new(resources: RenderResourceCache, oracle_resources: RenderResourceCache) -> Self {
+            Self { resources, oracle_resources, cache: Default::default(),
+                oracle_cache: Default::default(), timeline: Default::default(),
+                oracle_timeline: Default::default(), previous: None }
+        }
+
+        fn flush(&mut self, tree: &DomTree, mutations: &[crate::dom::RetainedStyleMutation], sample: f32) {
+            let mut current = if let Some(previous) = self.previous.take() {
+                prepare_dom_with_retained_styles_with_animation_state(
+                    tree, (360.0, 260.0), None, &mut self.resources, &[], &mut self.cache,
+                    previous, mutations, crate::AnimationSample::document(sample), &mut self.timeline,
+                ).unwrap()
+            } else {
+                prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                    tree, (360.0, 260.0), None, &mut self.resources, &[], &mut self.cache,
+                    crate::AnimationSample::document(sample), &mut self.timeline,
+                ).unwrap()
+            };
+            let mut oracle = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                tree, (360.0, 260.0), None, &mut self.oracle_resources, &[], &mut self.oracle_cache,
+                crate::AnimationSample::document(sample), &mut self.oracle_timeline,
+            ).unwrap();
+            assert_eq!(current.selected_images, oracle.selected_images);
+            assert_query_seed_render_matches(tree, &mut current, &mut oracle,
+                &mut self.resources, &mut self.oracle_resources, &format!("sample={sample}"));
+            self.timeline.clear_start_candidates();
+            self.oracle_timeline.clear_start_candidates();
+            self.previous = Some(current);
+        }
+
+        fn set_attribute(&mut self, tree: &DomTree, node: obscura_dom::tree::NodeId, name: &str, value: &str, sample: f32) {
+            let old_value = tree.get_node(node).unwrap().get_attribute(name).map(str::to_owned);
+            tree.with_node_mut(node, |node| node.set_attribute(name, value.into()));
+            self.flush(tree, &[crate::dom::AttributeStyleMutation {
+                node, name: name.into(), old_value, new_value: Some(value.into()),
+            }.into()], sample);
+        }
+    }
+
+    #[test]
+    fn query_seed_bounds_large_documents_without_changing_layout() {
+        for count in [32, 8200] {
+            let tree = parse_html(&format!(r#"<style>
+                #container {{container-type:inline-size;width:200px}}
+                .item {{width:20px;height:0}}
+                @container (min-width:100px) {{.item {{width:100px}}}}
+                #marker {{height:12px;background:green}}
+                </style><div id=container>{}<div id=marker></div></div>"#,
+                "<div class=item></div>".repeat(count)));
+            let mut case = QuerySeedCase::new(Default::default(), Default::default());
+            case.flush(&tree, &[], 0.0);
+            assert_eq!(case.previous.as_ref().unwrap().query_seed.is_some(), count < 8192);
+            let marker = tree.get_element_by_id("marker").unwrap();
+            case.set_attribute(&tree, marker, "style", "height:20px;background:blue", 1.0);
+            assert_eq!(case.previous.as_ref().unwrap().query_seed.is_some(), count < 8192);
+        }
+    }
+
+    #[test]
+    fn query_seed_prunes_removed_subtrees_and_reparents_inherited_values() {
+        let tree = parse_html(r#"<style>
+            .container {container-type:inline-size}
+            #left {width:200px;--size:20px;color:red}
+            #right {width:70px;--size:40px;color:blue}
+            #item {width:var(--size);height:20px;background:currentColor}
+            @container (min-width:100px) {#item, #kept {width:100px}}
+            </style><div id=left class=container><div id=item><span id=leaf>text</span></div></div>
+            <div id=right class=container><div id=kept></div></div>"#);
+        let left = tree.get_element_by_id("left").unwrap();
+        let right = tree.get_element_by_id("right").unwrap();
+        let item = tree.get_element_by_id("item").unwrap();
+        let leaf = tree.get_element_by_id("leaf").unwrap();
+        let kept = tree.get_element_by_id("kept").unwrap();
+        let mut case = QuerySeedCase::new(Default::default(), Default::default());
+        case.flush(&tree, &[], 0.0);
+        assert!(case.previous.as_ref().unwrap().query_seed.is_some());
+        tree.append_child(right, item);
+        case.flush(&tree, &[crate::dom::TreeStyleMutation::Insert {
+            node:item, old_parent:Some(left), new_parent:right,
+        }.into()], 1.0);
+        assert_eq!(case.previous.as_ref().unwrap().layout.styles[&item].width, crate::Dimension::Px(40.0));
+        tree.remove_child(item);
+        case.flush(&tree, &[crate::dom::TreeStyleMutation::Remove {node:item, old_parent:right}.into()], 2.0);
+        let seed = case.previous.as_ref().unwrap().query_seed.as_ref().unwrap();
+        assert!(!seed.styles.contains_key(&item));
+        assert!(!seed.styles.contains_key(&leaf));
+        tree.append_child(left, item);
+        case.flush(&tree, &[crate::dom::TreeStyleMutation::Insert {
+            node:item, old_parent:None, new_parent:left,
+        }.into()], 3.0);
+        let current = case.previous.as_ref().unwrap();
+        assert_eq!(current.layout.styles[&item].width, crate::Dimension::Px(100.0));
+        assert_eq!(current.query_seed.as_ref().unwrap().styles[&item].width, crate::Dimension::Px(20.0));
+
+        // With the last matching subject removed, upstream skips the query
+        // passes entirely. No retained seed is needed on that path.
+        tree.remove_child(kept);
+        tree.remove_child(item);
+        case.flush(&tree, &[
+            crate::dom::TreeStyleMutation::Remove {node:kept, old_parent:right}.into(),
+            crate::dom::TreeStyleMutation::Remove {node:item, old_parent:left}.into(),
+        ], 4.0);
+        assert!(case.previous.as_ref().unwrap().query_seed.is_none());
+        tree.append_child(right, item);
+        case.flush(&tree, &[crate::dom::TreeStyleMutation::Insert {
+            node:item, old_parent:None, new_parent:right,
+        }.into()], 5.0);
+        let current = case.previous.as_ref().unwrap();
+        assert_eq!(current.layout.styles[&item].width, crate::Dimension::Px(40.0));
+        assert_eq!(current.query_seed.as_ref().unwrap().styles[&item].width, crate::Dimension::Px(40.0));
+    }
+
+    #[test]
+    fn query_seed_refreshes_images_and_discards_seed_after_content_retry() {
+        let make_resources = || RenderResourceCache::with_loader(|url: &str| {
+            let (width, height, color) = match url {
+                "https://assets.test/a.svg" => (20, 10, "red"),
+                "https://assets.test/b.svg" => (40, 30, "blue"),
+                _ => panic!("unexpected resource: {url}"),
+            };
+            Some(format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"><rect width="100%" height="100%" fill="{color}"/></svg>"#).into_bytes())
+        });
+        let tree = parse_html(r#"<style>
+            #container {container-type:inline-size;width:200px}
+            img {display:block} #fixed {width:20px;height:10px}
+            @container (min-width:100px) {#marker {height:10px;background:green}}
+            </style><div id=container><img id=natural src='https://assets.test/a.svg'>
+            <img id=fixed src='https://assets.test/a.svg'><img id=content src='https://assets.test/a.svg'>
+            <div id=marker></div></div>"#);
+        let natural = tree.get_element_by_id("natural").unwrap();
+        let fixed = tree.get_element_by_id("fixed").unwrap();
+        let content = tree.get_element_by_id("content").unwrap();
+        let marker = tree.get_element_by_id("marker").unwrap();
+        let mut case = QuerySeedCase::new(make_resources(), make_resources());
+        case.flush(&tree, &[], 0.0);
+        assert!(case.previous.as_ref().unwrap().query_seed.is_some());
+        case.set_attribute(&tree, natural, "src", "https://assets.test/b.svg", 1.0);
+        let rect = case.previous.as_ref().unwrap().layout.rects[&natural];
+        assert_eq!((rect.width, rect.height), (40.0, 30.0));
+        case.set_attribute(&tree, fixed, "src", "https://assets.test/b.svg", 2.0);
+        let rect = case.previous.as_ref().unwrap().layout.rects[&fixed];
+        assert_eq!((rect.width, rect.height), (20.0, 10.0));
+        for (sample, value, size) in [
+            (3.0, "content:url('https://assets.test/b.svg')", (40.0, 30.0)),
+            (5.0, "content:url('https://assets.test/a.svg')", (20.0, 10.0)),
+            (7.0, "", (20.0, 10.0)),
+        ] {
+            let retries = case.resources.content_image_layout_retries;
+            case.set_attribute(&tree, content, "style", value, sample);
+            let current = case.previous.as_ref().unwrap();
+            let rect = current.layout.rects[&content];
+            assert_eq!((rect.width, rect.height), size);
+            assert!(case.resources.content_image_layout_retries > retries);
+            assert!(current.query_seed.is_none());
+            case.set_attribute(&tree, marker, "style", &format!("height:{}px", sample + 10.0), sample + 1.0);
+            assert!(case.previous.as_ref().unwrap().query_seed.is_some());
+        }
+    }
+
+    #[test]
+    fn query_seed_clears_cancelled_waapi_samples_after_unrelated_damage() {
+        let tree = parse_html(r#"<style>
+            #container {container-type:inline-size;width:200px}
+            #target {opacity:1;width:20px;height:20px;background:green}
+            @container (min-width:100px) {#target {width:100px}}
+            </style><div id=container><div id=target></div><div id=damage></div></div>"#);
+        let target = tree.get_element_by_id("target").unwrap();
+        let damage = tree.get_element_by_id("damage").unwrap();
+        let mut case = QuerySeedCase::new(Default::default(), Default::default());
+        for timeline in [&mut case.timeline, &mut case.oracle_timeline] {
+            timeline.register_waapi(crate::WaapiAnimation {
+                id:1, node:target,
+                keyframes:vec![
+                    crate::WaapiKeyframe {offset:0.0, opacity:Some(0.25), transform:None},
+                    crate::WaapiKeyframe {offset:1.0, opacity:Some(0.75), transform:None},
+                ],
+                timing:crate::AnimationTiming {duration_ms:1000.0, ..Default::default()},
+                easing:None, linear_easing:None, start_time_ms:0.0, hold_time_ms:None,
+                play_state:crate::WaapiPlayState::Running,
+            });
+        }
+        case.flush(&tree, &[], 500.0);
+        let current = case.previous.as_ref().unwrap();
+        assert_eq!(current.layout.styles[&target].opacity, Some(0.5));
+        assert!(current.query_seed.as_ref().unwrap().styles[&target].waapi_sample_state.is_some());
+        case.timeline.cancel_waapi(1);
+        case.oracle_timeline.cancel_waapi(1);
+        case.set_attribute(&tree, damage, "style", "height:10px", 600.0);
+        let current = case.previous.as_ref().unwrap();
+        assert_eq!(current.layout.styles[&target].opacity, Some(1.0));
+        assert!(current.query_seed.as_ref().unwrap().styles[&target].waapi_sample_state.is_none());
+    }
+
+    #[test]
+    fn query_seed_falls_back_for_changing_shadow_stylesheets() {
+        let tree = parse_html(r#"<style>
+            #container {container-type:inline-size;width:200px}
+            @container (min-width:100px) {#marker {height:10px;background:green}}
+            </style><div id=container><div id=marker></div><x-card id=host></x-card></div>
+            <div id=source><style id=shadow-sheet>span {display:block;width:20px;height:10px;background:red}</style>
+            <span id=shadow-item></span></div>"#);
+        let host = tree.get_element_by_id("host").unwrap();
+        let source = tree.get_element_by_id("source").unwrap();
+        let sheet = tree.get_element_by_id("shadow-sheet").unwrap();
+        let item = tree.get_element_by_id("shadow-item").unwrap();
+        let text = tree.children(sheet)[0];
+        let root = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        for child in tree.children(source) { tree.append_child(root, child); }
+        tree.remove(source);
+        let mut case = QuerySeedCase::new(Default::default(), Default::default());
+        case.flush(&tree, &[], 0.0);
+        assert!(case.previous.as_ref().unwrap().query_seed.is_none());
+        assert_eq!(case.previous.as_ref().unwrap().layout.rects[&item].width, 20.0);
+        tree.with_node_mut(text, |node| {
+            if let obscura_dom::tree::NodeData::Text {contents} = &mut node.data {
+                *contents = "span {display:block;width:47px;height:20px;background:blue}".into();
+            }
+        });
+        case.flush(&tree, &[crate::dom::TreeStyleMutation::Text {node:text, parent:Some(sheet)}.into()], 1.0);
+        assert!(case.previous.as_ref().unwrap().query_seed.is_none());
+        assert_eq!(case.previous.as_ref().unwrap().layout.rects[&item].width, 47.0);
+    }
+
+
+    #[test]
+    fn query_seed_preserves_conditional_inheritance_and_geometry_after_mutation() {
+        let tree = parse_html(r#"<!doctype html><style>
+            #container { container-type:inline-size;width:250px;--size:20px }
+            #container.narrow { width:80px;--size:30px }
+            .item { width:var(--size);height:15px;background:green }
+            .item.changed { height:35px }
+            .nested { container-type:inline-size;width:70%; }
+            @container (min-width:100px) {
+                .item { width:100px;color:red;font-size:20px }
+                .nested { width:60%;--size:40px }
+            }
+            @container (max-width:100px) { .leaf { padding:3px;color:blue } }
+            </style><div id=container><div id=item class=item><span>text</span></div>
+            <section class=nested><div class='item leaf'>nested</div></section></div>"#);
+        let container = tree.get_element_by_id("container").unwrap();
+        let item = tree.get_element_by_id("item").unwrap();
+        let mut resources = RenderResourceCache::default();
+        let mut oracle_resources = RenderResourceCache::default();
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut oracle_cache = crate::css::StylesheetCache::default();
+        let mut timeline = crate::AnimationTimelineState::default();
+        let mut oracle_timeline = crate::AnimationTimelineState::default();
+        let mut current = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+            &tree, (360.0, 260.0), None, &mut resources, &[], &mut cache,
+            crate::AnimationSample::document(0.0), &mut timeline,
+        ).unwrap();
+        assert_eq!(current.layout.styles[&item].width, crate::Dimension::Px(100.0));
+        assert_eq!(current.query_seed.as_ref().unwrap().styles[&item].width, crate::Dimension::Px(20.0));
+        for (index, (node, name, value, viewport)) in [
+            (item, "class", "item changed", (360.0, 260.0)),
+            (container, "class", "narrow", (360.0, 260.0)),
+            (container, "style", "--size:45px", (360.0, 260.0)),
+            (container, "class", "", (360.0, 260.0)),
+            (item, "style", "font-size:50%;width:50%", (360.0, 260.0)),
+            (container, "style", "width:60%;--size:25px", (180.0, 260.0)),
+            (item, "class", "item", (360.0, 260.0)),
+        ].into_iter().enumerate() {
+            let old_value = tree.get_node(node).unwrap().get_attribute(name).map(str::to_owned);
+            tree.with_node_mut(node, |node| node.set_attribute(name, value.into()));
+            current = prepare_dom_with_retained_styles_with_animation_state(
+                &tree, viewport, None, &mut resources, &[], &mut cache, current,
+                &[crate::dom::AttributeStyleMutation { node, name:name.into(), old_value,
+                    new_value:Some(value.into()) }.into()],
+                crate::AnimationSample::document(index as f32 + 1.0), &mut timeline,
+            ).unwrap();
+            let mut oracle = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                &tree, viewport, None, &mut oracle_resources, &[], &mut oracle_cache,
+                crate::AnimationSample::document(index as f32 + 1.0), &mut oracle_timeline,
+            ).unwrap();
+            assert!(current.query_seed.is_some());
+            assert_query_seed_render_matches(&tree, &mut current, &mut oracle,
+                &mut resources, &mut oracle_resources, &format!("mutation {index}"));
+        }
+    }
+
+    #[test]
+    fn query_seed_resamples_provisional_animation_owners_and_rewinds() {
+        for seed_hidden in [false, true] {
+            let tree = parse_html(&format!(r#"<!doctype html><style>
+                @keyframes grow {{ from {{width:20px}} to {{width:100px}} }}
+                #container {{container-type:inline-size;width:200px}}
+                #target {{display:{};height:10px;animation:grow 1000ms linear infinite}}
+                @container (min-width:100px) {{#target {{display:{}}}}}
+                </style><div id=container><div id=target></div><i id=damage></i></div>"#,
+                if seed_hidden { "none" } else { "block" },
+                if seed_hidden { "block" } else { "none" }));
+            let target = tree.get_element_by_id("target").unwrap();
+            let damage = tree.get_element_by_id("damage").unwrap();
+            let mut resources = RenderResourceCache::default();
+            let mut oracle_resources = RenderResourceCache::default();
+            let mut cache = crate::css::StylesheetCache::default();
+            let mut oracle_cache = crate::css::StylesheetCache::default();
+            let mut timeline = crate::AnimationTimelineState::default();
+            let mut oracle_timeline = crate::AnimationTimelineState::default();
+            timeline.note_start_candidate(target, 0.0);
+            oracle_timeline.note_start_candidate(target, 0.0);
+            let mut previous = None;
+            for sample in [0.0, 250.0, 500.0, 500.0, 100.0, 750.0] {
+                let old_value = tree.get_node(damage).unwrap().get_attribute("style").map(str::to_owned);
+                let value = format!("height:{}px", sample / 50.0 + 1.0);
+                tree.with_node_mut(damage, |node| node.set_attribute("style", value.clone()));
+                let mut current = if let Some(previous) = previous {
+                    prepare_dom_with_retained_styles_with_animation_state(
+                        &tree, (300.0, 180.0), None, &mut resources, &[], &mut cache, previous,
+                        &[crate::dom::AttributeStyleMutation {node:damage, name:"style".into(),
+                            old_value, new_value:Some(value)}.into()],
+                        crate::AnimationSample::document(sample), &mut timeline,
+                    ).unwrap()
+                } else {
+                    prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                        &tree, (300.0, 180.0), None, &mut resources, &[], &mut cache,
+                        crate::AnimationSample::document(sample), &mut timeline,
+                    ).unwrap()
+                };
+                let mut oracle = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                    &tree, (300.0, 180.0), None, &mut oracle_resources, &[], &mut oracle_cache,
+                    crate::AnimationSample::document(sample), &mut oracle_timeline,
+                ).unwrap();
+                assert_query_seed_render_matches(&tree, &mut current, &mut oracle,
+                    &mut resources, &mut oracle_resources, &format!("hidden={seed_hidden} sample={sample}"));
+                timeline.clear_start_candidates();
+                oracle_timeline.clear_start_candidates();
+                previous = Some(current);
+            }
+        }
+    }
+
+    #[test]
+    fn query_seed_is_discarded_when_stylesheet_key_changes() {
+        let tree = parse_html(r#"<!doctype html><style id=sheet>
+            #container {container-type:inline-size;width:200px}
+            #item {height:10px;width:20px}
+            @container (min-width:100px) {#item {width:100px}}
+            </style><div id=container><div id=item></div></div>"#);
+        let sheet = tree.get_element_by_id("sheet").unwrap();
+        let item = tree.get_element_by_id("item").unwrap();
+        let text = tree.children(sheet)[0];
+        let mut resources = RenderResourceCache::default();
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut timeline = crate::AnimationTimelineState::default();
+        let previous = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+            &tree, (300.0, 100.0), None, &mut resources, &[], &mut cache,
+            crate::AnimationSample::document(0.0), &mut timeline,
+        ).unwrap();
+        assert!(previous.query_seed.is_some());
+        tree.with_node_mut(text, |node| {
+            if let obscura_dom::tree::NodeData::Text { contents } = &mut node.data {
+                *contents = "#item {width:47px;height:10px}".into();
+            }
+        });
+        let current = prepare_dom_with_retained_styles_with_animation_state(
+            &tree, (300.0, 100.0), None, &mut resources, &[], &mut cache, previous,
+            &[crate::dom::TreeStyleMutation::Text {node:text,parent:Some(sheet)}.into()],
+            crate::AnimationSample::document(0.0), &mut timeline,
+        ).unwrap();
+        assert!(current.query_seed.is_none());
+        assert_eq!(current.layout.styles[&item].width, crate::Dimension::Px(47.0));
+    }
+
+    #[test]
+    fn container_query_seed_visibility_does_not_restart_final_css_animation() {
+        let tree = parse_html(r#"<style>
+            @keyframes grow { from { width:20px } to { width:100px } }
+            #container { container-type:inline-size;width:200px }
+            #target { display:none;width:20px;height:10px;animation:grow 1000ms linear infinite }
+            @container (min-width:100px) { #target { display:block } }
+            </style><div id=container><div id=target></div></div>"#);
+        let target = tree.get_element_by_id("target").unwrap();
+        let mut resources = RenderResourceCache::default();
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut timeline = crate::AnimationTimelineState::default();
+        timeline.note_start_candidate(target, 0.0);
+        for (sample, expected) in [(0.0, 20.0), (250.0, 40.0), (500.0, 60.0)] {
+            let prepared = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                &tree, (300.0, 150.0), None, &mut resources, &[], &mut cache,
+                crate::AnimationSample::document(sample), &mut timeline,
+            ).unwrap();
+            assert_eq!(prepared.layout.styles[&target].display, crate::Display::Block);
+            assert_eq!(prepared.layout.styles[&target].width, crate::Dimension::Px(expected));
+            assert!(prepared.has_active_declarative_css_animations());
+            timeline.clear_start_candidates();
+        }
+    }
+
+    #[test]
+    fn css_animation_display_eligibility_uses_winning_important_declaration() {
+        for (inline, expected, active) in [("display:none", 40.0, true), ("display:none!important", 20.0, false)] {
+            let tree = parse_html(&format!(r#"<style>
+                @keyframes grow {{ from {{ width:20px }} to {{ width:100px }} }}
+                #target {{ display:block!important;width:20px;height:10px;animation:grow 1s linear infinite }}
+                </style><div id=target style='{inline}'></div>"#));
+            let target = tree.get_element_by_id("target").unwrap();
+            let mut resources = RenderResourceCache::default();
+            let prepared = prepare_dom_at_animation_time(
+                &tree, (200.0, 100.0), None, &mut resources,
+                crate::AnimationSampleTime { milliseconds: 250.0 },
+            ).unwrap();
+            assert_eq!(prepared.layout.styles[&target].width, crate::Dimension::Px(expected));
+            assert_eq!(prepared.has_active_declarative_css_animations(), active);
+        }
+    }
+
+    #[test]
+    fn css_display_none_suppresses_shadow_and_slotted_animations() {
+        for hide_host in [false, true] {
+            let tree = parse_html(&format!(r#"<style>
+                @keyframes grow {{ from {{ width:20px }} to {{ width:100px }} }}
+                #light {{ width:20px;height:10px;animation:grow 1s linear infinite }}
+                </style><x-card id=host style='display:{}'><span id=light></span></x-card>
+                <div id=source><style>
+                @keyframes grow {{ from {{ width:20px }} to {{ width:100px }} }}
+                #shadow {{ width:20px;height:10px;animation:grow 1s linear infinite }}
+                </style><div style='display:{}'><div id=shadow></div><slot></slot></div></div>"#,
+                if hide_host { "none" } else { "block" },
+                if hide_host { "block" } else { "none" },
+            ));
+            let host = tree.get_element_by_id("host").unwrap();
+            let source = tree.get_element_by_id("source").unwrap();
+            let targets = [tree.get_element_by_id("light").unwrap(), tree.get_element_by_id("shadow").unwrap()];
+            let root = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+            for child in tree.children(source) { tree.append_child(root, child); }
+            tree.remove(source);
+            let mut resources = RenderResourceCache::default();
+            let prepared = prepare_dom_at_animation_time(
+                &tree, (200.0, 100.0), None, &mut resources,
+                crate::AnimationSampleTime { milliseconds: 250.0 },
+            ).unwrap();
+            for target in targets {
+                assert_eq!(prepared.layout.styles[&target].width, crate::Dimension::Px(20.0));
+                assert!(!prepared.layout.styles[&target].animation_has_render_effect);
+            }
+            assert!(!prepared.has_active_declarative_css_animations());
+        }
+    }
+
+    #[test]
+    fn retained_fixed_image_source_changes_do_not_freeze_css_animations() {
+        for (before, after) in [(0.0, 500.0), (500.0, 0.0)] {
+            let tree = parse_html(r#"<style>
+                @keyframes grow { from { width:20px } to { width:80px } }
+                #animated { height:10px; background:blue; animation:grow 1s linear both }
+                img { display:block; width:20px; height:10px }
+            </style><div id=animated></div><img id=image src=https://assets.test/a.svg>"#);
+            let image = tree.get_element_by_id("image").unwrap();
+            let animated = tree.get_element_by_id("animated").unwrap();
+            let viewport = (120.0, 80.0);
+            let make_resources = || RenderResourceCache::with_loader(|_url: &str| {
+                Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30"/>"#.to_vec())
+            });
+            let mut resources = make_resources();
+            let mut oracle_resources = make_resources();
+            let mut cache = crate::css::StylesheetCache::default();
+            let mut oracle_cache = crate::css::StylesheetCache::default();
+            let mut timeline = crate::AnimationTimelineState::default();
+            let mut oracle_timeline = crate::AnimationTimelineState::default();
+            timeline.note_start_candidate(animated, 0.0);
+            oracle_timeline.note_start_candidate(animated, 0.0);
+            let previous = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                &tree, viewport, None, &mut resources, &[], &mut cache,
+                crate::AnimationSample::document(before), &mut timeline,
+            ).unwrap();
+            let before_rect = previous.layout.rects[&animated];
+            let _ = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                &tree, viewport, None, &mut oracle_resources, &[], &mut oracle_cache,
+                crate::AnimationSample::document(before), &mut oracle_timeline,
+            ).unwrap();
+            tree.with_node_mut(image, |node| node.set_attribute("src", "https://assets.test/b.svg".into()));
+            let mut retained = prepare_dom_with_retained_styles_with_animation_state(
+                &tree, viewport, None, &mut resources, &[], &mut cache, previous,
+                &[crate::dom::AttributeStyleMutation { node: image, name: "src".into(),
+                    old_value: Some("https://assets.test/a.svg".into()),
+                    new_value: Some("https://assets.test/b.svg".into()) }.into()],
+                crate::AnimationSample::document(after), &mut timeline,
+            ).unwrap();
+            let mut oracle = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                &tree, viewport, None, &mut oracle_resources, &[], &mut oracle_cache,
+                crate::AnimationSample::document(after), &mut oracle_timeline,
+            ).unwrap();
+            assert_ne!(retained.layout.rects[&animated], before_rect, "the animation must advance or rewind");
+            assert_eq!(retained.layout.rects, oracle.layout.rects);
+            assert_eq!(retained.animation_sample, crate::AnimationSample::document(after));
+            let pixels = paint_prepared(&tree, &mut retained, &mut resources, (0.0, 0.0)).unwrap();
+            let expected = paint_prepared(&tree, &mut oracle, &mut oracle_resources, (0.0, 0.0)).unwrap();
+            assert_eq!(pixels.data(), expected.data());
+        }
+    }
+
+    #[cfg(feature = "native-resource-loader")]
     #[test]
     fn image_accept_advertises_exactly_decodable_mime_types() {
         assert!(!IMAGE_ACCEPT.contains('*'));
@@ -11595,6 +14216,176 @@ mod tests {
         assert_eq!(metadata.0, PLACEHOLDER);
         assert_eq!(metadata.2, Some((1.0, 1.0)));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    fn raster_cache_fixture() -> Arc<[u8]> {
+        let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2, 3, image::Rgba([20, 40, 60, 127]),
+        ));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        source.write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        Arc::from(encoded.into_inner())
+    }
+
+    #[test]
+    fn cached_raster_relative_urls_preserve_request_profiles_and_pixels() {
+        let url = "https://example.test/images/image.png";
+        let base = "https://example.test/pages/index.html";
+        let rect = crate::Rect { x: 0.0, y: 0.0, width: 12.0, height: 18.0 };
+        for profile in [None, Some(ImageRequestProfile::NoCorsInclude),
+            Some(ImageRequestProfile::CorsSameOrigin), Some(ImageRequestProfile::CorsInclude)] {
+            let mut cache = RenderResourceCache::default();
+            let bytes = raster_cache_fixture();
+            match profile {
+                Some(profile) => cache.seed_image_shared(url.to_owned(), profile, bytes),
+                None => cache.seed_shared(url.to_owned(), bytes),
+            }
+            let draw = |src, cache: &mut RenderResourceCache| {
+                let mut surface = Pixmap::new(12, 18).unwrap();
+                assert!(paint_image(src, Some(base), &rect, &rect, crate::ObjectFit::Fill,
+                    crate::ObjectPosition::default(), &mut surface, cache, profile, None,
+                    crate::ResolvedBorderRadii::default(), None));
+                surface
+            };
+            let relative = draw("../images/image.png", &mut cache);
+            let absolute = draw(url, &mut cache);
+            assert_eq!(relative.data(), absolute.data());
+            assert_eq!(cache.raster_paints.len(), 1);
+            assert_eq!(relative.pixel(0, 0).unwrap().alpha(), 127);
+        }
+    }
+
+    #[test]
+    fn raster_eligibility_is_lazy_and_invalidated_with_resource_bytes() {
+        let mut cache = RenderResourceCache::default();
+        let url = "https://example.test/lazy.png";
+        let bytes = raster_cache_fixture();
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        let eligibility = |cache: &RenderResourceCache| match cache.entries.get(url).unwrap() {
+            CachedResource::Bytes { static_raster, .. } => static_raster.get().copied(),
+            CachedResource::Missing(_) => None,
+        };
+        assert_eq!(eligibility(&cache), None);
+        // Layout/metadata preparation must not initialize paint eligibility.
+        cache.entries.get(url).unwrap().image_intrinsic();
+        assert_eq!(eligibility(&cache), None);
+        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        assert_eq!(eligibility(&cache), Some(true));
+        cache.raster_paint(url, Arc::clone(&bytes), 6, 9).unwrap();
+        assert_eq!(eligibility(&cache), Some(true));
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        assert_eq!(eligibility(&cache), None);
+        assert!(cache.raster_paints.is_empty());
+        cache.seed_missing(url.to_owned());
+        assert_eq!(eligibility(&cache), None);
+    }
+
+    #[test]
+    fn raster_paint_cache_reuses_exact_pixels_and_separates_dimensions_and_profiles() {
+        let mut cache = RenderResourceCache::default();
+        let bytes = raster_cache_fixture();
+        let url = "https://example.test/image.png";
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        let first = cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        let second = cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.data(), raster_to_pixmap(&bytes, 12, 18).unwrap().data());
+        let resized = cache.raster_paint(url, Arc::clone(&bytes), 6, 9).unwrap();
+        assert!(!Arc::ptr_eq(&first, &resized));
+        let cors_key = image_resource_key(url, ImageRequestProfile::CorsInclude);
+        cache.seed_image_shared(url.to_owned(), ImageRequestProfile::CorsInclude, Arc::clone(&bytes));
+        let cors = cache.raster_paint(&cors_key, bytes, 12, 18).unwrap();
+        assert!(!Arc::ptr_eq(&first, &cors));
+        assert_eq!(first.data(), cors.data());
+    }
+
+    #[cfg(feature = "native-resource-loader")]
+    #[test]
+    fn raster_paint_cache_drops_replaced_failed_and_evicted_resources() {
+        let mut cache = RenderResourceCache::with_loader_and_limits(HttpResourceLoader, 1, 4096);
+        let bytes = raster_cache_fixture();
+        let url = "https://example.test/a.png";
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        assert!(cache.raster_paint_bytes > 0);
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        assert_eq!(cache.raster_paint_bytes, 0);
+        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        cache.seed_missing(url.to_owned());
+        assert!(cache.raster_paints.is_empty());
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        cache.seed_shared("https://example.test/b.png".to_owned(), bytes);
+        assert!(cache.raster_paints.is_empty());
+        assert_eq!(cache.raster_paint_bytes, 0);
+    }
+
+    #[test]
+    fn cached_raster_paint_preserves_cover_clipping_and_transparency() {
+        let mut cache = RenderResourceCache::default();
+        let url = "https://example.test/image.png";
+        cache.seed_shared(url.to_owned(), raster_cache_fixture());
+        let rect = crate::Rect { x: 5.0, y: 5.0, width: 20.0, height: 20.0 };
+        let clip = crate::Rect { x: 10.0, y: 10.0, width: 10.0, height: 10.0 };
+        let draw = |cache: &mut RenderResourceCache| {
+            let mut surface = Pixmap::new(40, 40).unwrap();
+            assert!(paint_image(url, None, &rect, &clip, crate::ObjectFit::Cover,
+                crate::ObjectPosition::default(), &mut surface, cache,
+                Some(ImageRequestProfile::NoCorsInclude), None,
+                crate::ResolvedBorderRadii::default(), None));
+            surface
+        };
+        let cold = draw(&mut cache);
+        assert_eq!(cache.raster_paints.len(), 1);
+        let warm = draw(&mut cache);
+        assert_eq!(cold.data(), warm.data());
+        assert_eq!(warm.pixel(7, 7).unwrap().alpha(), 0);
+        assert_eq!(warm.pixel(15, 15).unwrap().alpha(), 127);
+    }
+
+    #[test]
+    fn raster_paint_cache_excludes_animation_and_unretained_bytes() {
+        use base64::Engine;
+        // A two-frame, 2x3 RGBA APNG with distinct pixel values in each frame.
+        let animated: Arc<[u8]> = Arc::from(base64::engine::general_purpose::STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6BAAAACGFjVEwAAAACAAAAAPONk3AAAAAaZmNUTAAAAAAAAAACAAAAAwAAAAAAAAAAAAEAHgAASoAMRAAAABFJREFUeJxjENGwqQdhBgwGAEpDBcvYVzBtAAAAGmZjVEwAAAABAAAAAgAAAAMAAAAAAAAAAAABAB4AANHz5pAAAAAVZmRBVAAAAAJ4nGOw0bCpB2EGDAYAWFMGu+aEKGIAAAAASUVORK5CYII="
+        ).unwrap());
+        assert!(image::codecs::png::PngDecoder::new(std::io::Cursor::new(&*animated))
+            .unwrap().is_apng().unwrap());
+        let mut cache = RenderResourceCache::default();
+        let url = "https://example.test/animated.png";
+        cache.seed_shared(url.to_owned(), Arc::clone(&animated));
+        assert!(cache.raster_paint(url, animated, 2, 3).is_some());
+        assert!(cache.raster_paints.is_empty());
+        let static_bytes = raster_cache_fixture();
+        assert!(cache.raster_paint("https://example.test/unretained.png", static_bytes, 2, 3).is_some());
+        assert!(cache.raster_paints.is_empty());
+    }
+
+    #[test]
+    fn raster_paint_cache_enforces_payload_entry_and_count_bounds() {
+        let mut cache = RenderResourceCache::default();
+        let bytes = raster_cache_fixture();
+        let url = "https://example.test/image.png";
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        for width in 1..=80 {
+            cache.raster_paint(url, Arc::clone(&bytes), width, 1).unwrap();
+            assert!(cache.raster_paints.len() <= RASTER_PAINT_CACHE_ENTRIES);
+        }
+        for width in 500..510 {
+            cache.raster_paint(url, Arc::clone(&bytes), width, 800).unwrap();
+            assert!(cache.raster_paint_bytes <= RASTER_PAINT_CACHE_BYTES);
+            assert_eq!(cache.raster_paint_bytes,
+                cache.raster_paints.iter().map(|entry| entry.raster.data().len()).sum::<usize>());
+        }
+        let before = cache.raster_paint_bytes;
+        cache.raster_paint(url, Arc::clone(&bytes), 1024, 1024).unwrap();
+        assert_eq!(cache.raster_paint_bytes, before);
+        assert!(!static_raster_cacheable(b"GIF89a"));
+        assert!(!static_raster_cacheable(b"<svg/>"));
+        assert!(!static_raster_cacheable(b"not an image"));
+        cache.remove(url);
+        assert_eq!(cache.raster_paint_bytes, 0);
     }
 
     #[test]
@@ -11759,9 +14550,7 @@ mod tests {
         let output = paint_dom(&tree, (100.0, 100.0), None).expect("paint");
         let below_body = output.pixel(15, 65).expect("pixel");
         assert!(
-            below_body.red() > 240
-                && below_body.green() > 240
-                && below_body.blue() > 240,
+            below_body.red() > 240 && below_body.green() > 240 && below_body.blue() > 240,
             "body overflow must not be mistaken for a viewport clip when html already owns overflow: {below_body:?}"
         );
     }
@@ -12085,10 +14874,16 @@ mod tests {
         .expect("canvas paint");
         let inside = pixmap.pixel(10, 10).expect("inside body box");
         let outside = pixmap.pixel(90, 70).expect("outside body box");
-        assert_eq!(inside, outside, "transferred body background must not paint twice");
+        assert_eq!(
+            inside, outside,
+            "transferred body background must not paint twice"
+        );
         assert!((127..=128).contains(&inside.red()), "red blend: {inside:?}");
         assert_eq!(inside.green(), 0);
-        assert!((127..=128).contains(&inside.blue()), "blue blend: {inside:?}");
+        assert!(
+            (127..=128).contains(&inside.blue()),
+            "blue blend: {inside:?}"
+        );
         assert_eq!(inside.alpha(), 255);
     }
 
@@ -12185,8 +14980,16 @@ mod tests {
         };
 
         assert_eq!(rgb(25, 25), (8, 127, 91), "left side keeps lead background");
-        assert_eq!(rgb(25, 55), (232, 89, 12), "left side keeps heading background");
-        assert_eq!(rgb(25, 70), (112, 72, 232), "left side keeps beside background");
+        assert_eq!(
+            rgb(25, 55),
+            (232, 89, 12),
+            "left side keeps heading background"
+        );
+        assert_eq!(
+            rgb(25, 70),
+            (112, 72, 232),
+            "left side keeps beside background"
+        );
         for y in [25, 55, 70] {
             assert_eq!(
                 rgb(175, y),
@@ -14015,9 +16818,9 @@ mod tests {
         assert!(
             (20..100).any(|x| (20..60).any(|y| {
                 let pixel = pixmap.pixel(x, y).expect("scaled text region");
-                pixel.red() < 80 && pixel.green() < 80 && pixel.blue() < 80
+                pixel.red() < 80 && pixel.green() < 80 && pixel.blue() > 160
             })),
-            "text must be rasterized inside the scaled atomic subtree"
+            "authored blue text must be rasterized inside the scaled atomic subtree"
         );
 
         let rotated_box = pixmap.pixel(165, 25).expect("rotated box");
@@ -14217,14 +17020,14 @@ mod tests {
             </body></html>"#
         ));
         let mut resources = RenderResourceCache::default();
-        let mut prepared = prepare_dom(&tree, (360.0, 220.0), None, &mut resources)
-            .expect("poster-aware layout");
+        let mut prepared =
+            prepare_dom(&tree, (360.0, 220.0), None, &mut resources).expect("poster-aware layout");
         let video = tree.get_element_by_id("poster").expect("video");
         let rect = prepared.document_rect(video).expect("video rect");
         assert_eq!((rect.width, rect.height), (300.0, 100.0));
 
-        let pixmap = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
-            .expect("poster paint");
+        let pixmap =
+            paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).expect("poster paint");
         let red = pixmap.pixel(50, 50).expect("red stripe");
         let green = pixmap.pixel(150, 50).expect("green stripe");
         let blue = pixmap.pixel(250, 50).expect("blue stripe");
@@ -14481,13 +17284,8 @@ mod tests {
         );
         let svg = tree.query_selector("svg").unwrap().unwrap();
         let layout = crate::dom::layout_dom(&tree, (160.0, 80.0));
-        let markup = serialize_svg_styled(
-            &tree,
-            svg,
-            &layout.styles,
-            &layout.custom_properties,
-            None,
-        );
+        let markup =
+            serialize_svg_styled(&tree, svg, &layout.styles, &layout.custom_properties, None);
         assert!(
             markup.contains("fill:#00cc55!important"),
             "computed author fill must cross the standalone boundary: {markup}"
@@ -14505,6 +17303,61 @@ mod tests {
         assert!(
             painted_green,
             "author-styled SVG text should rasterize with embedded fonts"
+        );
+    }
+
+    #[test]
+    fn svg_text_symbol_glyphs_resolve_in_the_font_database() {
+        // The Liberation faces stop at Latin/Greek/Cyrillic: without a
+        // broad-coverage face in the SVG database, usvg's per-glyph fallback
+        // finds nothing for ★/U+2605, renders the .notdef tofu, and warns per
+        // character (#701). Pixel presence cannot distinguish a real glyph
+        // from tofu, so capture usvg's warnings while rasterizing a
+        // symbol-bearing SVG text run through the same database the page
+        // pipeline uses.
+        static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        struct SymbolWarningLogger;
+        impl log::Log for SymbolWarningLogger {
+            fn enabled(&self, _metadata: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record) {
+                if record.level() == log::Level::Warn {
+                    WARNINGS.lock().unwrap().push(record.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        let _ = log::set_boxed_logger(Box::new(SymbolWarningLogger));
+        log::set_max_level(log::LevelFilter::Warn);
+        WARNINGS.lock().unwrap().clear();
+
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="60" height="50">
+            <text x="8" y="34" font-size="24" fill="#00cc55">★</text>
+            <text x="8" y="4" font-size="24" fill="#00cc55">&#x378;</text>
+        </svg>"##;
+        let pixmap = render_svg_with_font_database(svg.as_bytes(), 60, 50, &svg_font_database())
+            .expect("raster");
+        assert!(
+            pixmap
+                .pixels()
+                .iter()
+                .any(|pixel| pixel.green() > 150 && pixel.red() < 80 && pixel.blue() < 120),
+            "the ★ text run should rasterize"
+        );
+        let warnings = WARNINGS.lock().unwrap();
+        // Positive control first: an unassigned codepoint must still warn, so
+        // the test fails loudly if the logger wiring breaks instead of
+        // vacuously passing.
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("U+378 character")),
+            "the unassigned-codepoint control must warn: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("U+2605")),
+            "the SVG font database must cover ★ instead of dropping to .notdef: {warnings:?}"
         );
     }
 
@@ -14626,13 +17479,7 @@ mod tests {
         );
         let svg = tree.query_selector("#icon").unwrap().unwrap();
         let laid = crate::dom::layout_dom(&tree, (70.0, 10.0));
-        let markup = serialize_svg_styled(
-            &tree,
-            svg,
-            &laid.styles,
-            &laid.custom_properties,
-            None,
-        );
+        let markup = serialize_svg_styled(&tree, svg, &laid.styles, &laid.custom_properties, None);
 
         assert!(
             markup.contains(r##"fill="#dc1e28""##)
@@ -14720,6 +17567,41 @@ mod tests {
             computed.get("word-break").map(String::as_str),
             Some("keep-all")
         );
+    }
+
+    /// A text `<input>`'s value has no DOM text node, so it needs painting from
+    /// the attribute the way the placeholder does. Without it the control
+    /// rendered empty while `value` read back correctly — visible only in a
+    /// screenshot or PDF. `type=password` masks with bullets.
+    #[test]
+    fn input_values_paint_like_placeholders() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                 body{margin:0;background:#fff}
+                 input{display:block;width:180px;height:30px;border:0;padding:0;font-size:16px}
+               </style></head><body>
+                 <input id="filled" value="ABC">
+                 <input id="empty">
+                 <input id="secret" type="password" value="ABC">
+               </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let mut prepared =
+            prepare_dom(&tree, (200.0, 120.0), None, &mut resources).expect("input layout");
+        let pixmap =
+            paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).expect("input paint");
+        let ink = |top: u32| {
+            (top..top + 30)
+                .flat_map(|y| (0..180).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let pixel = pixmap.pixel(x, y).unwrap();
+                    pixel.red() < 200 || pixel.green() < 200 || pixel.blue() < 200
+                })
+                .count()
+        };
+        assert!(ink(0) > 10, "a value from markup must paint");
+        assert_eq!(ink(30), 0, "an empty control paints nothing");
+        assert!(ink(60) > 10, "a password value must paint as bullets");
     }
 
     #[test]
@@ -14909,13 +17791,8 @@ mod tests {
         );
         let laid = crate::dom::layout_dom(&tree, (100.0, 100.0));
         let svg = tree.query_selector("#icon").unwrap().unwrap();
-        let mut markup = serialize_svg_styled(
-            &tree,
-            svg,
-            &laid.styles,
-            &laid.custom_properties,
-            None,
-        );
+        let mut markup =
+            serialize_svg_styled(&tree, svg, &laid.styles, &laid.custom_properties, None);
         let mut cache = RenderResourceCache::default();
         let mut sprite_cache = std::collections::HashMap::new();
         inject_external_sprites(
@@ -14951,13 +17828,8 @@ mod tests {
         );
         let laid = crate::dom::layout_dom(&tree, (100.0, 100.0));
         let svg = tree.query_selector("#icon").unwrap().unwrap();
-        let mut markup = serialize_svg_styled(
-            &tree,
-            svg,
-            &laid.styles,
-            &laid.custom_properties,
-            None,
-        );
+        let mut markup =
+            serialize_svg_styled(&tree, svg, &laid.styles, &laid.custom_properties, None);
         let mut cache = RenderResourceCache::default();
         let mut sprite_cache = std::collections::HashMap::from([(
             "icons.svg#badge".to_string(),
@@ -14981,8 +17853,7 @@ mod tests {
             "external use reference must be localized: {markup}"
         );
         assert!(
-            markup.contains(r##"fill="#e83e8c""##)
-                && markup.contains(r##"stroke="#224466""##),
+            markup.contains(r##"fill="#e83e8c""##) && markup.contains(r##"stroke="#224466""##),
             "external symbol presentation values must use host properties and fallbacks: {markup}"
         );
         assert!(
@@ -15042,13 +17913,7 @@ mod tests {
         );
         let laid = crate::dom::layout_dom(&tree, (100.0, 100.0));
         let svg = tree.query_selector("#icon").unwrap().unwrap();
-        let markup = serialize_svg_styled(
-            &tree,
-            svg,
-            &laid.styles,
-            &laid.custom_properties,
-            None,
-        );
+        let markup = serialize_svg_styled(&tree, svg, &laid.styles, &laid.custom_properties, None);
         assert!(
             !markup.to_ascii_lowercase().contains("light-dark("),
             "unsupported CSS Color 5 syntax must not reach usvg: {markup}"
@@ -15069,6 +17934,96 @@ mod tests {
                 && center.blue() < 130,
             "resolved dark fill must survive usvg rasterization: {center:?}"
         );
+    }
+
+
+    #[test]
+    fn metadata_discovery_refreshes_preloads_shadow_fonts_and_svg_text() {
+        let tree = parse_html(r#"<style id=faces>
+            @font-face{font-family:First;src:url(first.ttf)}
+            @font-face{font-family:Second;src:url(second.ttf);font-weight:700;font-style:italic}
+            </style><link id=preload rel="alternate PrElOaD" as="FoNt" href="second.ttf">
+            <x-card id=host><style>@font-face{font-family:Ignored;src:url(ignored.ttf)}</style>
+                <svg><text>Unslotted</text></svg></x-card>
+            <div id=source><style>@font-face{font-family:Shadow;src:url(shadow.ttf)}</style>
+                <svg id=visible><text>Visible</text></svg></div>"#);
+        let host = tree.get_element_by_id("host").unwrap();
+        let source = tree.get_element_by_id("source").unwrap();
+        let visible = tree.get_element_by_id("visible").unwrap();
+        let faces = tree.get_element_by_id("faces").unwrap();
+        let preload = tree.get_element_by_id("preload").unwrap();
+        let shadow = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        for child in tree.children(source) { tree.append_child(shadow, child); }
+        tree.remove(source);
+        let loads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = loads.clone();
+        let mut resources = RenderResourceCache::with_loader(move |url: &str| {
+            observed.lock().unwrap().push(url.to_owned());
+            Some(SERIF_FONT_BYTES.to_vec())
+        });
+        let fonts = collect_web_fonts(&tree, Some("https://example.test/page"), &mut resources, &[]);
+        assert_eq!(fonts.iter().map(|f| f.family.as_deref().unwrap()).collect::<Vec<_>>(),
+            vec!["Second", "First", "Shadow"]);
+        assert_eq!(fonts[0].weight, Some((700, 700)));
+        assert_eq!(fonts[0].italic, Some(true));
+        assert!(has_inline_svg_text(&tree));
+        let css_text = tree.children(faces)[0];
+        tree.with_node_mut(css_text, |node| {
+            if let obscura_dom::tree::NodeData::Text { contents } = &mut node.data {
+                *contents = "@font-face{font-family:Changed;src:url(first.ttf);font-weight:600}@font-face{font-family:Second;src:url(second.ttf)}".into();
+            }
+        });
+        tree.with_node_mut(preload, |node| node.set_attribute("href", "first.ttf".into()));
+        tree.remove(visible);
+        let fonts = collect_web_fonts(&tree, Some("https://example.test/page"), &mut resources, &[]);
+        assert_eq!(fonts.iter().map(|f| f.family.as_deref().unwrap()).collect::<Vec<_>>(),
+            vec!["Changed", "Second", "Shadow"]);
+        assert_eq!(fonts[0].weight, Some((600, 600)));
+        assert!(!has_inline_svg_text(&tree), "unslotted SVG text must remain excluded");
+        assert_eq!(*loads.lock().unwrap(), vec![
+            "https://example.test/second.ttf", "https://example.test/first.ttf",
+            "https://example.test/shadow.ttf"], "warm resources must not reload or discover unslotted fonts");
+    }
+
+    #[test]
+    fn metadata_discovery_refreshes_responsive_images_posters_and_profiles() {
+        let tree = parse_html(r#"<picture>
+            <source media="(min-width:500px)" srcset="large.svg 2x">
+            <img id=hero src="small.svg" crossorigin="anonymous">
+            </picture><video id=video poster="  poster.svg  "></video>
+            <video poster=" "></video><div data-src="ignored.svg">ordinary text</div>"#);
+        let hero = tree.get_element_by_id("hero").unwrap();
+        let video = tree.get_element_by_id("video").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_: &str| {
+            panic!("seeded metadata must not open a resource request")
+        });
+        for (url, profile, width, height) in [
+            ("large.svg", ImageRequestProfile::CorsSameOrigin, 80, 40),
+            ("small.svg", ImageRequestProfile::CorsSameOrigin, 10, 5),
+            ("poster.svg", ImageRequestProfile::NoCorsInclude, 30, 20),
+            ("large.svg", ImageRequestProfile::CorsInclude, 100, 60),
+        ] {
+            resources.seed_image(format!("https://example.test/{url}"), profile,
+                format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"/>"#).into_bytes());
+        }
+        let (intrinsic, selected) = collect_image_intrinsics(&tree, (800.0, 600.0),
+            Some("https://example.test/page"), &mut resources);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[&hero].resolved_url, "https://example.test/large.svg");
+        assert_eq!(selected[&hero].density, 2.0);
+        assert_eq!(intrinsic[&hero].natural_size(), Some((40.0, 20.0)));
+        assert_eq!(intrinsic[&video].natural_size(), Some((30.0, 20.0)));
+        tree.with_node_mut(video, |node| node.set_attribute("poster", "  ".into()));
+        let (intrinsic, selected) = collect_image_intrinsics(&tree, (320.0, 600.0),
+            Some("https://example.test/page"), &mut resources);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[&hero].resolved_url, "https://example.test/small.svg");
+        assert_eq!(intrinsic[&hero].natural_size(), Some((10.0, 5.0)));
+        tree.with_node_mut(hero, |node| node.set_attribute("crossorigin", "use-credentials".into()));
+        let (intrinsic, selected) = collect_image_intrinsics(&tree, (800.0, 600.0),
+            Some("https://example.test/page"), &mut resources);
+        assert_eq!(selected[&hero].profile, ImageRequestProfile::CorsInclude);
+        assert_eq!(intrinsic[&hero].natural_size(), Some((50.0, 30.0)));
     }
 
     #[test]
@@ -15110,6 +18065,76 @@ mod tests {
         let face = font_face_blocks(css)[0];
         assert!(font_face_covers_ascii(face));
         assert_eq!(font_face_urls(face), vec!["example.otf"]);
+    }
+
+    #[test]
+    fn font_face_uses_the_first_decodable_source() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                @font-face {
+                    font-family: Fixture;
+                    src: url("fixture.eot") format("embedded-opentype"),
+                         url("fixture.woff2") format("woff2"),
+                         url("fixture.ttf") format("truetype");
+                }
+            </style></head><body></body></html>"#,
+        );
+        let loads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let loader_loads = Arc::clone(&loads);
+        let mut resources = RenderResourceCache::with_loader(move |url: &str| {
+            loader_loads
+                .lock()
+                .expect("font loads")
+                .push(url.to_string());
+            match url {
+                // A server can return malformed bytes for a preferred source;
+                // CSS Fonts requires trying the next candidate in the list.
+                "https://example.test/fixture.woff2" => Some(b"not a font".to_vec()),
+                "https://example.test/fixture.ttf" => Some(SERIF_FONT_BYTES.to_vec()),
+                _ => None,
+            }
+        });
+
+        let fonts = collect_web_fonts(
+            &tree,
+            Some("https://example.test/page.html"),
+            &mut resources,
+            &[],
+        );
+
+        assert_eq!(fonts.len(), 1);
+        assert_eq!(fonts[0].family.as_deref(), Some("Fixture"));
+        assert_eq!(fonts[0].data.as_slice(), SERIF_FONT_BYTES);
+        assert_eq!(
+            *loads.lock().expect("font loads"),
+            vec![
+                "https://example.test/fixture.woff2".to_string(),
+                "https://example.test/fixture.ttf".to_string(),
+            ],
+            "unsupported EOT must be skipped without a request"
+        );
+    }
+
+    #[test]
+    fn font_face_uses_the_last_duplicate_src_descriptor() {
+        let css = r#"@font-face {
+            font-family: FontAwesome;
+            src: url("legacy.eot");
+            src: url("legacy.eot?#iefix") format("embedded-opentype"),
+                 url("icons.woff2") format("woff2"),
+                 url("icons.ttf") format("truetype");
+        }"#;
+        let face = font_face_blocks(css)[0];
+
+        assert_eq!(
+            font_face_urls(face),
+            vec![
+                "legacy.eot?#iefix".to_string(),
+                "icons.woff2".to_string(),
+                "icons.ttf".to_string(),
+            ],
+            "CSS keeps the final duplicate @font-face descriptor"
+        );
     }
 
     #[test]
@@ -15310,7 +18335,10 @@ mod tests {
 
         let top = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
         assert_eq!(
-            prepared.viewport_rect_with_scroll(plain_sticky, &top).unwrap().y,
+            prepared
+                .viewport_rect_with_scroll(plain_sticky, &top)
+                .unwrap()
+                .y,
             40.0,
         );
         let offsets = HashMap::from([
@@ -15321,11 +18349,17 @@ mod tests {
         ]);
         let scrolled = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &offsets);
         assert_eq!(
-            prepared.element_scroll_metrics(plain, &scrolled).unwrap().offset,
+            prepared
+                .element_scroll_metrics(plain, &scrolled)
+                .unwrap()
+                .offset,
             (0.0, 60.0),
         );
         assert_eq!(
-            prepared.viewport_rect_with_scroll(plain, &scrolled).unwrap().y,
+            prepared
+                .viewport_rect_with_scroll(plain, &scrolled)
+                .unwrap()
+                .y,
             0.0,
             "scroll-container chrome must remain stationary",
         );
@@ -15377,12 +18411,7 @@ mod tests {
             "calc() percentage inset must use the nested content-box basis",
         );
 
-        let pixels = paint_prepared_with_scroll(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            &scrolled,
-        )
+        let pixels = paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &scrolled)
         .expect("paint");
         let plain_pixel = pixels.pixel(10, 10).unwrap();
         let percent_pixel = pixels.pixel(130, 65).unwrap();
@@ -15428,8 +18457,8 @@ mod tests {
         assert!(prepared.viewport_fixed_nodes().contains(&fixed));
         assert!(!prepared.viewport_fixed_nodes().contains(&captured_fixed));
 
-        let tuple = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
-            .expect("tuple paint");
+        let tuple =
+            paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).expect("tuple paint");
         let tuple_pixel = tuple.pixel(155, 15).unwrap();
         assert!(
             tuple_pixel.green() > 240 && tuple_pixel.red() < 20 && tuple_pixel.blue() < 20,
@@ -15456,18 +18485,19 @@ mod tests {
             scroll.inherited_clip_for(fixed).is_none(),
             "a viewport-fixed boundary must clear document-space overflow clips",
         );
-        let resolved =
-            paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &scroll)
+        let resolved = paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &scroll)
                 .expect("resolved paint");
         let resolved_pixel = resolved.pixel(155, 15).unwrap();
         assert!(
-            resolved_pixel.green() > 240
-                && resolved_pixel.red() < 20
-                && resolved_pixel.blue() < 20,
+            resolved_pixel.green() > 240 && resolved_pixel.red() < 20 && resolved_pixel.blue() < 20,
             "the resolved paint path retained the ancestor scroller clip: {resolved_pixel:?}",
         );
         let captured_pixel = resolved.pixel(155, 55).unwrap();
-        assert!(captured_pixel.red() > 240 && captured_pixel.green() > 240 && captured_pixel.blue() > 240);
+        assert!(
+            captured_pixel.red() > 240
+                && captured_pixel.green() > 240
+                && captured_pixel.blue() > 240
+        );
         let internal_clip_pixel = resolved.pixel(155, 80).unwrap();
         assert!(
             internal_clip_pixel.red() > 240
@@ -15489,8 +18519,7 @@ mod tests {
         let calc = tree.get_element_by_id("calc").unwrap();
         let vh = tree.get_element_by_id("vh").unwrap();
         let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
-        let prepared =
-            prepare_dom(&tree, (200.0, 200.0), None, &mut resources).expect("prepared");
+        let prepared = prepare_dom(&tree, (200.0, 200.0), None, &mut resources).expect("prepared");
         let live = prepared.resolve_scroll_state_for_viewport(
             &tree,
             (0.0, 200.0),
@@ -15504,10 +18533,22 @@ mod tests {
             (200.0, 100.0),
         );
 
-        assert_eq!(prepared.viewport_rect_with_scroll(calc, &live).unwrap().y, 101.0);
-        assert_eq!(prepared.viewport_rect_with_scroll(calc, &page).unwrap().y, 51.0);
-        assert_eq!(prepared.viewport_rect_with_scroll(vh, &live).unwrap().y, 20.0);
-        assert_eq!(prepared.viewport_rect_with_scroll(vh, &page).unwrap().y, 10.0);
+        assert_eq!(
+            prepared.viewport_rect_with_scroll(calc, &live).unwrap().y,
+            101.0
+        );
+        assert_eq!(
+            prepared.viewport_rect_with_scroll(calc, &page).unwrap().y,
+            51.0
+        );
+        assert_eq!(
+            prepared.viewport_rect_with_scroll(vh, &live).unwrap().y,
+            20.0
+        );
+        assert_eq!(
+            prepared.viewport_rect_with_scroll(vh, &page).unwrap().y,
+            10.0
+        );
     }
 
     #[test]
@@ -15531,8 +18572,7 @@ mod tests {
         let clip = tree.get_element_by_id("clip").unwrap();
         let clip_sticky = tree.get_element_by_id("clip-sticky").unwrap();
         let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
-        let prepared =
-            prepare_dom(&tree, (240.0, 120.0), None, &mut resources).expect("prepared");
+        let prepared = prepare_dom(&tree, (240.0, 120.0), None, &mut resources).expect("prepared");
         assert!(prepared.scroll_container_nodes().any(|node| node == hidden));
         assert!(!prepared.scroll_container_nodes().any(|node| node == clip));
 
@@ -15604,12 +18644,7 @@ mod tests {
             "outer sticky movement must affect the inner port and its content equally",
         );
 
-        let pixels = paint_prepared_with_scroll(
-            &tree,
-            &mut prepared,
-            &mut resources,
-            &scrolled,
-        )
+        let pixels = paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &scrolled)
         .expect("paint");
         let pixel = pixels.pixel(10, 7).unwrap();
         assert!(pixel.green() > 240 && pixel.red() < 20 && pixel.blue() < 20);
@@ -15653,8 +18688,8 @@ mod tests {
             60.0,
         );
 
-        let pixels = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
-            .expect("tuple paint");
+        let pixels =
+            paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).expect("tuple paint");
         let pixel = pixels.pixel(10, 65).unwrap();
         let fixed_pixel = pixels.pixel(130, 65).unwrap();
         assert!(pixel.green() > 240 && pixel.red() < 20 && pixel.blue() < 20);
@@ -15801,18 +18836,36 @@ mod tests {
         let region = CaptureRegion::new(0.0, 0.0, 120.0, 220.0, 1.0);
 
         let screen_before = screenshot_prepared_region_with_scroll_and_backgrounds(
-            &tree, &mut prepared, &mut resources, &scroll, region, true,
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            region,
+            true,
         )
         .expect("screen capture before print");
         let economy = screenshot_prepared_region_with_scroll_and_backgrounds(
-            &tree, &mut prepared, &mut resources, &scroll, region, false,
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            region,
+            false,
         )
         .expect("print economy capture");
         let screen_after = screenshot_prepared_region_with_scroll_and_backgrounds(
-            &tree, &mut prepared, &mut resources, &scroll, region, true,
+            &tree,
+            &mut prepared,
+            &mut resources,
+            &scroll,
+            region,
+            true,
         )
         .expect("screen capture after print");
-        assert_eq!(screen_before, screen_after, "print paint must not mutate retained style");
+        assert_eq!(
+            screen_before, screen_after,
+            "print paint must not mutate retained style"
+        );
 
         let screen = image::load_from_memory_with_format(&screen_before, image::ImageFormat::Png)
             .unwrap()
@@ -16192,7 +19245,10 @@ mod tests {
             &style,
         );
         assert_eq!(ink.x, 76.0, "outset shadow must widen the cull rect");
-        assert_eq!(ink.y, 0.0, "shadow blur must widen the cull rect vertically");
+        assert_eq!(
+            ink.y, 0.0,
+            "shadow blur must widen the cull rect vertically"
+        );
         assert_eq!(ink.x + ink.width, 127.0);
     }
 
@@ -16247,9 +19303,7 @@ mod tests {
         let pixmap = paint_dom(&tree, (120.0, 120.0), None).expect("transformed outline");
         let outer_outline = pixmap.pixel(25, 50).expect("transformed outer outline");
         assert!(
-            outer_outline.red() > 220
-                && outer_outline.green() < 40
-                && outer_outline.blue() < 40,
+            outer_outline.red() > 220 && outer_outline.green() < 40 && outer_outline.blue() < 40,
             "outline ink outside the border-box source bounds must survive the transform: {outer_outline:?}"
         );
     }
@@ -16323,8 +19377,7 @@ mod tests {
 
     #[test]
     fn animation_restyle_mutations_deduplicate_waapi_and_filter_disconnected_targets() {
-        let tree =
-            parse_html("<main><div id=connected></div><div id=detached></div></main>");
+        let tree = parse_html("<main><div id=connected></div><div id=detached></div></main>");
         let connected = tree.get_element_by_id("connected").unwrap();
         let detached = tree.get_element_by_id("detached").unwrap();
         tree.remove_child(detached);
@@ -16359,9 +19412,7 @@ mod tests {
         let mutations = retained_animation_restyle_mutations(&tree, &HashMap::new(), &timeline);
         assert_eq!(
             mutations,
-            vec![crate::dom::RetainedStyleMutation::WaapiAnimation {
-                node: connected
-            }],
+            vec![crate::dom::RetainedStyleMutation::WaapiAnimation { node: connected }],
             "only connected WAAPI targets may enter retained style damage"
         );
     }
@@ -16388,18 +19439,16 @@ mod tests {
             hold_time_ms: None,
             play_state: crate::WaapiPlayState::Running,
         };
-        let sample = crate::AnimationSampleTime { milliseconds: 100.0 };
+        let sample = crate::AnimationSampleTime {
+            milliseconds: 100.0,
+        };
         let mut timeline = crate::AnimationTimelineState::default();
         timeline.register_waapi(animation(1, Some(0.5), None));
         assert_eq!(
             timeline.active_waapi_effect_impact(sample),
             crate::AnimationEffectImpact::Paint,
         );
-        timeline.register_waapi(animation(
-            2,
-            None,
-            Some("future-transform(1)".to_string()),
-        ));
+        timeline.register_waapi(animation(2, None, Some("future-transform(1)".to_string())));
         assert_eq!(
             timeline.active_waapi_effect_impact(sample),
             crate::AnimationEffectImpact::Geometry,
@@ -16534,8 +19583,7 @@ mod tests {
         let mut oracle_resources = RenderResourceCache::with_loader(|_url: &str| None);
         let mut oracle_cache = crate::css::StylesheetCache::default();
         let mut oracle_timeline = make_timeline();
-        let mut oracle =
-            prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+        let mut oracle = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
                 &tree,
                 viewport,
                 None,
@@ -16548,7 +19596,10 @@ mod tests {
             .expect("forced-full oracle");
 
         assert_eq!(candidate.layout.rects, oracle.layout.rects);
-        assert_eq!(candidate.layout.inline_fragments, oracle.layout.inline_fragments);
+        assert_eq!(
+            candidate.layout.inline_fragments,
+            oracle.layout.inline_fragments
+        );
         assert_eq!(candidate.layout.translates, oracle.layout.translates);
         assert_eq!(candidate.layout.transforms, oracle.layout.transforms);
         assert_eq!(candidate.layout.clip_rects, oracle.layout.clip_rects);
@@ -16562,7 +19613,11 @@ mod tests {
             candidate.scroll_container_nodes().collect::<Vec<_>>(),
             oracle.scroll_container_nodes().collect::<Vec<_>>(),
         );
-        assert!(candidate.scroll_container_nodes().any(|node| node == scroller));
+        assert!(
+            candidate
+                .scroll_container_nodes()
+                .any(|node| node == scroller)
+        );
         for node in [moving, affine, overflow] {
             assert_eq!(
                 format!("{:?}", candidate.layout.styles[&node]),
@@ -16603,7 +19658,9 @@ mod tests {
             oracle.viewport_rect_with_scroll(scroll_target, &oracle_scroll),
         );
         assert_ne!(
-            candidate.sticky.translations(viewport, candidate_scroll.root_offset),
+            candidate
+                .sticky
+                .translations(viewport, candidate_scroll.root_offset),
             HashMap::new(),
         );
         let candidate_pixels = paint_prepared_with_scroll(
@@ -16613,12 +19670,8 @@ mod tests {
             &candidate_scroll,
         )
         .expect("candidate pixels");
-        let oracle_pixels = paint_prepared_with_scroll(
-            &tree,
-            &mut oracle,
-            &mut oracle_resources,
-            &oracle_scroll,
-        )
+        let oracle_pixels =
+            paint_prepared_with_scroll(&tree, &mut oracle, &mut oracle_resources, &oracle_scroll)
         .expect("oracle pixels");
         assert_eq!(candidate_pixels.data(), oracle_pixels.data());
     }
@@ -16725,8 +19778,7 @@ mod tests {
             )
             .expect("initial render before delayed effect");
         assert_eq!(
-            prepared.layout.styles[&target].containing_block_triggers
-                & crate::CB_TRIGGER_TRANSFORM,
+            prepared.layout.styles[&target].containing_block_triggers & crate::CB_TRIGGER_TRANSFORM,
             0,
         );
         assert!(!prepared.try_advance_visual_waapi_sample(
@@ -16734,7 +19786,10 @@ mod tests {
             crate::AnimationSample::document(500.0),
             &timeline,
         ));
-        assert_eq!(prepared.animation_sample, crate::AnimationSample::document(0.0));
+        assert_eq!(
+            prepared.animation_sample,
+            crate::AnimationSample::document(0.0)
+        );
     }
 
     #[test]
@@ -16763,7 +19818,10 @@ mod tests {
         .expect("T=0 render");
         assert_eq!(at_zero.animation_sample_time().milliseconds, 0.0);
         assert_eq!(at_zero.layout.styles[&overlay].opacity, Some(1.0));
-        assert_ne!(at_zero.layout.styles[&overlay].visibility_hidden, Some(true));
+        assert_ne!(
+            at_zero.layout.styles[&overlay].visibility_hidden,
+            Some(true)
+        );
         assert!(at_zero.has_active_css_animations());
 
         let at_end = prepare_dom_with_dynamic_fonts_and_stylesheet_cache_at_animation_time(
@@ -16773,12 +19831,181 @@ mod tests {
             &mut resources,
             &[],
             &mut stylesheets,
-            crate::AnimationSampleTime { milliseconds: 600.0 },
+            crate::AnimationSampleTime {
+                milliseconds: 600.0,
+            },
         )
         .expect("animation-end render");
         assert_eq!(at_end.layout.styles[&overlay].opacity, Some(0.0));
         assert_eq!(at_end.layout.styles[&overlay].visibility_hidden, Some(true));
         assert!(at_end.layout.styles[&overlay].effectively_invisible);
         assert!(!at_end.has_active_css_animations());
+    }
+
+    #[test]
+    fn css_resource_urls_ignores_strings_comments_data_and_fragments() {
+        let base = url::Url::parse("https://example.test/css/app/main.css").unwrap();
+        let css = r#"
+            /* url(ignored.png) */
+            .copy::before { content: "url(also-ignored.png)"; }
+            @import URL("theme.css") print;
+            @import url("semi;colon.css") screen;
+            .hero { background: url('../img/hero.png'); }
+            .icon { mask: URL("https://cdn.test/icon.svg#shape"); }
+            .inline { background: url(data:image/svg+xml,<svg/>); }
+            .local { mask: url(#local); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/css/img/hero.png".to_string(),
+                "https://cdn.test/icon.svg".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn css_resource_urls_handles_import_variations_and_skips_stylesheet_dependencies() {
+        let base = url::Url::parse("https://example.test/base.css").unwrap();
+        let css = r#"
+            @import "simple.css";
+            @import url("with-url.css");
+            @import url('with-single.css');
+            @import 'semi;colon.css';
+            @import url("media;query.css") (min-width: 600px);
+            @import /* comment ; inside */ "comment.css";
+            @import "nested.css" screen and (max-width: 768px);
+            .a { background: url("image-a.png"); }
+            @important { color: red; }
+            .b { background: url("image-b.png"); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/image-a.png".to_string(),
+                "https://example.test/image-b.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn css_resource_urls_preserves_order_and_duplicates() {
+        let base = url::Url::parse("https://example.test/page.html").unwrap();
+        let css = r#"
+            .first { background: url("shared.png"); }
+            .second { background: url("second.png"); }
+            .repeat { background: url("shared.png"); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/shared.png".to_string(),
+                "https://example.test/second.png".to_string(),
+                "https://example.test/shared.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn css_resource_urls_filters_schemes_var_and_url_parser_canonicalization() {
+        let base = url::Url::parse("https://example.test/style.css").unwrap();
+        let css = r#"
+            .http { background: url("http://insecure.test/img.png"); }
+            .https { background: url("https://secure.test/img.png"); }
+            .ftp { background: url("ftp://files.test/img.png"); }
+            .file { background: url("file:///local/img.png"); }
+            .blob { background: url("blob:https://example.test/uuid"); }
+            .javascript { background: url("javascript:alert(1)"); }
+            .var1 { background: url(var(--custom-bg)); }
+            .var2 { background: url(var(--bg, "fallback.png")); }
+            .empty1 { background: url(); }
+            .empty2 { background: url(""); }
+            .empty3 { background: url('   '); }
+            .unquoted { background: url(unquoted.png); }
+            .spaced { background: url(  "spaced.png"  ); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "http://insecure.test/img.png".to_string(),
+                "https://secure.test/img.png".to_string(),
+                "https://example.test/unquoted.png".to_string(),
+                "https://example.test/spaced.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn css_resource_urls_handles_malformed_and_edge_cases() {
+        let base = url::Url::parse("https://example.test/app.css").unwrap();
+        assert_eq!(css_resource_urls("/* url(a.png)", &base), Vec::<String>::new());
+        assert_eq!(css_resource_urls(r#""url(a.png)"#, &base), Vec::<String>::new());
+        assert_eq!(
+            css_resource_urls(r#"content: "escaped \" url(a.png)"; .b { background: url(b.png); }"#, &base),
+            vec!["https://example.test/b.png".to_string()]
+        );
+        assert_eq!(css_resource_urls("background: url(unclosed.png", &base), Vec::<String>::new());
+        assert_eq!(css_resource_urls("@import url(unclosed.css", &base), Vec::<String>::new());
+        assert_eq!(
+            css_resource_urls(r#"background: url("foo%20bar.png");"#, &base),
+            vec!["https://example.test/foo%20bar.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn css_resource_requests_preserve_font_face_context_not_url_suffixes() {
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = r#"
+            😀 .image { background: url("looks-like-font.woff2"); }
+            @FONT-FACE/* valid comment boundary */{
+                src: local("Ignored"), url("/download?family=portable");
+                @supports (font-tech(color-COLRv1)) {
+                    src: url("nested?id=2");
+                }
+            }
+            .after { mask: url("after.svg"); }
+            .copy::before { content: "@font-face { src:url(fake) }"; }
+        "#;
+        assert_eq!(
+            css_resource_requests(css, &base),
+            vec![
+                CssResourceRequest {
+                    url: "https://example.test/css/looks-like-font.woff2".to_string(),
+                    kind: CssResourceKind::Image,
+                },
+                CssResourceRequest {
+                    url: "https://example.test/download?family=portable".to_string(),
+                    kind: CssResourceKind::Font,
+                },
+                CssResourceRequest {
+                    url: "https://example.test/css/nested?id=2".to_string(),
+                    kind: CssResourceKind::Font,
+                },
+                CssResourceRequest {
+                    url: "https://example.test/css/after.svg".to_string(),
+                    kind: CssResourceKind::Image,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn css_resource_scanner_treats_comments_as_boundaries_and_balanced_eof_import_as_import() {
+        let base = url::Url::parse("https://example.test/app.css").unwrap();
+        assert_eq!(
+            css_resource_requests("/* lead */@font-face/* gap */{src:url(font?id=1)}", &base),
+            vec![CssResourceRequest {
+                url: "https://example.test/font?id=1".to_string(),
+                kind: CssResourceKind::Font,
+            }]
+        );
+        assert_eq!(
+            css_resource_requests("@import url(theme.css)", &base),
+            Vec::<CssResourceRequest>::new()
+        );
+        assert_eq!(
+            css_resource_requests("@import url(unclosed.css", &base),
+            Vec::<CssResourceRequest>::new()
+        );
     }
 }

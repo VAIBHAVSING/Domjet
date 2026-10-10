@@ -1,0 +1,347 @@
+//! Transport-free cookie and storage-domain state.
+//!
+//! Context cookies are logical browser state. A host may mirror them into its
+//! page runtime for request headers and `document.cookie`, but it does not
+//! decide the CDP-visible cookie set or its lifetime.
+
+use serde_json::{json, Value};
+use url::Url;
+
+use crate::engine::{CdpFailure, ContextId, PageId};
+use crate::protocol::{CdpRequest, CdpResponse, MAX_METHOD_BYTES};
+use crate::state::{
+    BrowserState, ContextCookieState, MAX_COOKIE_BYTES, MAX_COOKIE_COUNT,
+};
+
+fn error(request: &CdpRequest, code: i64, message: impl Into<String>) -> CdpResponse {
+    CdpResponse::error(request.id, code, message.into(), request.session_id.clone())
+}
+
+fn failure(request: &CdpRequest, failure: CdpFailure) -> CdpResponse {
+    let code = match failure {
+        CdpFailure::InvalidArgument(_) => -32602,
+        CdpFailure::UnknownPage(_) | CdpFailure::UnknownContext(_) => -32000,
+        CdpFailure::Unsupported(_) => -32601,
+        _ => -32000,
+    };
+    error(request, code, failure.to_string())
+}
+
+pub fn supports(method: &str) -> bool {
+    matches!(
+        method,
+        "Network.getAllCookies"
+            | "Storage.getCookies"
+            | "Network.setCookies"
+            | "Storage.setCookies"
+            | "Network.deleteCookies"
+            | "Network.clearBrowserCookies"
+            | "Storage.clearDataForOrigin"
+    )
+}
+
+pub fn supports_browser(method: &str) -> bool {
+    matches!(method, "Storage.getCookies" | "Storage.setCookies")
+}
+
+fn page_url(state: &BrowserState, page: &PageId) -> Result<String, CdpFailure> {
+    state
+        .page(page)
+        .map(|page| page.url.clone())
+        .ok_or(CdpFailure::UnknownPage(*page))
+}
+
+fn host_from_url(value: &str) -> Option<String> {
+    Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+}
+
+fn parse_cookie_values(
+    params: &Value,
+    target_url: &str,
+) -> Result<Vec<ContextCookieState>, CdpFailure> {
+    let values = params
+        .get("cookies")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CdpFailure::invalid_argument("cookies must be an array"))?;
+    if values.len() > MAX_COOKIE_COUNT {
+        return Err(CdpFailure::invalid_argument("cookies exceed the 4096-cookie limit"));
+    }
+    let target_host = host_from_url(target_url);
+    let mut parsed = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let Some(cookie) = value.as_object() else {
+            return Err(CdpFailure::invalid_argument(format!("cookies[{index}] must be an object")));
+        };
+        let name = cookie.get("name").and_then(Value::as_str).unwrap_or("");
+        let cookie_value = cookie.get("value").and_then(Value::as_str).unwrap_or("");
+        if name.is_empty() {
+            return Err(CdpFailure::invalid_argument(format!("cookies[{index}].name is required")));
+        }
+        let url_host = cookie
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(host_from_url);
+        let explicit_domain = cookie
+            .get("domain")
+            .and_then(Value::as_str)
+            .map(|domain| domain.trim_start_matches('.').to_ascii_lowercase())
+            .filter(|domain| !domain.is_empty());
+        let domain = explicit_domain
+            .clone()
+            .or(url_host)
+            .or(target_host.clone())
+            .ok_or_else(|| CdpFailure::invalid_argument(format!("cookies[{index}] requires a domain or URL")))?;
+        let path = cookie
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| path.starts_with('/'))
+            .unwrap_or("/");
+        let same_site = match cookie.get("sameSite").and_then(Value::as_str) {
+            Some("Strict") => "Strict",
+            Some("None") => "None",
+            _ => "Lax",
+        };
+        let expires = cookie.get("expires").and_then(|value| {
+            let value = value.as_f64()?;
+            (value.is_finite() && (0.0..=i64::MAX as f64).contains(&value)).then_some(value as i64)
+        });
+        parsed.push(ContextCookieState {
+            name: name.to_string(),
+            value: cookie_value.to_string(),
+            domain,
+            path: path.to_string(),
+            secure: cookie.get("secure").and_then(Value::as_bool).unwrap_or(false),
+            http_only: cookie.get("httpOnly").and_then(Value::as_bool).unwrap_or(false),
+            same_site: same_site.to_string(),
+            expires,
+            host_only: explicit_domain.is_none(),
+        });
+    }
+    let encoded = serde_json::to_vec(&parsed)
+        .map_err(|error| CdpFailure::host(format!("cookie serialization failed: {error}")))?;
+    if encoded.len() > MAX_COOKIE_BYTES {
+        return Err(CdpFailure::invalid_argument("cookies exceed the 64KiB limit"));
+    }
+    Ok(parsed)
+}
+
+fn context_id(state: &BrowserState, params: &Value) -> Result<ContextId, CdpFailure> {
+    let Some(wire) = params.get("browserContextId").and_then(Value::as_str) else {
+        return Ok(state.default_context());
+    };
+    if wire == "default" {
+        return Ok(state.default_context());
+    }
+    let value = wire
+        .strip_prefix("context-")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| CdpFailure::invalid_argument("browserContextId is invalid"))?;
+    let context = ContextId::new(value);
+    state
+        .context(&context)
+        .map(|_| context)
+        .ok_or(CdpFailure::UnknownContext(context))
+}
+
+pub fn dispatch_browser(
+    request: &CdpRequest,
+    state: &mut BrowserState,
+    now_secs: u64,
+) -> CdpResponse {
+    let context = match context_id(state, &request.params) {
+        Ok(context) => context,
+        Err(error) => return failure(request, error),
+    };
+    match request.method.as_str() {
+        "Storage.getCookies" => {
+            match state.context_cookies_for_context(&context, now_secs) {
+                Ok(cookies) => CdpResponse::success(
+                    request.id,
+                    json!({"cookies": cookies}),
+                    request.session_id.clone(),
+                ),
+                Err(error) => failure(request, error),
+            }
+        }
+        "Storage.setCookies" => {
+            let cookies = match parse_cookie_values(&request.params, "") {
+                Ok(value) => value,
+                Err(error) => return failure(request, error),
+            };
+            match state.merge_context_cookies_for_context(&context, cookies, now_secs) {
+                Ok(()) => CdpResponse::success(request.id, json!({}), request.session_id.clone()),
+                Err(error) => failure(request, error),
+            }
+        }
+        _ => error(request, -32601, "method is not implemented by portable browser Storage dispatch"),
+    }
+}
+
+pub fn dispatch(
+    request: &CdpRequest,
+    state: &mut BrowserState,
+    page_id: PageId,
+    now_secs: u64,
+) -> CdpResponse {
+    match request.method.as_str() {
+        "Network.getAllCookies" | "Storage.getCookies" => {
+            match state.context_cookies(&page_id, now_secs) {
+                Ok(cookies) => CdpResponse::success(
+                    request.id,
+                    json!({"cookies": cookies}),
+                    request.session_id.clone(),
+                ),
+                Err(error) => failure(request, error),
+            }
+        }
+        "Network.setCookies" | "Storage.setCookies" => {
+            let target_url = match page_url(state, &page_id) {
+                Ok(value) => value,
+                Err(error) => return failure(request, error),
+            };
+            let cookies = match parse_cookie_values(&request.params, &target_url) {
+                Ok(value) => value,
+                Err(error) => return failure(request, error),
+            };
+            match state.merge_context_cookies(&page_id, cookies, now_secs) {
+                Ok(()) => CdpResponse::success(request.id, json!({}), request.session_id.clone()),
+                Err(error) => failure(request, error),
+            }
+        }
+        "Network.deleteCookies" => {
+            let Some(name) = request.params.get("name").and_then(Value::as_str) else {
+                return error(request, -32602, "name is required");
+            };
+            let domain = request
+                .params
+                .get("domain")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    request
+                        .params
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .and_then(host_from_url)
+                })
+                .unwrap_or_default();
+            let path = request.params.get("path").and_then(Value::as_str);
+            if domain.len() > MAX_METHOD_BYTES || path.is_some_and(|path| path.len() > MAX_METHOD_BYTES) {
+                return error(request, -32602, "cookie domain or path exceeds the byte limit");
+            }
+            match state.delete_context_cookies(&page_id, name, &domain, path) {
+                Ok(()) => CdpResponse::success(request.id, json!({}), request.session_id.clone()),
+                Err(error) => failure(request, error),
+            }
+        }
+        "Network.clearBrowserCookies" => {
+            match state.clear_context_cookies(&page_id) {
+                Ok(()) => CdpResponse::success(request.id, json!({}), request.session_id.clone()),
+                Err(error) => failure(request, error),
+            }
+        }
+        "Storage.clearDataForOrigin" => {
+            let Some(storage_types) = request.params.get("storageTypes").and_then(Value::as_str) else {
+                return error(request, -32602, "storageTypes is required");
+            };
+            let clears_cookies = storage_types
+                .split(',')
+                .map(str::trim)
+                .any(|value| matches!(value, "cookies" | "all"));
+            if !clears_cookies {
+                return CdpResponse::success(request.id, json!({}), request.session_id.clone());
+            }
+            let Some(origin) = request.params.get("origin").and_then(Value::as_str) else {
+                return error(request, -32602, "origin is required");
+            };
+            match state.clear_context_cookies_for_origin(&page_id, origin) {
+                Ok(()) => CdpResponse::success(request.id, json!({}), request.session_id.clone()),
+                Err(error) => failure(request, error),
+            }
+        }
+        _ => error(request, -32601, "method is not implemented by portable Storage dispatch"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::CdpEngine;
+
+    fn request(id: u64, method: &str, params: Value) -> CdpRequest {
+        CdpRequest { id, method: method.to_string(), params, session_id: Some("page-1-session-1".to_string()) }
+    }
+
+    #[test]
+    fn cookies_are_context_owned_and_expiry_filtered() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "https://example.test/path").unwrap();
+        assert!(dispatch(
+            &request(1, "Network.setCookies", json!({"_obscuraNowSecs": u64::MAX, "cookies": [
+                {"name": "sid", "value": "abc", "domain": "example.test", "path": "/", "httpOnly": true, "expires": 101},
+                {"name": "old", "value": "gone", "domain": "example.test", "path": "/", "expires": 99}
+            ]})),
+            &mut state,
+            page,
+            100,
+        ).error.is_none());
+        let result = dispatch(&request(2, "Network.getAllCookies", json!({"_obscuraNowSecs": u64::MAX})), &mut state, page, 100);
+        assert_eq!(result.result.as_ref().unwrap()["cookies"].as_array().unwrap().len(), 1);
+        assert_eq!(result.result.as_ref().unwrap()["cookies"][0]["name"], "sid");
+        assert!(dispatch(&request(3, "Network.deleteCookies", json!({"name": "sid", "domain": "example.test", "path": "/"})), &mut state, page, 100).error.is_none());
+        assert!(dispatch(&request(4, "Storage.getCookies", json!({})), &mut state, page, 100).result.as_ref().unwrap()["cookies"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_cookie_commands_are_bounded() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "about:blank").unwrap();
+        let response = dispatch(&request(1, "Network.setCookies", json!({"cookies": "bad"})), &mut state, page, 0);
+        assert_eq!(response.error.unwrap().code, -32602);
+    }
+
+    #[test]
+    fn origin_clear_only_removes_requested_cookie_storage() {
+        let mut state = BrowserState::new();
+        let page = state.create_page(&state.default_context(), "https://example.test/").unwrap();
+        let set = request(1, "Network.setCookies", json!({"cookies": [
+            {"name": "first", "value": "1", "domain": "example.test"},
+            {"name": "second", "value": "2", "domain": "unrelated.test"}
+        ]}));
+        assert!(dispatch(&set, &mut state, page, 0).error.is_none());
+
+        let local_only = request(2, "Storage.clearDataForOrigin", json!({
+            "origin": "https://example.test",
+            "storageTypes": "local_storage"
+        }));
+        assert!(dispatch(&local_only, &mut state, page, 0).error.is_none());
+        assert_eq!(state.context_cookies(&page, 0).unwrap().len(), 2);
+
+        let cookies = request(3, "Storage.clearDataForOrigin", json!({
+            "origin": "https://example.test",
+            "storageTypes": "cookies"
+        }));
+        assert!(dispatch(&cookies, &mut state, page, 0).error.is_none());
+        let remaining = state.context_cookies(&page, 0).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].domain, "unrelated.test");
+    }
+
+    #[test]
+    fn browser_storage_routes_by_context() {
+        let mut state = BrowserState::new();
+        let context = state.create_context(Default::default()).unwrap();
+        let set = request(1, "Storage.setCookies", json!({
+            "browserContextId": format!("context-{}", context.get()),
+            "cookies": [{"name": "sid", "value": "1", "url": "https://example.test/"}]
+        }));
+        assert!(dispatch_browser(&set, &mut state, 0).error.is_none());
+        let get = request(2, "Storage.getCookies", json!({
+            "browserContextId": format!("context-{}", context.get())
+        }));
+        let response = dispatch_browser(&get, &mut state, 0);
+        assert_eq!(response.result.unwrap()["cookies"][0]["hostOnly"], true);
+    }
+}

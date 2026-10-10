@@ -194,7 +194,7 @@ async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
 
 // requestSubmit(submitter) must validate its argument before doing anything
 // else (issue #424): a TypeError if the submitter is not a submit button, and a
-// NotFoundError DOMException if it is not owned by the form. obscura accepted
+// NotFoundError DOMException if it is not owned by the form. Domjet accepted
 // anything and silently submitted. The form under test preventDefault()s its
 // own submit event so the valid-submitter case cannot navigate away.
 #[tokio::test(flavor = "current_thread")]
