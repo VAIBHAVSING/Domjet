@@ -262,3 +262,26 @@ test("the CDP endpoint refuses web origins and rebound host names", async () => 
   assert.throws(() => new DomjetCdpServer({ allowedOrigins: "https://devtools.example" }), TypeError);
 });
 
+test("closing the server does not wait for clients that dropped or kept their connection", async () => {
+  const { server } = await makeServer();
+  const live = new CdpClient(server.wsEndpoint());
+  await live.ready();
+  const url = new URL(server.wsEndpoint());
+  await new Promise((resolveDropped, reject) => {
+    const socket = createConnection({ host: url.hostname, port: Number(url.port) });
+    socket.once("error", reject);
+    socket.once("data", () => { socket.destroy(); setTimeout(resolveDropped, 100); });
+    socket.once("connect", () => socket.write([
+      `GET ${url.pathname} HTTP/1.1`, `Host: ${url.host}`, "Connection: Upgrade", "Upgrade: websocket",
+      "Sec-WebSocket-Version: 13", "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==", "\r\n",
+    ].join("\r\n")));
+  });
+  let timer;
+  const closed = await Promise.race([
+    server.close().then(() => "closed"),
+    new Promise((resolveTimeout) => { timer = setTimeout(() => resolveTimeout("timed out"), 4_000); }),
+  ]);
+  clearTimeout(timer);
+  await live.close().catch(() => undefined);
+  assert.equal(closed, "closed");
+});

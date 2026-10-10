@@ -68,6 +68,12 @@ export class WebSocketPeer extends EventEmitter {
     socket.on("drain", () => this.#flush());
     socket.on("error", (error) => this.#fail(error));
     socket.on("close", () => this.#finish());
+    // Upgraded HTTP sockets are half-open: a client that goes away without a
+    // close frame only sends FIN. Close our side too, so "close" fires and the
+    // connection owner and server.close() are not left waiting.
+    socket.on("end", () => {
+      if (!this.#closed) this.#socket.destroy();
+    });
     // The connection owner installs the error listener immediately after this
     // constructor returns. Defer upgrade-head parsing so a malformed first
     // frame is reported through that listener instead of escaping Node's

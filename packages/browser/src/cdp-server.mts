@@ -995,6 +995,9 @@ class CdpConnection {
     this.closed = true;
     for (const sessionId of this.sessions.keys()) this.detach(sessionId);
     this.server.connections.delete(this);
+    // Server shutdown also ends live clients; the peer destroys the socket if
+    // the client does not answer the close frame.
+    try { this.peer.close?.(1001, "browser closing"); } catch {}
   }
 }
 
