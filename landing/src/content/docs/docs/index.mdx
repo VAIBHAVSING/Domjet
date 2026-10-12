@@ -1,0 +1,61 @@
+---
+title: Domjet documentation
+description: Give AI agents lightweight headless browsing with Domjet's Node.js and WebAssembly engine.
+template: splash
+hero:
+  title: The lightweight browser for AI agents.
+  tagline: Headless browsing with a real DOM, JavaScript, rendering, and familiar automation APIs—without launching Chrome.
+  actions:
+    - text: Get started
+      link: /docs/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: Architecture
+      link: /docs/architecture/
+      icon: open-book
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## Headless browsing built for agent workloads
+
+Domjet is embedded in Node.js as WebAssembly. Node supplies the host environment and V8 runtime;
+the engine supplies the DOM, CSS, layout, paint, browser contexts, and Chrome DevTools Protocol state.
+
+<CardGrid>
+  <Card title="Direct Node API" icon="seti:npm">
+    Create browsers, contexts, and pages without starting a listener or managing a child process.
+  </Card>
+  <Card title="Real rendering" icon="seti:image">
+    Use layout, screenshots, PDF, and canvas-backed paint from the same engine that owns the DOM.
+  </Card>
+  <Card title="Familiar tooling" icon="puzzle">
+    Connect existing Playwright and Puppeteer workflows through CDP adapters when you need them.
+  </Card>
+  <Card title="Portable by design" icon="rocket">
+    Ship one Node dependency instead of downloading and supervising a separate Chromium build.
+  </Card>
+</CardGrid>
+
+## Start small
+
+Install Domjet and open a page with the direct API:
+
+```bash
+npm install domjet
+```
+
+```js
+import { createBrowser } from 'domjet';
+
+const browser = await createBrowser();
+const page = await browser.newPage();
+
+await page.goto('https://example.com');
+console.log(await page.evaluate(() => document.title));
+
+await browser.close();
+```
+
+Continue to [Get started](/docs/getting-started/) for the first complete workflow.

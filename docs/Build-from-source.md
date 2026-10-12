@@ -1,100 +1,66 @@
-## Requirements
+# Build from source
 
-- Rust 1.75+ ([rustup.rs](https://rustup.rs))
-- C compiler (gcc or clang)
-- ~5 GB free disk space (V8 compiles from source on first build)
+The repository contains the Rust engine crates and the `domjet`
+Node.js package. The standalone Rust CLI has been removed.
 
-First build takes about 5 minutes. Incremental builds are seconds.
+## Rust workspace
 
-## Build
+Requirements: a current stable Rust toolchain, a C compiler, and several GB of
+disk space for the first native V8 build.
 
-```bash
-git clone https://github.com/h4ckf0r0day/obscura.git
-cd obscura
-cargo build --release -p obscura-cli --bins --features render
-```
-
-Binary is at `./target/release/obscura`.
-
-This produces the release binary with geometry, screenshots, screencasting,
-and PDF export.
-
-## Rendering and stealth
+Build the native workspace (the WASM package has a separate shared-library
+linking setup):
 
 ```bash
-cargo build --release -p obscura-cli --bins --features render,stealth
+cargo build --release --workspace --exclude obscura-wasm
 ```
 
-This is the complete rendering build with the stealth wreq/BoringSSL transport,
-TLS fingerprint randomization, browser-identity protections, and tracker
-blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
-
-## Without rendering
+Build the embeddable Rust API with rendering:
 
 ```bash
-cargo build --release -p obscura-cli --bins --no-default-features
-cargo build --release -p obscura-cli --bins --no-default-features --features stealth
+cargo build --release -p obscura --features render
 ```
 
-The second command keeps stealth while excluding layout, screenshots,
-screencasting, and PDF export.
-
-The stealth feature builds BoringSSL and generates Rust bindings. In addition
-to the default requirements, install CMake, Clang, and the libclang/LLVM
-development libraries. On Ubuntu/Debian:
+Build the native browser crate with rendering and stealth support:
 
 ```bash
-sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
+cargo build --release -p obscura-browser --features render,stealth
 ```
 
-On macOS, install the Xcode Command Line Tools and CMake. On Windows, install
-the Visual Studio C++ Build Tools, CMake, and LLVM/Clang. Ensure the directory
-containing `libclang` is available through `LIBCLANG_PATH` if bindgen cannot
-locate it automatically.
+The first build compiles V8 from source. Subsequent builds are incremental.
+Stealth builds additionally require CMake, Clang, and libclang/LLVM.
 
-On macOS 26 with the standalone Command Line Tools, Apple Clang may not find
-libc++ while compiling BoringSSL. Use the active SDK for that build:
-
-```bash
-SDK_PATH="$(xcrun --show-sdk-path)"
-SDKROOT="$SDK_PATH" CXXFLAGS="-isystem $SDK_PATH/usr/include/c++/v1" \
-  cargo build --release -p obscura-cli --bins --features render,stealth
-```
-
-## OpenSSL on older systems
-
-If the build fails on the vendored OpenSSL with an AVX-512 assembler error (common on older VPS hosts):
-
-```bash
-OPENSSL_NO_VENDOR=1 cargo build --release -p obscura-cli --bins --features render
-```
-
-Uses the system OpenSSL instead.
-
-## Run from the build
-
-```bash
-./target/release/obscura --version
-./target/release/obscura fetch https://example.com --eval "document.title"
-```
-
-Install system-wide:
-
-```bash
-cargo install --path crates/obscura-cli --features render
-```
-
-## Tests
+Run Rust tests with `cargo nextest`, which isolates V8-backed tests in separate
+processes:
 
 ```bash
 cargo nextest run --release --features render --no-fail-fast
 ```
 
-Integration suite:
+## Node.js package
+
+Use Node.js 22 or newer. The repository includes the WASM artifact; the normal
+package build copies the host runtime and compiles TypeScript, without
+recompiling Rust or downloading Chromium:
 
 ```bash
-python3 tests/test_all.py
+npm ci
+npm run build
+npm test
+npm pack --workspace domjet
 ```
 
-Use `cargo nextest`, not `cargo test`: runtime tests require process isolation
-because the engine owns a single V8 isolate per process.
+Rebuild the Rust/WASM artifact only when changing its Rust source. Install
+`wasm-bindgen-cli` at the same version as `wasm-bindgen` in `Cargo.lock`:
+
+```bash
+rustup target add wasm32-unknown-unknown
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-wasm --target wasm32-unknown-unknown --features render
+wasm-bindgen --target nodejs --out-dir target/wasm-bindgen target/wasm32-unknown-unknown/release/obscura_wasm.wasm
+DOMJET_WASM_BINDGEN_DIR="$PWD/target/wasm-bindgen" npm run prepare:wasm --workspace domjet
+npm run build
+npm test
+```
+
+The [package README](../packages/browser/README.md) documents the direct API,
+adapters, persistence, and `domjet` utility.
