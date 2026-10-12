@@ -1925,6 +1925,7 @@ function _seedDetachedTreeState(node) {
 }
 
 function _seedInsertedTreeState(node, parent, connected) {
+  if (connected) _promoteWrapperGroup(node);
   node._treeDetachedExact = false;
   node._treeParent = parent;
   node._treeParentEpoch = _treeMutationEpoch;
@@ -3178,8 +3179,11 @@ class Element extends Node {
       if (nid >= 0) {
         // Cache by node id so `.content` keeps a stable identity across reads —
         // frameworks stash the fragment and compare it later.
-        if (!_cache.has(nid)) _cache.set(nid, new DocumentFragment(nid));
-        const content = _cache.get(nid);
+        let content = _cachedWrapper(nid);
+        if (content === undefined) {
+          content = new DocumentFragment(nid);
+          _cache.set(nid, content);
+        }
         content._fragmentContext = 'template';
         return content;
       }
@@ -5512,6 +5516,179 @@ class DocumentType extends Node {
 
 const _cache = new Map();
 
+// Detached node reclamation. Wrappers of connected nodes stay strong because
+// listeners and expandos live on them. At task boundaries the host sweeps:
+// wrappers of detached subtrees move to weak references, one group per
+// detached owner root, and a group stays alive while script can reach any
+// member. A collected group, or a detached subtree no wrapper reaches, is
+// freed in the engine after checking that no wrapper inside it is alive.
+// Engines without the reclaim commands answer null and keep every wrapper.
+const _weakWrappers = new Map();
+const _wrapperGroups = new WeakMap();
+const _detachedGroups = new Map();
+const _reclaimRoots = [];
+const _SWEEP_MIN_WRAPPERS = 4096;
+let _sweepAtWrappers = _SWEEP_MIN_WRAPPERS;
+let _reclaimEnabled = typeof WeakRef === "function" && typeof FinalizationRegistry === "function";
+const _WeakRefCtor = _reclaimEnabled ? WeakRef : null;
+const _FinalizationRegistryCtor = _reclaimEnabled ? FinalizationRegistry : null;
+// Created by the first sweep, so engines that never sweep (and their startup
+// snapshots) never hold a registry.
+let _groupFinalizer = null;
+
+function _cachedWrapper(nid) {
+  const strong = _cache.get(nid);
+  if (strong !== undefined) return strong;
+  const weak = _weakWrappers.get(nid);
+  if (weak === undefined) return undefined;
+  const node = weak.deref();
+  if (node === undefined) _weakWrappers.delete(nid);
+  return node;
+}
+
+function _isReleasedHandleError(error) {
+  return String(error && error.message || error).includes("stale or unknown node handle");
+}
+
+// A detached group that is inserted into the document becomes strong again.
+// Members still detached are demoted by the next sweep.
+function _promoteWrapperGroup(node) {
+  const group = _wrapperGroups.get(node);
+  if (group === undefined) return;
+  for (const member of group.members) {
+    _wrapperGroups.delete(member);
+    const weak = _weakWrappers.get(member._nid);
+    if (weak !== undefined && weak.deref() === member) {
+      _weakWrappers.delete(member._nid);
+      if (!_cache.has(member._nid)) _cache.set(member._nid, member);
+    }
+  }
+  group.members.length = 0;
+}
+
+function _releaseDetachedRoot(root) {
+  let handles;
+  try { handles = _domParse("detached_subtree_handles", root); } catch (_) { return false; }
+  if (!Array.isArray(handles)) return false;
+  for (const nid of handles) {
+    if (_cachedWrapper(nid) !== undefined) return false;
+  }
+  let released = false;
+  try { released = _dom("release_detached", root) === "true"; } catch (_) { released = false; }
+  if (released) {
+    for (const nid of handles) {
+      _weakWrappers.delete(nid);
+      delete _formValues[nid];
+      delete _formChecked[nid];
+    }
+  }
+  return released;
+}
+
+function _reclaimCollectedGroups() {
+  let released = 0;
+  while (_reclaimRoots.length !== 0) {
+    const root = _reclaimRoots.pop();
+    const ref = _detachedGroups.get(root);
+    if (ref !== undefined) {
+      if (ref.deref() !== undefined) continue;
+      _detachedGroups.delete(root);
+    }
+    if (_releaseDetachedRoot(root)) released++;
+  }
+  return released;
+}
+
+function _sweepDetachedWrappers() {
+  let groups;
+  try { groups = _domParse("detached_handle_roots"); } catch (_) { groups = undefined; }
+  if (groups === null) {
+    _reclaimEnabled = false;
+    return null;
+  }
+  if (!groups || typeof groups !== "object") return null;
+  let moved = 0;
+  let released = 0;
+  const detached = new Set();
+  for (const key of Object.keys(groups)) {
+    const root = +key;
+    const members = groups[key];
+    if (!Array.isArray(members)) continue;
+    let group = _detachedGroups.get(root)?.deref();
+    let reachable = group !== undefined;
+    const fresh = [];
+    for (const nid of members) {
+      detached.add(nid);
+      const strong = _cache.get(nid);
+      if (strong !== undefined) {
+        fresh.push(strong);
+        continue;
+      }
+      const weak = _weakWrappers.get(nid)?.deref();
+      if (weak === undefined) continue;
+      reachable = true;
+      if (group === undefined || _wrapperGroups.get(weak) !== group) fresh.push(weak);
+    }
+    if (fresh.length === 0) {
+      // No wrapper and no group: script cannot reach this subtree.
+      if (!reachable && _releaseDetachedRoot(root)) released++;
+      continue;
+    }
+    if (group === undefined) {
+      group = { root, members: [] };
+      _detachedGroups.set(root, new _WeakRefCtor(group));
+      if (_groupFinalizer === null) {
+        _groupFinalizer = new _FinalizationRegistryCtor((collected) => {
+          _reclaimRoots[_reclaimRoots.length] = collected;
+        });
+      }
+      _groupFinalizer.register(group, root);
+    }
+    for (const node of fresh) {
+      const nid = node._nid;
+      _cache.delete(nid);
+      _weakWrappers.set(nid, new _WeakRefCtor(node));
+      _wrapperGroups.set(node, group);
+      group.members.push(node);
+      moved++;
+    }
+  }
+  // Weak wrappers whose nodes are back in the document become strong again.
+  for (const [nid, weak] of _weakWrappers) {
+    if (detached.has(nid)) continue;
+    _weakWrappers.delete(nid);
+    const node = weak.deref();
+    if (node !== undefined) {
+      _wrapperGroups.delete(node);
+      if (!_cache.has(nid)) _cache.set(nid, node);
+    }
+  }
+  _sweepAtWrappers = Math.max(_SWEEP_MIN_WRAPPERS, _cache.size * 2);
+  return { moved, released };
+}
+
+// Called by the host between tasks, never while page script is running.
+Object.defineProperty(globalThis, "__obscura_reclaim_detached", {
+  value: function(sweep) {
+    if (!_reclaimEnabled) return null;
+    const released = _reclaimCollectedGroups();
+    const swept = sweep === true || _cache.size >= _sweepAtWrappers
+      ? _sweepDetachedWrappers()
+      : null;
+    return {
+      enabled: _reclaimEnabled,
+      swept: swept !== null,
+      released: released + (swept ? swept.released : 0),
+      moved: swept ? swept.moved : 0,
+      wrappers: _cache.size,
+      weakWrappers: _weakWrappers.size,
+    };
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+
 class TextTrackCue {
   constructor(startTime, endTime, text) {
     this.id = "";
@@ -6087,8 +6264,14 @@ function _elementClassForKnownName(namespace, qualifiedName) {
 }
 function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
-  if (_cache.has(nid)) return _cache.get(nid);
-  const t = +_dom("node_type", nid);
+  const cached = _cachedWrapper(nid);
+  if (cached !== undefined) return cached;
+  let t;
+  try { t = +_dom("node_type", nid); }
+  catch (error) {
+    if (_isReleasedHandleError(error)) return null;
+    throw error;
+  }
   let n;
   if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
   else if (t === 3) n = new Text(nid);
@@ -6102,8 +6285,14 @@ function _wrap(nid) {
 }
 function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
-  if (_cache.has(nid)) return _cache.get(nid);
-  const C = _elementClassFor(nid);
+  const cached = _cachedWrapper(nid);
+  if (cached !== undefined) return cached;
+  let C;
+  try { C = _elementClassFor(nid); }
+  catch (error) {
+    if (_isReleasedHandleError(error)) return null;
+    throw error;
+  }
   const n = new C(nid);
   _cache.set(nid, n);
   return n;
@@ -12431,7 +12620,7 @@ function _shadowRootForHost(host, includeClosed) {
   const parts = info.split('\0');
   if (!includeClosed && parts[1] !== 'open') return null;
   const rootNid = +parts[0];
-  let root = _cache.get(rootNid);
+  let root = _cachedWrapper(rootNid);
   if (!(root instanceof ShadowRoot)) {
     root = new ShadowRoot(rootNid, host, { mode: parts[1] });
     _cache.set(rootNid, root);

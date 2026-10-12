@@ -1,0 +1,60 @@
+function findElement(html, selector) {
+  let namePattern;
+  let attributePattern = "[^>]*";
+  if (selector.startsWith("#")) {
+    namePattern = "[a-zA-Z][\\w:-]*";
+    attributePattern = `[^>]*\\bid=["']${selector.slice(1)}["'][^>]*`;
+  } else if (selector.startsWith(".")) {
+    namePattern = "[a-zA-Z][\\w:-]*";
+    attributePattern = `[^>]*\\bclass=["'][^"']*\\b${selector.slice(1)}\\b[^"']*["'][^>]*`;
+  } else {
+    namePattern = selector;
+  }
+  const match = new RegExp(`<(${namePattern})${attributePattern}>([\\s\\S]*?)<\\/\\1>`, "i").exec(html);
+  if (!match) return null;
+  return { outerHTML: match[0], textContent: match[2].replace(/<[^>]*>/g, "") };
+}
+
+class ObscuraCore {
+  constructor(html) {
+    this.source = html;
+    this.freed = false;
+  }
+
+  queryText(selector) {
+    this.#assertOpen();
+    return findElement(this.source, selector)?.textContent;
+  }
+
+  query_html(selector) {
+    this.#assertOpen();
+    if (selector === "async-result") return Promise.resolve("<async-result></async-result>");
+    return findElement(this.source, selector)?.outerHTML;
+  }
+
+  querySnapshot(selector) {
+    this.#assertOpen();
+    if (selector === "async-result") return Promise.resolve(["<async-result></async-result>", ""]);
+    if (selector === "snapshot-only") return ["<snapshot-only>batched</snapshot-only>", "batched"];
+    if (selector === "oversized-result") return ["x".repeat(4 * 1024 * 1024 + 1), ""];
+    const element = findElement(this.source, selector);
+    return element ? [element.outerHTML, element.textContent] : undefined;
+  }
+
+  documentElementHtml() {
+    this.#assertOpen();
+    if (this.source.includes("data-document-error")) throw new RangeError("document serializer failed");
+    return this.source.replace(/^\s*<!doctype[^>]*>\s*/i, "");
+  }
+
+  free() {
+    if (this.freed) throw new Error("core freed twice");
+    this.freed = true;
+  }
+
+  #assertOpen() {
+    if (this.freed) throw new Error("core is freed");
+  }
+}
+
+module.exports = { abi_version: 1, ObscuraCore };

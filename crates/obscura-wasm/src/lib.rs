@@ -1415,6 +1415,16 @@ impl ObscuraCore {
         Ok(handle)
     }
 
+    /// Detaches `child` and frees it at once when the host holds no handle
+    /// inside it. Script reaches nodes only through handles, so such a
+    /// subtree is unreachable; the rest waits for the host's detached sweep.
+    fn detach_and_reclaim(&mut self, child: NodeId) {
+        self.dom.detach(child);
+        let handles = &self.node_to_handle;
+        self.dom
+            .free_detached_child_unless(child, |node| handles.contains_key(&node));
+    }
+
     fn expose_node(&mut self, node: NodeId) -> Result<u32, String> {
         if self.dom.with_node(node, |_| ()).is_none() {
             return Err(format!("cannot expose missing DOM node {}", node.raw()));
@@ -2146,7 +2156,7 @@ impl ObscuraCore {
                     return Ok("false".to_string());
                 }
                 for child in self.dom.children(target) {
-                    self.dom.detach(child);
+                    self.detach_and_reclaim(child);
                 }
                 if !arg2.is_empty() {
                     let context_name = self
@@ -2172,7 +2182,7 @@ impl ObscuraCore {
                 }
                 let (context, html) = fragment_context_and_html(arg2);
                 for child in self.dom.children(target) {
-                    self.dom.detach(child);
+                    self.detach_and_reclaim(child);
                 }
                 if !html.is_empty() {
                     let fragment = parse_fragment_with_context(html, context);
@@ -2346,6 +2356,53 @@ impl ObscuraCore {
                     }
                 }
                 Err("DOM parent chain exceeds the tree-size safety bound".to_string())
+            }
+            // Detached-subtree reclamation. The host asks which of its handles
+            // sit outside the document, grouped by detached owner root, and
+            // frees a root once no wrapper inside it is alive. Handles are
+            // never recycled, so a stale handle fails instead of aliasing a
+            // reused arena slot.
+            "detached_handle_roots" => {
+                let mut exposed: Vec<(u32, NodeId)> = self
+                    .handle_to_node
+                    .iter()
+                    .map(|(handle, node)| (*handle, *node))
+                    .collect();
+                exposed.sort_unstable_by_key(|(handle, _)| *handle);
+                let nodes: Vec<NodeId> = exposed.iter().map(|(_, node)| *node).collect();
+                let mut groups: std::collections::BTreeMap<u32, Vec<u32>> =
+                    std::collections::BTreeMap::new();
+                for (node, root) in self.dom.detached_owner_roots(&nodes) {
+                    let Some(&member) = self.node_to_handle.get(&node) else {
+                        continue;
+                    };
+                    let root_handle = self.expose_node(root)?;
+                    groups.entry(root_handle).or_default().push(member);
+                }
+                serde_json::to_string(&groups).map_err(|error| error.to_string())
+            }
+            "detached_subtree_handles" => {
+                let root = self.resolve_handle(arg1)?;
+                let Some(nodes) = self.dom.detached_root_owned_nodes(root) else {
+                    return Ok("null".to_string());
+                };
+                let handles: Vec<u32> = nodes
+                    .iter()
+                    .filter_map(|node| self.node_to_handle.get(node).copied())
+                    .collect();
+                serde_json::to_string(&handles).map_err(|error| error.to_string())
+            }
+            "release_detached" => {
+                let root = self.resolve_handle(arg1)?;
+                let Some(freed) = self.dom.free_detached_root(root) else {
+                    return Ok("false".to_string());
+                };
+                for node in freed {
+                    if let Some(handle) = self.node_to_handle.remove(&node) {
+                        self.handle_to_node.remove(&handle);
+                    }
+                }
+                Ok("true".to_string())
             }
             _ => Ok("null".to_string()),
         }
@@ -3499,7 +3556,7 @@ mod tests {
     /// matches `BOOTSTRAP_DOM_OP_COMMANDS` in
     /// `node/wasm-v8-harness/src/bootstrap-runtime.mjs`, which
     /// `bootstrap-runtime.test.mjs` locks against the production bootstrap.js.
-    const ALL_DOM_COMMANDS: [&str; 65] = [
+    const ALL_DOM_COMMANDS: [&str; 68] = [
         "append_child",
         "attribute_names",
         "child_nodes",
@@ -3513,6 +3570,8 @@ mod tests {
         "create_element_ns",
         "create_processing_instruction",
         "create_text_node",
+        "detached_handle_roots",
+        "detached_subtree_handles",
         "doctype_name",
         "doctype_public_id",
         "document_doctype",
@@ -3551,6 +3610,7 @@ mod tests {
         "query_selector_all",
         "query_selector_all_scoped",
         "query_selector_scoped",
+        "release_detached",
         "remove_attribute",
         "remove_attribute_ns",
         "remove_child",
@@ -3813,6 +3873,11 @@ mod tests {
             "create_doctype" => ("html".to_string(), "public".to_string()),
             "clone_node" => (main.clone(), "true".to_string()),
             "template_contents" => (template.clone(), String::new()),
+            // Detached-subtree reclamation.
+            "detached_handle_roots" => (String::new(), String::new()),
+            "detached_subtree_handles" | "release_detached" => {
+                (op(core, "create_element", "div", ""), String::new())
+            }
             // PI and doctype reads.
             "pi_target" => (op(core, "create_processing_instruction", "xml", "d"), String::new()),
             "doctype_name" | "doctype_public_id" => {
@@ -3838,7 +3903,7 @@ mod tests {
                     assert_eq!(mode, "open");
                 }
                 "child_nodes" | "query_selector_all" | "query_selector_all_scoped"
-                | "attribute_names" | "element_children" => {
+                | "attribute_names" | "element_children" | "detached_subtree_handles" => {
                     let parsed: serde_json::Value = serde_json::from_str(&result)
                         .unwrap_or_else(|error| panic!("{cmd} must return JSON: {error}"));
                     assert!(parsed.is_array(), "{cmd} returned {result:?}");
@@ -3852,6 +3917,10 @@ mod tests {
                         .unwrap_or_else(|error| panic!("{cmd} must return JSON: {error}"));
                     assert!(parsed.is_string(), "{cmd} returned {result:?}");
                 }
+                "detached_handle_roots" => {
+                    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+                    assert!(parsed.is_object(), "{cmd} returned {result:?}");
+                }
                 "document_doctype" => {
                     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
                     assert!(parsed.is_object() || parsed.is_null(), "{cmd} returned {result:?}");
@@ -3860,7 +3929,7 @@ mod tests {
                 | "append_child" | "remove_child" | "insert_before" | "remove_attribute"
                 | "remove_attribute_ns" | "set_attribute" | "set_attribute_ns"
                 | "set_text_content" | "set_inner_html" | "set_inner_html_context"
-                | "set_fragment_html_executable" => {
+                | "set_fragment_html_executable" | "release_detached" => {
                     assert!(result == "true" || result == "false", "{cmd} returned {result:?}");
                 }
                 "node_type" => {
@@ -3892,6 +3961,83 @@ mod tests {
     // ------------------------------------------------------------------
     // Phase 3: handle correctness
     // ------------------------------------------------------------------
+
+    #[test]
+    fn inner_html_frees_replaced_children_the_host_never_saw() {
+        let mut core = fresh_core();
+        let main = handle(&mut core, "#main");
+        op(&mut core, "set_inner_html", &main, "<p><b>one</b></p><i>two</i>");
+        let baseline = core.dom.len();
+        for round in 0..50 {
+            let html = format!("<p><b>{round}</b><template><u>t</u></template></p><i>x</i>");
+            assert_eq!(op(&mut core, "set_inner_html", &main, &html), "true");
+            assert_eq!(op(&mut core, "set_inner_html_context", &main, &format!("div\0{html}")), "true");
+        }
+        assert!(core.dom.len() <= baseline + 8, "{} > {}", core.dom.len(), baseline + 8);
+
+        // A child the host holds a handle into stays alive and detached.
+        let kept: Vec<u32> = serde_json::from_str(&op(&mut core, "child_nodes", &main, "")).unwrap();
+        let kept = kept[0].to_string();
+        let grandchild = op(&mut core, "first_child", &kept, "");
+        op(&mut core, "set_inner_html", &main, "<em>new</em>");
+        assert_eq!(op(&mut core, "node_type", &kept, ""), "1");
+        assert_eq!(op(&mut core, "parent_node", &kept, ""), "-1");
+        assert_eq!(op(&mut core, "parent_node", &grandchild, ""), kept);
+        assert_eq!(op(&mut core, "is_connected", &kept, ""), "false");
+    }
+
+    #[test]
+    fn detached_subtrees_are_grouped_and_released_without_aliasing_handles() {
+        fn groups(core: &mut ObscuraCore) -> std::collections::BTreeMap<String, Vec<u32>> {
+            serde_json::from_str(&op(core, "detached_handle_roots", "", "")).unwrap()
+        }
+        fn handles(core: &mut ObscuraCore, root: &str) -> Vec<u32> {
+            let mut list: Vec<u32> =
+                serde_json::from_str(&op(core, "detached_subtree_handles", root, "")).unwrap();
+            list.sort_unstable();
+            list
+        }
+        let mut core = fresh_core();
+        let document = op(&mut core, "document_node_id", "", "");
+        let main = handle(&mut core, "#main");
+        let p = handle(&mut core, "p");
+        let template = handle(&mut core, "template");
+        let contents = op(&mut core, "template_contents", &template, "");
+        let div = op(&mut core, "create_element", "div", "");
+        let span = op(&mut core, "create_element", "span", "");
+        assert_eq!(op(&mut core, "append_child", &div, &span), "true");
+        let n = |handle: &str| handle.parse::<u32>().unwrap();
+
+        // Connected nodes and live template contents never appear.
+        assert_eq!(groups(&mut core).into_iter().collect::<Vec<_>>(), vec![(div.clone(), vec![n(&div), n(&span)])]);
+        assert_eq!(op(&mut core, "remove_child", &p, ""), "true");
+        let revision = core.page_revision;
+        let current = groups(&mut core);
+        assert_eq!(current.get(&p), Some(&vec![n(&p)]));
+        assert_eq!(current.len(), 2);
+        assert_eq!(handles(&mut core, &div), vec![n(&div), n(&span)]);
+
+        // Only a detached owner root can be released.
+        for owned in [&document, &main, &template, &contents, &span] {
+            assert_eq!(op(&mut core, "detached_subtree_handles", owned, ""), "null");
+            assert_eq!(op(&mut core, "release_detached", owned, ""), "false");
+        }
+        assert_eq!(op(&mut core, "release_detached", &div, ""), "true");
+        for stale in [&div, &span] {
+            assert!(op_err(&mut core, "node_type", stale, "").contains("stale"));
+            assert!(op_err(&mut core, "release_detached", stale, "").contains("stale"));
+        }
+        assert_eq!(core.page_revision, revision);
+        assert_eq!(groups(&mut core).into_keys().collect::<Vec<_>>(), vec![p.clone()]);
+
+        // A node that reuses a freed slot gets a fresh handle.
+        let fresh = op(&mut core, "create_element", "em", "");
+        assert!(n(&fresh) > n(&span));
+        assert_eq!(op(&mut core, "node_type", &fresh, ""), "1");
+        assert_eq!(op(&mut core, "release_detached", &p, ""), "true");
+        assert!(groups(&mut core).get(&p).is_none());
+        assert_eq!(op(&mut core, "is_connected", &main, ""), "true");
+    }
 
     #[test]
     fn same_node_returns_the_same_handle_repeatedly() {

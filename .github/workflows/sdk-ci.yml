@@ -1,0 +1,144 @@
+name: SDK CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Enable pnpm from packageManager
+        run: corepack enable && pnpm --version
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build SDK packages
+        run: pnpm build
+
+      - name: Test against packaged engine
+        env:
+          DOMJET_REAL_WASM_MODULE: ${{ github.workspace }}/packages/browser/wasm/obscura_wasm.cjs
+          DOMJET_REQUIRE_REAL_ARTIFACTS: "1"
+        run: pnpm test
+
+  package-smoke:
+    name: Packed SDK smoke test
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up minimum supported Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Enable pnpm from packageManager
+        run: corepack enable && pnpm --version
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit dependencies
+        run: pnpm audit --audit-level high
+
+      - name: Pack and install SDK
+        shell: bash
+        run: |
+          pnpm --filter domjet pack --pack-destination "$RUNNER_TEMP"
+          package_version="$(node -p "require('./packages/browser/package.json').version")"
+          package_tarball="$RUNNER_TEMP/domjet-$package_version.tgz"
+          test -f "$package_tarball"
+
+          smoke_dir="$RUNNER_TEMP/domjet-sdk-smoke"
+          mkdir "$smoke_dir"
+          cd "$smoke_dir"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund "$package_tarball"
+          ./node_modules/.bin/domjet-web-assets "$smoke_dir/web-assets" > /dev/null
+          for file in frame.html domjet.web.mjs frame-client.mjs manifest.json; do test -f "$smoke_dir/web-assets/$file"; done
+          compgen -G "$smoke_dir/web-assets/engine.*.wasm" > /dev/null
+          compgen -G "$smoke_dir/web-assets/bootstrap.*.js" > /dev/null
+
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import createBrowser from "domjet";
+
+          const browser = await createBrowser();
+          try {
+            assert.equal(browser.processInfo().port, null);
+            const page = await browser.newPage();
+            await page.goto("data:text/html,<title>Domjet CI</title><h1>ready</h1>");
+            assert.equal(await page.title(), "Domjet CI");
+            assert.equal(await page.evaluate("document.querySelector('h1').textContent"), "ready");
+            const png = await page.screenshot({ width: 320, height: 200 });
+            assert.deepEqual([...png.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+          } finally {
+            await browser.close({ persist: "skip" });
+          }
+          NODE
+
+  browser:
+    name: Browser (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Enable pnpm from packageManager
+        run: corepack enable && pnpm --version
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build SDK packages
+        run: pnpm build
+      - name: Install Chromium for the browser test
+        run: |
+          npm install --prefix "$RUNNER_TEMP/playwright" --no-audit --no-fund playwright-core@1.64.0
+          "$RUNNER_TEMP/playwright/node_modules/.bin/playwright-core" install --with-deps chromium
+      - name: Test domjet/web in Chromium
+        working-directory: packages/browser
+        env:
+          DOMJET_PLAYWRIGHT_CORE: ${{ runner.temp }}/playwright/node_modules/playwright-core
+        run: ../../node_modules/.bin/tsx --test ./test/web.test.mts

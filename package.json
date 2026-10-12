@@ -1,0 +1,31 @@
+{
+  "name": "domjet-workspace",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.3.4",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter @domjet/browser-protocol run build && pnpm --filter @domjet/browser-storage run build && pnpm --filter @domjet/browser-runtime run build && pnpm --filter domjet run build",
+    "prepare:browser": "pnpm --filter domjet run prepare:runtime",
+    "test": "pnpm --filter domjet run test && pnpm --filter @domjet/browser-runtime run test && pnpm --filter @domjet/browser-storage run test && pnpm --filter @domjet/browser-protocol run test"
+  },
+  "engines": {
+    "node": ">=22",
+    "pnpm": ">=10"
+  },
+  "version": "1.0.0",
+  "description": "Domjet: a lightweight embedded browser SDK for Node.js.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VAIBHAVSING/domjet.git"
+  },
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/VAIBHAVSING/domjet/issues"
+  },
+  "homepage": "https://domjet.dev"
+}
