@@ -572,8 +572,10 @@ const RECLAIM_TIMEOUT_MS = 2_000;
 const RECLAIM_SWEEP_GROWTH_BYTES = 8 * 1024 * 1024;
 const RECLAIM_PRESSURE_BYTES = 96 * 1024 * 1024;
 const RECLAIM_PRESSURE_STEP_BYTES = 16 * 1024 * 1024;
-const RECLAIM_SCRIPT = new vm.Script("__obscura_reclaim_detached(false)");
-const RECLAIM_SWEEP_SCRIPT = new vm.Script("__obscura_reclaim_detached(true)");
+// A bootstrap.js without the reclaim hook (the shared engine does not ship
+// it yet) answers null, so pages keep every wrapper as before.
+const RECLAIM_SCRIPT = new vm.Script('typeof __obscura_reclaim_detached === "function" ? __obscura_reclaim_detached(false) : null');
+const RECLAIM_SWEEP_SCRIPT = new vm.Script('typeof __obscura_reclaim_detached === "function" ? __obscura_reclaim_detached(true) : null');
 const reclaimStats = {
   ticks: 0,
   sweeps: 0,

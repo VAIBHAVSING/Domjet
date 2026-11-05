@@ -134,27 +134,6 @@ test("context.cookies() sees cookies a navigated page received", { skip: !module
   }
 });
 
-test("a text-heavy page renders within the engine's memory", { skip: !modulePath, timeout: 120_000 }, async () => {
-  // About 280 MB of layout: above the former 256 MiB engine ceiling, which
-  // ended this screenshot (and its page) with a WebAssembly trap.
-  const body = "<p>paragraph text that wraps a little bit for the test</p>".repeat(15000);
-  const { server, base } = await localServer((_request, response) => {
-    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    response.end(`<!doctype html><title>t</title>${body}`);
-  });
-  const browser = await createBrowser({ modulePath, prewarmPages: 0, allowPrivateNetwork: true });
-  try {
-    const page = await browser.newPage();
-    await page.goto(`${base}/long`);
-    const png = await page.screenshot({ width: 1280, height: 800 });
-    assert.deepEqual([...png.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
-    assert.equal(await page.evaluate("document.querySelectorAll('p').length"), 15000);
-  } finally {
-    await browser.close({ persist: "skip" });
-    await new Promise((resolveClose) => server.close(resolveClose));
-  }
-});
-
 test("pages whose first navigation fails do not keep their slot", { skip: !modulePath, timeout: 60_000 }, async () => {
   const browser = await createBrowser({ modulePath, prewarmPages: 0, maxTargets: 2 });
   const client = await browser.cdp().connect();

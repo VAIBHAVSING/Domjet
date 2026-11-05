@@ -8449,9 +8449,8 @@ fn percent_decode(s: &str) -> Vec<u8> {
 /// allocated ~3.6 GB in the resize.
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_IMAGE_RASTER_PIXELS: u64 = 64 * 1024 * 1024;
-/// The WASM module's whole linear memory is capped (1 GiB, see
-/// obscura-wasm/build.rs) and shared with the DOM and layout, so the native
-/// budget alone could exhaust it and trap. Use the capture budget (64 MiB of
+/// The WASM module's whole linear memory is capped at 256 MiB, so the native
+/// budget alone would exhaust it and trap. Use the capture budget (64 MiB of
 /// RGBA) instead; the oversized raster is still scaled up on draw.
 #[cfg(target_arch = "wasm32")]
 const MAX_IMAGE_RASTER_PIXELS: u64 = MAX_CAPTURE_PIXELS;
