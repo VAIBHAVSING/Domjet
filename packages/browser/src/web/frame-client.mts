@@ -2,6 +2,11 @@
 // Serve frame.html from a dedicated origin (for example a static assets
 // subdomain): the frame then has its own origin, HTTP cache, and storage, and
 // page content cannot reach the embedding document.
+//
+// A frame on another origin only talks to the embedder origins it was
+// published for (`domjet-web-assets --frame-origin <this page's origin>`).
+// Options are sent to the frame by message after it identifies itself, never
+// in its URL, so no other site can set them by embedding the same frame.
 export interface BrowserFrameOptions {
   /** URL of the published frame.html. */
   frameUrl: string | URL;
@@ -13,6 +18,8 @@ export interface BrowserFrameOptions {
   fetchProxy?: string;
   /** Command timeout. Default 60 s. */
   timeoutMs?: number;
+  /** How long to wait for the frame to load and accept this page. Default 60 s. */
+  readyTimeoutMs?: number;
 }
 
 export interface BrowserFrame {
@@ -30,11 +37,13 @@ export function mountBrowserFrame(container: Element, options: BrowserFrameOptio
   const src = new URL(String(options.frameUrl), location.href);
   src.searchParams.set("w", String(width));
   src.searchParams.set("h", String(height));
-  src.searchParams.append("allow", location.origin);
-  if (options.url) src.searchParams.set("url", options.url);
-  if (options.allowPrivateNetwork) src.searchParams.set("privateNetwork", "1");
-  if (options.fetchProxy) src.searchParams.set("proxy", options.fetchProxy);
   const frameOrigin = src.origin;
+  const init = {
+    type: "domjet:init",
+    ...(options.url ? { url: options.url } : {}),
+    ...(options.allowPrivateNetwork ? { allowPrivateNetwork: true } : {}),
+    ...(options.fetchProxy ? { fetchProxy: options.fetchProxy } : {}),
+  };
 
   const element = document.createElement("iframe");
   element.src = src.href;
@@ -47,11 +56,24 @@ export function mountBrowserFrame(container: Element, options: BrowserFrameOptio
   const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   let nextId = 1;
   let ready!: () => void;
-  const readyPromise = new Promise<void>((resolve) => { ready = resolve; });
+  let notReady!: (error: Error) => void;
+  const readyPromise = new Promise<void>((resolve, reject) => { ready = resolve; notReady = reject; });
+  const readyTimer = setTimeout(() => {
+    notReady(new Error(
+      `Domjet frame at ${frameOrigin} did not accept ${location.origin}. ` +
+      `Publish it with domjet-web-assets --frame-origin ${location.origin}, or serve it from this origin.`,
+    ));
+  }, options.readyTimeoutMs ?? 60_000);
   const onMessage = (event: MessageEvent) => {
     if (event.source !== element.contentWindow || event.origin !== frameOrigin) return;
     const data = event.data ?? {};
-    if (data.type === "domjet:ready") { ready(); return; }
+    if (data.type === "domjet:hello") { element.contentWindow!.postMessage(init, frameOrigin); return; }
+    if (data.type === "domjet:ready") { clearTimeout(readyTimer); ready(); return; }
+    if (data.type === "domjet:refused") {
+      clearTimeout(readyTimer);
+      notReady(new Error(`Domjet frame refused its options: ${String(data.error)}`));
+      return;
+    }
     const entry = pending.get(data.id);
     if (!entry) return;
     pending.delete(data.id);
@@ -74,6 +96,10 @@ export function mountBrowserFrame(container: Element, options: BrowserFrameOptio
   }
 
   container.appendChild(element);
+  readyPromise.catch(() => {
+    window.removeEventListener("message", onMessage);
+    element.remove();
+  });
   return readyPromise.then(() => ({
     element,
     navigate: (url: string) => command("domjet:navigate", { url }),
@@ -81,6 +107,7 @@ export function mountBrowserFrame(container: Element, options: BrowserFrameOptio
     content: () => command<string>("domjet:content"),
     screenshot: () => command<Uint8Array>("domjet:screenshot"),
     destroy: () => {
+      clearTimeout(readyTimer);
       window.removeEventListener("message", onMessage);
       for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(new Error("Domjet frame destroyed")); }
       pending.clear();

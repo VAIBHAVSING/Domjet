@@ -100,7 +100,7 @@ test("domjet/web runs the engine, unmodified bootstrap.js, and the iframe in a b
     const out = {};
     try {
       const { mountBrowserFrame } = await import("${A}/frame-client.mjs");
-      const frame = await mountBrowserFrame(document.getElementById("c"), { frameUrl: "${A}/frame.html", allowPrivateNetwork: true, width: 320, height: 240 });
+      const frame = await mountBrowserFrame(document.getElementById("c"), { frameUrl: "${A}/frame.html", allowPrivateNetwork: true, width: 320, height: 240, readyTimeoutMs: Number(new URLSearchParams(location.search).get("readyTimeoutMs")) || 60000 });
       out.nav = await frame.navigate("${A}/fixture.html");
       out.items = await frame.evaluate("document.querySelectorAll('li').length");
       out.isolated = (() => { try { return typeof frame.element.contentWindow.document; } catch (e) { return e.name; } })();
@@ -108,6 +108,12 @@ test("domjet/web runs the engine, unmodified bootstrap.js, and the iframe in a b
     window.__result = out;
   </script>` });
   const B = origin(embedServer, "localhost");
+  // The frame lives on the asset origin and only accepts the embedder origin
+  // it was published for.
+  const publish = (...extra: string[]) => execFileSync(process.execPath, [join(packageRoot, "dist/bin/domjet-web-assets.mjs"), assets, "--frame-origin", B, ...extra]);
+  // Without --frame-private-network a cross-origin embedder cannot turn
+  // allowPrivateNetwork on; checked below before republishing with it.
+  publish();
   const browser = await playwright.chromium.launch();
   try {
     const page = await (await browser.newContext()).newPage();
@@ -147,6 +153,9 @@ test("domjet/web runs the engine, unmodified bootstrap.js, and the iframe in a b
     assert.equal(crossOrigin.error, undefined, crossOrigin.error);
     assert.equal(crossOrigin.title, "cross-origin assets");
 
+    const refused = await result(`${B}/embed.html?readyTimeoutMs=10000`);
+    assert.match(String(refused.error), /refused its options: allowPrivateNetwork/);
+    publish("--frame-private-network");
     const embed = await result(`${B}/embed.html`);
     assert.equal(embed.error, undefined, embed.error);
     assert.equal(embed.nav.title, "fixture ran");
@@ -155,10 +164,52 @@ test("domjet/web runs the engine, unmodified bootstrap.js, and the iframe in a b
     const frame = page.frames().find((candidate: any) => candidate.url().startsWith(`${A}/frame.html`));
     const view = await frame.evaluate(() => (document.getElementById("view") as HTMLImageElement).naturalWidth);
     assert.equal(view, 320);
+
+    // The same embedding page on an origin frame.html was not published for:
+    // the frame ignores it, whatever the page puts in the frame URL.
+    const unlisted = await result(`${origin(embedServer)}/embed.html?readyTimeoutMs=5000`);
+    assert.match(String(unlisted.error), /did not accept/);
   } finally {
     await browser.close();
     assetServer.close();
     embedServer.close();
     rmSync(assets, { recursive: true, force: true });
+  }
+});
+
+test("domjet-web-assets bakes the permitted embedder origins into frame.html", () => {
+  const cli = join(packageRoot, "dist/bin/domjet-web-assets.mjs");
+  const plain = mkdtempSync(join(tmpdir(), "domjet-web-plain-"));
+  const restricted = mkdtempSync(join(tmpdir(), "domjet-web-origins-"));
+  try {
+    execFileSync(process.execPath, [cli, plain], { stdio: "pipe" });
+    assert.doesNotMatch(readFileSync(join(plain, "frame.html"), "utf8"), /domjet-frame-origins/);
+    const report = JSON.parse(execFileSync(process.execPath, [
+      cli, restricted, "--frame-origin", "https://app.example.com", "--frame-origin=http://localhost:8080",
+    ], { encoding: "utf8" }));
+    assert.deepEqual(report.frameOrigins, ["https://app.example.com", "http://localhost:8080"]);
+    assert.match(
+      readFileSync(join(restricted, "frame.html"), "utf8"),
+      /<meta name="domjet-frame-origins" content="https:\/\/app\.example\.com http:\/\/localhost:8080">/,
+    );
+    for (const invalid of ["https://app.example.com/", "app.example.com", "https://app.example.com/path", "null"]) {
+      assert.throws(() => execFileSync(process.execPath, [cli, restricted, "--frame-origin", invalid], { stdio: "pipe" }), invalid);
+    }
+    // What other-origin embedders may enable is the publisher's choice.
+    const capable = JSON.parse(execFileSync(process.execPath, [
+      cli, restricted, "--frame-origin", "https://app.example.com", "--frame-private-network", "--frame-proxy", "https://proxy.example/fetch",
+    ], { encoding: "utf8" }));
+    assert.equal(capable.framePrivateNetwork, true);
+    assert.deepEqual(capable.frameProxies, ["https://proxy.example/fetch"]);
+    const capableHtml = readFileSync(join(restricted, "frame.html"), "utf8");
+    assert.match(capableHtml, /<meta name="domjet-frame-private-network" content="allow">/);
+    assert.match(capableHtml, /<meta name="domjet-frame-proxies" content="https:\/\/proxy\.example\/fetch">/);
+    assert.throws(() => execFileSync(process.execPath, [cli, restricted, "--frame-orgin", "https://app.example.com"], { stdio: "pipe" }));
+    for (const invalid of ["ftp://proxy.example/", "not a url", 'https://proxy.example/"><script>', "https://user:secret@proxy.example/"]) {
+      assert.throws(() => execFileSync(process.execPath, [cli, restricted, "--frame-proxy", invalid], { stdio: "pipe" }), invalid);
+    }
+  } finally {
+    rmSync(plain, { recursive: true, force: true });
+    rmSync(restricted, { recursive: true, force: true });
   }
 });
