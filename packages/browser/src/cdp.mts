@@ -37,6 +37,17 @@ export interface CdpAdapter {
 export interface CdpListenOptions {
   host?: string;
   port?: number;
+  /** Required to listen on a non-loopback host: the endpoint has no authentication. */
+  allowRemote?: boolean;
+  /** Serve /json/version and /json/list (default true). */
+  discovery?: boolean;
+  /**
+   * Host names clients may use in the Host header besides localhost, loopback
+   * addresses and the bound address, for an endpoint reached by name (for
+   * example a container service name). Other names are refused so a
+   * DNS-rebinding page cannot reach the endpoint. "*" accepts any name.
+   */
+  allowedHosts?: readonly string[];
 }
 
 interface MessageTransport {
@@ -179,13 +190,20 @@ export class CdpClient implements CdpConnection {
         if (ArrayBuffer.isView(data)) data = new TextDecoder().decode(data);
         transport.onmessage?.(String(data));
       });
-      socket.addEventListener("close", () => transport.onclose?.());
+      socket.addEventListener("close", () => {
+        // A socket that closes before opening never becomes ready.
+        reject(new Error("CDP WebSocket closed before it opened"));
+        transport.onclose?.();
+      });
       socket.addEventListener("error", (event) => {
         const error = new Error(event.message || "CDP WebSocket error");
         transport.onerror?.(error);
         reject(error);
       });
     });
+    // A connection that fails before anyone awaits ready() must not surface
+    // as an unhandled rejection; ready() and command() still report it.
+    this.#ready.catch(() => undefined);
   }
 
   async ready(): Promise<this> {

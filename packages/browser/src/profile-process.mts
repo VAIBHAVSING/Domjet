@@ -267,7 +267,9 @@ export class ProfileBrowserProcess {
 
   playwright<Browser = any>(options: PlaywrightAdapterOptions = {}): Promise<Browser> {
     this.#assertRunning();
-    return connectPlaywrightEndpoint(this.httpEndpoint(), options);
+    // The child serves no /json discovery; Playwright connects to the
+    // WebSocket endpoint directly.
+    return connectPlaywrightEndpoint(this.wsEndpoint(), options);
   }
 
   puppeteer<Browser = any>(options: PuppeteerAdapterOptions = {}): Promise<Browser> {

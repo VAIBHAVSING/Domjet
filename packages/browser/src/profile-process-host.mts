@@ -99,7 +99,10 @@ async function handle(message: any): Promise<void> {
     traceHost("initialize:before");
     server = new DomjetCdpServer(message.options);
     await server.start({ listen: false });
-    await server.listen({ host: "127.0.0.1", port: 0 });
+    // No /json discovery: the endpoint has no credentials, and discovery
+    // would hand its WebSocket URL to any local process that finds the port.
+    // The parent receives the random WebSocket URL over IPC instead.
+    await server.listen({ host: "127.0.0.1", port: 0, discovery: false });
     traceHost("initialize:after");
     await send({
       protocol: PROTOCOL,

@@ -22,8 +22,23 @@ identity and can be restored into a later browser process. The current snapshot
 format persists cookies and context options. It is versioned so more durable
 browser state can be added without changing the storage API.
 
-Passing only `profile` uses the local profile directory. A final checkpoint is
-required when the context or browser closes.
+A context without a profile is ephemeral: its cookies stay in memory while the
+context is open (also after its pages close), are never shared with another
+context, and are discarded when the context or browser closes. Nothing is
+written to disk or to a bucket.
+
+Attach a store to keep a profile: `persistence: local({ directory })` or
+`persistence: s3({ endpoint, bucket, prefix })` saves it at that location and
+restores it into a later browser. Passing only `profile` uses the default local
+profile directory. A final checkpoint is required when the context or browser
+closes.
+
+**Profiles are stored unencrypted unless you pass `profileEncryptionKey`.** A
+profile holds session cookies, so anyone who can read the profile directory or
+bucket can sign in as that profile. Profile files are created with mode `0600`.
+With a key (32 bytes, AES-256-GCM), a profile that is not encrypted is refused
+on load, so nobody who can write to the store can substitute one. To encrypt an
+existing plaintext profile, open it once without a key and save it with one.
 
 ```ts
 const browser = await createBrowser({ profile: "customer-123" });
@@ -56,7 +71,13 @@ const remoteBrowser = await createBrowser({
 
 Call `context.backup()` for an explicit checkpoint. Automatic debounced
 checkpoints are enabled by default. `close({ persist: "skip" })` is available
-for a deliberate force-close.
+for a deliberate force-close. A checkpoint compares the snapshot with the last
+stored one, so changes made over CDP (Playwright, Puppeteer) are saved and an
+unchanged profile is not written again.
+
+S3 endpoints must use HTTPS unless they are on loopback or `allowInsecureHttp:
+true` is set. Requests time out after `requestTimeoutMs` (default 30 s) and do
+not follow redirects.
 
 ## Crash-isolated profile processes
 
@@ -106,15 +127,25 @@ profile process inside one shared sandbox does not provide tenant isolation.
 
 ## CDP, Puppeteer, and Playwright
 
-The adapters are experimental. In the September 2026 launch review,
-`puppeteer-core@25.10.0` failed page creation on `Audits.enable`, and
-`playwright-core@1.63.0` failed locator text extraction. The direct API is the
-verified path for navigation, evaluation, screenshots, and PDF. Broad peer
-dependency ranges do not imply full client compatibility.
+The adapters are experimental. Runtime remote objects live in the page, so
+`evaluate`, `evaluateHandle`, element handles, locators that read the DOM,
+`$eval`, `content()` and screenshots work with `playwright-core@1.63` and
+`puppeteer-core@25.12`. Playwright `setContent()`, `click()`, and
+`page.on("console")` work too. Commands on one page session are handled in the
+order they were sent, as in Chrome.
+
+Not yet supported: `page.route()` for navigation requests (subresource and
+`data:` requests can be routed), `addInitScript()`, console messages a document
+logs before the first CDP evaluation in it, and `setContent()` of a whole
+document with its own `<head>` (the content is written into the existing
+body). Puppeteer `goto()` lifecycle waiting is not verified. The direct API is
+the verified path for navigation, evaluation, screenshots, and PDF.
 
 The direct API and Puppeteer adapter use an in-memory CDP transport. A network
 endpoint is created only when explicitly requested. Playwright currently uses
-a loopback CDP endpoint because its public connection API requires one.
+a loopback CDP endpoint because its public connection API requires one; a
+listener it starts serves no `/json/*` discovery, so only a client that knows
+the random WebSocket path can connect.
 
 ```ts
 import createBrowser from "domjet";
@@ -134,13 +165,51 @@ request/event transport intended for a future remote browser service. Local and
 remote placement can therefore share the same public browser API.
 
 The CDP endpoint has no credentials, so it only answers local clients. It
-refuses requests whose `Host` is not `localhost`, an IP address, or the host it
-was bound to (DNS rebinding), and WebSocket or HTTP requests that carry an
-`Origin` header (a web page) unless `allowedOrigins` lists that origin. Node CDP
-clients such as Puppeteer and Playwright send no `Origin`. Browser and page IDs
-are random. Remote clients of a non-loopback bind connect by IP address, as with
-Chrome. Binding to a non-loopback host gives anyone who can reach it control of
-the browser; `domjet serve --host` warns about it.
+refuses requests whose `Host` is not `localhost`, a loopback address, or the
+address it was bound to (DNS rebinding), and WebSocket or HTTP requests that
+carry an `Origin` header (a web page) unless `allowedOrigins` lists that origin.
+A `Host` with credentials, a path, or a backslash is refused. Node CDP clients
+such as Puppeteer and Playwright send no `Origin`. Browser and page IDs are
+random. Binding to a non-loopback host gives anyone who can reach it control of
+the browser, so it requires `allowRemote: true` (`domjet serve --host` sets it
+and warns). Remote clients of a wildcard bind (`0.0.0.0`, `::`) connect by IP
+address; to reach the endpoint by name (a container or service name), list the
+names in `allowedHosts` (`domjet serve --allowed-hosts domjet,domjet.internal`).
+
+### Limits
+
+Every page is a Worker whose JavaScript heap is capped at 512 MB. `maxTargets`
+bounds the pages open at once; the default is half of the memory the process
+may use (the container limit when one applies) divided by that cap, between 2
+and 16 (8 on an 8 GB machine, 16 on 16 GB or more). Pass `maxTargets: 32` (or
+`Infinity`) to change it. CDP messages may be up to 256 MiB (screenshots and
+PDFs are base64); commands up to 8 MiB.
+
+The engine's memory per page (DOM, styles, layout, and raster) can grow to
+1 GiB; it is committed only as a page needs it, so ordinary pages use tens of
+MiB. Text-heavy documents need the most: layout costs about 1 KB per word.
+Three guards keep a large page from destabilizing the process:
+
+- `minFreeMemoryMb` (default 256): new pages are refused with a clear error
+  while less memory than this is free (container limits included).
+- `engineMemoryRecycleMb` (default 256): engine memory never shrinks, so a page
+  above this moves to a fresh Worker at its next navigation, keeping its
+  cookies, and the memory returns to the system.
+- A page that exceeds the engine's memory anyway fails that call with
+  `ERR_DOMJET_ENGINE_OUT_OF_MEMORY` (other engine faults use
+  `ERR_DOMJET_ENGINE_TRAPPED`). Its Worker ends and the page starts over at
+  `about:blank` on its next call; other pages are unaffected.
+
+### Network policy
+
+Pages cannot reach loopback, private, link-local, CGNAT, or cloud metadata
+addresses (the same set as the native engine), including through redirects and
+through host names that resolve to such addresses, which are checked when the
+connection is made. `allowPrivateNetwork: true` lifts this for local
+development. Page JavaScript runs in a Node `vm` realm inside a Worker thread,
+which is not a security boundary against engine bugs: for untrusted sites, run
+the browser in a separate process with Node's permission model or an OS
+sandbox.
 
 ## Runtimes: Node.js, Bun, browsers, Web Workers, and iframes
 
@@ -201,9 +270,23 @@ console.log(await frame.evaluate("document.title"));
 ```
 
 Serve `frame.html` from a dedicated origin (for example an assets subdomain).
-The frame then has its own HTTP cache and storage, page content cannot reach the
-embedding document, and the frame only accepts commands from the embedder's
-origin.
+The frame then has its own HTTP cache and storage, and page content cannot reach
+the embedding document.
+
+The frame accepts commands only from the origins it was published for, and
+without a list only from its own origin. Nothing in the frame URL or the
+referrer changes that, so another site that embeds your `frame.html` cannot
+drive it. List the embedding origins when you write the assets, and send a
+matching `Content-Security-Policy: frame-ancestors` header with `frame.html`:
+
+```bash
+npx domjet-web-assets ./public/domjet --frame-origin https://app.example.com
+```
+
+`mountBrowserFrame()` sends its options (`url`, `allowPrivateNetwork`,
+`fetchProxy`) to the frame in a message after the frame accepts the page, not in
+the frame URL. If the frame does not accept the page within `readyTimeoutMs`
+(default 60 s), the returned promise rejects with the command to publish it.
 
 ## Compatibility and attribution
 

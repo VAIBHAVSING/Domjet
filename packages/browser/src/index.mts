@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
@@ -14,6 +15,9 @@ const DEFAULT_BACKUP_DEBOUNCE_MS = 1_000;
 const profileLeases = new WeakMap<ProfileStore, Set<string>>();
 let sharedDefaultBrowserPromise: Promise<BrowserVM> | undefined;
 let sharedDefaultBrowser: BrowserVM | undefined;
+// Browsers whose close() has started. A shared default browser closed before
+// createBrowser() recorded it must not be handed to the next caller.
+const closingBrowsers = new WeakSet<BrowserVM>();
 
 export interface BrowserOptions {
   modulePath?: string;
@@ -31,6 +35,21 @@ export interface BrowserOptions {
   allowedOrigins?: readonly string[];
   /** Started page workers kept ready for newPage(). Default 1; 0 disables. */
   prewarmPages?: number;
+  /**
+   * Most pages (each a Worker) open at once. Default: half of the memory this
+   * process may use divided by the per-page heap cap, clamped to 2..16.
+   * Infinity removes the limit.
+   */
+  maxTargets?: number;
+  /** Allow the CDP endpoint on a non-loopback host. It has no authentication. */
+  allowRemote?: boolean;
+  /** Refuse new pages while less memory than this is free. Default 256; 0 disables. */
+  minFreeMemoryMb?: number;
+  /**
+   * A page whose engine memory exceeds this moves to a fresh Worker at its next
+   * navigation, returning the memory to the system. Default 256; 0 disables.
+   */
+  engineMemoryRecycleMb?: number;
   workerOptions?: Record<string, unknown>;
   /** Stable Chrome-style user profile used by the default context. */
   profile?: string;
@@ -162,7 +181,20 @@ function normalizeProfileOptions(options: BrowserContextOptions): {
   else if (configured === true) autoBackupMs = DEFAULT_BACKUP_DEBOUNCE_MS;
   else if (Number.isInteger(configured) && configured >= 0 && configured <= 300_000) autoBackupMs = configured;
   else throw new RangeError("autoBackup must be a boolean or an integer from 0 to 300000 milliseconds");
-  return { profile, persistence, profileEncryptionKey: options.profileEncryptionKey, autoBackupMs };
+  let profileEncryptionKey: Uint8Array | undefined;
+  if (options.profileEncryptionKey !== undefined) {
+    // Check the key now, not when close() first seals the profile, and copy
+    // it so later changes to the caller's buffer cannot change it.
+    if (!(options.profileEncryptionKey instanceof Uint8Array) || options.profileEncryptionKey.byteLength !== 32) {
+      throw new TypeError("profileEncryptionKey must contain exactly 32 bytes");
+    }
+    profileEncryptionKey = new Uint8Array(options.profileEncryptionKey);
+  }
+  return { profile, persistence, profileEncryptionKey, autoBackupMs };
+}
+
+function snapshotDigest(snapshot: Uint8Array): string {
+  return createHash("sha256").update(snapshot).digest("hex");
 }
 
 function acquireProfileLease(store: ProfileStore, profile: string): () => void {
@@ -283,6 +315,8 @@ export class BrowserContext {
   readonly #pages = new Set<Page>();
   #releaseLease?: () => void;
   #storedVersion?: string;
+  // SHA-256 of the snapshot last loaded from or saved to the store.
+  #storedDigest?: string;
   #dirty = false;
   #closed = false;
   #backupTimer?: NodeJS.Timeout;
@@ -306,8 +340,10 @@ export class BrowserContext {
     try {
       const stored = await this.#store.load(this.#profile);
       if (stored) {
-        await this.#browser.server.restoreContextSnapshot(openProfile(stored.bytes, { encryptionKey: this.#encryptionKey }), this.id);
+        const snapshot = openProfile(stored.bytes, { encryptionKey: this.#encryptionKey });
+        await this.#browser.server.restoreContextSnapshot(snapshot, this.id);
         this.#storedVersion = stored.version;
+        this.#storedDigest = snapshotDigest(snapshot);
       }
       return this;
     } catch (error) {
@@ -407,19 +443,28 @@ export class BrowserContext {
   async backup(): Promise<BackupResult> {
     this.#ensureOpen();
     if (!this.#store || !this.#profile) return { saved: false, reason: "ephemeral" };
-    if (!this.#dirty && this.#storedVersion) return { saved: false, profile: this.#profile, reason: "clean", version: this.#storedVersion };
     if (this.#backupPromise) return this.#backupPromise;
-    this.#backupPromise = (async () => {
+    const pending = (async (): Promise<BackupResult> => {
+      // Compare content, not only the SDK's dirty flag: cookies changed over
+      // CDP (Playwright, Puppeteer, raw clients) never set it, and an
+      // unchanged profile is not rewritten.
       const snapshot = await this.#browser.server.exportContextSnapshot(this.id);
+      const digest = snapshotDigest(snapshot);
+      if (this.#storedVersion && digest === this.#storedDigest) {
+        this.#dirty = false;
+        return { saved: false, profile: this.#profile, reason: "clean", version: this.#storedVersion };
+      }
       const bytes = sealProfile(snapshot, { encryptionKey: this.#encryptionKey });
       const saved = await this.#store!.save(this.#profile!, bytes, {
         expectedVersion: this.#storedVersion ?? null,
       });
       this.#storedVersion = saved.version;
+      this.#storedDigest = digest;
       this.#dirty = false;
       return { saved: true, profile: this.#profile, version: saved.version, bytes: bytes.byteLength };
     })().finally(() => { this.#backupPromise = undefined; });
-    return this.#backupPromise;
+    this.#backupPromise = pending;
+    return pending;
   }
 
   async close(options: ContextCloseOptions = {}): Promise<void> {
@@ -547,15 +592,27 @@ export class BrowserVM {
 
   async close(options: ContextCloseOptions = {}): Promise<void> {
     if (this.#closed) return;
+    closingBrowsers.add(this);
     clearSharedDefaultBrowser(this);
+    // A context that fails to close (a profile save conflict, a store
+    // error) must not leave the server and its Workers running. The first
+    // failure is reported after everything is closed.
+    let failure: unknown;
     try {
-      for (const context of [...this.#contextSet]) await context.close(options);
+      for (const context of [...this.#contextSet]) {
+        try {
+          await context.close(options);
+        } catch (error) {
+          failure ??= error;
+        }
+      }
       this.#closed = true;
-      await this.#client.close();
+      try { await this.#client.close(); } catch (error) { failure ??= error; }
       await this.server.close();
     } finally {
       clearSharedDefaultBrowser(this);
     }
+    if (failure !== undefined) throw failure;
   }
 
   #ensureOpen(): void {
@@ -583,7 +640,9 @@ export async function createBrowser(options: BrowserOptions = {}): Promise<Brows
     sharedDefaultBrowserPromise = promise;
     void promise.then(
       (browser) => {
-        if (sharedDefaultBrowserPromise === promise) sharedDefaultBrowser = browser;
+        if (sharedDefaultBrowserPromise !== promise) return;
+        if (closingBrowsers.has(browser)) sharedDefaultBrowserPromise = undefined;
+        else sharedDefaultBrowser = browser;
       },
       () => {
         if (sharedDefaultBrowserPromise === promise) sharedDefaultBrowserPromise = undefined;
@@ -597,7 +656,7 @@ export async function createBrowser(options: BrowserOptions = {}): Promise<Brows
 /** Server-oriented compatibility alias. New embedded code should prefer createBrowser(). */
 export async function launch(options: BrowserOptions & CdpListenOptions = {}): Promise<BrowserVM> {
   const browser = await createBrowser(options);
-  await browser.listen({ host: options.host, port: options.port });
+  await browser.listen({ host: options.host, port: options.port, allowRemote: options.allowRemote, discovery: options.discovery, allowedHosts: options.allowedHosts });
   return browser;
 }
 

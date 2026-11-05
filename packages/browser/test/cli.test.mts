@@ -96,6 +96,12 @@ test("npx CLI one-shot commands use the WASM package for PNG, PDF, and eval", as
     const evaluated = await runCli(["eval", url, "document.querySelector('h1').textContent", "--module", WASM, "--json"]);
     assert.equal(evaluated.code, 0, evaluated.stderr);
     assert.equal(JSON.parse(evaluated.stdout), "portable");
+    const plain = await runCli(["eval", url, "document.querySelector('h1').textContent", "--module", WASM]);
+    assert.equal(plain.code, 0, plain.stderr);
+    assert.equal(JSON.parse(plain.stdout), "portable");
+    const thrown = await runCli(["eval", url, "(() => { throw new Error('boom'); })()", "--module", WASM]);
+    assert.equal(thrown.code, 5);
+    assert.match(thrown.stderr, /evaluation failed: .*boom/);
     assert.ok((await stat(pngPath)).size > 64);
     assert.ok((await stat(pdfPath)).size > 64);
   } finally {

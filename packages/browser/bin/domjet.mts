@@ -2,14 +2,14 @@
 // @ts-nocheck
 import { writeFile, rename, unlink } from "node:fs/promises";
 import { resolve } from "node:path";
-import { launch, connect, version } from "../src/index.mjs";
+import { createBrowser, launch, connect, version } from "../src/index.mjs";
 
 const MAX_OPTION_VALUE_BYTES = 8 * 1024;
 const MAX_OUTPUT_PATH_BYTES = 4 * 1024;
 const MAX_EXPRESSION_BYTES = 4 * 1024 * 1024;
 const MAX_TIMEOUT_MS = 120_000;
 const COMMAND_OPTIONS = Object.freeze({
-  serve: new Set(["module", "host", "port", "json"]),
+  serve: new Set(["module", "host", "port", "json", "allowed-hosts"]),
   screenshot: new Set(["module", "host", "port", "timeout"]),
   pdf: new Set(["module", "host", "port", "timeout"]),
   eval: new Set(["module", "host", "port", "timeout", "json"]),
@@ -32,7 +32,7 @@ function cliError(message, exitCode = 2, options = {}) {
 function usage() {
   process.stderr.write([
     "Usage:",
-    "  domjet serve [--module path] [--host 127.0.0.1] [--port 0] [--json]",
+    "  domjet serve [--module path] [--host 127.0.0.1] [--port 0] [--allowed-hosts name,...] [--json]",
     "  domjet screenshot <url> <output.png> [--module path] [--timeout ms]",
     "  domjet pdf <url> <output.pdf> [--module path] [--timeout ms]",
     "  domjet eval <url> <expression> [--module path] [--timeout ms] [--json]",
@@ -130,12 +130,18 @@ async function atomicWrite(path, bytes) {
 }
 
 async function withPage(options, callback) {
-  const browser = await launch({
-    modulePath: options.module,
-    host: options.host,
-    port: options.port === undefined ? 0 : Number(options.port),
-  });
-  const client = await connect(browser.wsEndpoint());
+  // One-shot commands talk to the browser in memory; they only open a port
+  // when --host or --port asks for one.
+  const listen = options.host !== undefined || options.port !== undefined;
+  const browser = listen
+    ? await launch({
+      modulePath: options.module,
+      host: options.host,
+      port: options.port === undefined ? 0 : Number(options.port),
+      allowRemote: options.host !== undefined,
+    })
+    : await createBrowser({ modulePath: options.module });
+  const client = listen ? await connect(browser.wsEndpoint()) : await browser.cdp().connect();
   try {
     const { targetId } = await client.command("Target.createTarget", { url: "about:blank" });
     const { sessionId } = await client.command("Target.attachToTarget", { targetId, flatten: true });
@@ -156,7 +162,16 @@ async function main(argv) {
   }
   if (!command) { usage(); process.exitCode = 2; return; }
   if (command === "serve") {
-    const browser = await launch({ modulePath: options.module, host: options.host, port: options.port === undefined ? 0 : Number(options.port) });
+    // --host is an explicit choice; the warning below states the exposure.
+    const browser = await launch({
+      modulePath: options.module,
+      host: options.host,
+      port: options.port === undefined ? 0 : Number(options.port),
+      allowRemote: options.host !== undefined,
+      allowedHosts: options["allowed-hosts"] === undefined
+        ? undefined
+        : String(options["allowed-hosts"]).split(",").map((host) => host.trim()).filter(Boolean),
+    });
     const info = { httpEndpoint: browser.httpEndpoint(), wsEndpoint: browser.wsEndpoint(), ...browser.processInfo() };
     process.stdout.write(options.json ? `${JSON.stringify(info)}\n` : `${info.httpEndpoint}\n`);
     const loopback = ["127.0.0.1", "localhost", "::1", "[::1]"];
@@ -205,7 +220,11 @@ async function main(argv) {
         error.exitCode = 4;
         throw error;
       }
-      const result = await client.command("Runtime.evaluate", { expression: positional[1], returnByValue: true }, sessionId);
+      const result = await client.command("Runtime.evaluate", { expression: positional[1], returnByValue: true, awaitPromise: true }, sessionId);
+      if (result.exceptionDetails) {
+        const details = result.exceptionDetails;
+        throw cliError(`evaluation failed: ${details.exception?.description ?? details.text ?? "uncaught exception"}`, 5);
+      }
       process.stdout.write(`${JSON.stringify(result.result?.value ?? null)}\n`);
     });
     return;

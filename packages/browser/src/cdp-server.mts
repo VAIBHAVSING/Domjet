@@ -4,26 +4,96 @@ import { createServer } from "node:http";
 import { EventEmitter } from "node:events";
 import { dirname, resolve } from "node:path";
 import { existsSync } from "node:fs";
+import { totalmem } from "node:os";
 import { fileURLToPath } from "node:url";
 import { WasmV8Worker } from "./runtime/client.mjs";
-import { WebSocketPeer, websocketAccept } from "./websocket.mjs";
+import { PageRuntime } from "./page-runtime.mjs";
+import { MAX_WS_OUTBOUND_MESSAGE_BYTES, WebSocketPeer, websocketAccept } from "./websocket.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_HOST = "127.0.0.1";
+const DEFAULT_PAGE_HEAP_MB = 512;
+const MIN_DEFAULT_MAX_TARGETS = 2;
+const MAX_DEFAULT_MAX_TARGETS = 16;
+
+// Default page limit from the memory this process may use: every page is a
+// Worker whose JavaScript heap may grow to its cap, so half of the memory
+// divided by that cap, clamped to 2..16 (8 pages on 8 GiB, 16 on 16 GiB+).
+// Inside a container os.totalmem() reports the host; the cgroup limit from
+// process.constrainedMemory() is used when it is lower.
+export function defaultMaxTargets(pageHeapMb = DEFAULT_PAGE_HEAP_MB) {
+  const total = totalmem();
+  const constrained = typeof process.constrainedMemory === "function" ? Number(process.constrainedMemory()) : 0;
+  const available = constrained > 0 && constrained < total ? constrained : total;
+  const perPage = Math.max(64, Number(pageHeapMb) || DEFAULT_PAGE_HEAP_MB) * 1024 * 1024;
+  const fit = Math.floor((available / 2) / perPage);
+  return Math.min(MAX_DEFAULT_MAX_TARGETS, Math.max(MIN_DEFAULT_MAX_TARGETS, fit));
+}
+
+function isLoopbackHost(host) {
+  const value = String(host).toLowerCase().replace(/^\[|\]$/gu, "");
+  return value === "localhost" || value === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/u.test(value);
+}
 
 // The CDP endpoint has no credentials, so it only answers requests a local
-// client could have made. A Host header must be localhost, an IP literal, or
-// the host the server was bound to: a DNS-rebinding page uses its own host
-// name. Browsers attach Origin to cross-site WebSocket and fetch requests;
-// Node CDP clients (Puppeteer, Playwright, this SDK) send none. Requests with
-// an Origin are refused unless it is listed in `allowedOrigins`.
-function hostHeaderAllowed(value, boundHost) {
-  if (typeof value !== "string" || value.length === 0) return false;
+// client could have made. A Host header must be localhost, a loopback IP
+// literal, or the address the server was bound to: a DNS-rebinding page uses
+// its own host name. A wildcard bind (0.0.0.0, ::) accepts any IP literal,
+// since the server then answers on every interface address; it still refuses
+// host names other than the bound one. Browsers attach Origin to cross-site
+// WebSocket and fetch requests; Node CDP clients (Puppeteer, Playwright, this
+// SDK) send none. Requests with an Origin are refused unless it is listed in
+// `allowedOrigins`.
+//
+// The header is matched against a strict host[:port] grammar first. Handing it
+// to the URL parser alone would read "evil.example@127.0.0.1" as credentials
+// plus a loopback host.
+const EMPTY_HOSTS = new Set();
+
+function normalizeAllowedHosts(value) {
+  if (value === undefined) return EMPTY_HOSTS;
+  if (!Array.isArray(value) || value.some((host) => typeof host !== "string" || host.length === 0 || host.length > 255)) {
+    throw new TypeError("allowedHosts must be an array of host names");
+  }
+  return new Set(value.map((host) => (host === "*" ? host : normalizeHostLiteral(host))));
+}
+
+const HOST_HEADER = /^(?:\[([0-9A-Fa-f:.]+)\]|([A-Za-z0-9.-]+))(?::(\d{1,5}))?$/u;
+
+function normalizeHostLiteral(value) {
+  return String(value).toLowerCase().replace(/^\[|\]$/gu, "").replace(/\.$/u, "");
+}
+
+function isIpv4Literal(value) {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/u.exec(value);
+  return match !== null && match.slice(1).every((octet) => Number(octet) <= 255);
+}
+
+function isWildcardHost(value) {
+  return value === "0.0.0.0" || value === "::" || value === "0:0:0:0:0:0:0:0";
+}
+
+function hostHeaderAllowed(value, boundHost, allowedHosts = EMPTY_HOSTS) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 255) return false;
+  const match = HOST_HEADER.exec(value);
+  if (!match) return false;
+  if (match[3] !== undefined && Number(match[3]) > 65535) return false;
+  const bracketed = match[1] !== undefined;
   let hostname;
-  try { hostname = new URL(`http://${value}`).hostname.toLowerCase(); } catch { return false; }
+  // The URL parser canonicalizes IPv6 and the legacy IPv4 forms (0x7f.1,
+  // 2130706433) so the comparisons below see one spelling per address.
+  try { hostname = normalizeHostLiteral(new URL(`http://${bracketed ? `[${match[1]}]` : match[2]}`).hostname); } catch { return false; }
   if (hostname === "localhost" || hostname.endsWith(".localhost")) return true;
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/u.test(hostname) || hostname.startsWith("[")) return true;
-  return typeof boundHost === "string" && hostname === boundHost.toLowerCase();
+  if (isLoopbackHost(hostname)) return true;
+  // Names the operator listed, for a remote endpoint reached by name (a
+  // container or service name). "*" accepts any well-formed Host.
+  if (allowedHosts.has("*") || allowedHosts.has(hostname)) return true;
+  const bound = typeof boundHost === "string" ? normalizeHostLiteral(boundHost) : "";
+  let boundCanonical = bound;
+  try { if (bound) boundCanonical = normalizeHostLiteral(new URL(`http://${bound.includes(":") ? `[${bound}]` : bound}`).hostname); } catch {}
+  if (bound && hostname === boundCanonical) return true;
+  const ipLiteral = bracketed || isIpv4Literal(hostname);
+  return ipLiteral && isWildcardHost(boundCanonical);
 }
 
 function originAllowed(origin, allowedOrigins) {
@@ -31,7 +101,37 @@ function originAllowed(origin, allowedOrigins) {
   return allowedOrigins.has("*") || allowedOrigins.has(String(origin));
 }
 const MAX_COMMAND_BYTES = 8 * 1024 * 1024;
-const MAX_REMOTE_OBJECTS = 2_048;
+
+// Commands on one page session start in the order the client sent them, and a
+// command's response (with the events it emits) is written before the next
+// command starts, as in Chrome. Playwright depends on that: it reads
+// Page.getFrameTree before the contexts Runtime.enable announces, and drops a
+// context for a frame it does not know yet.
+//
+// Commands that can wait on a later command or on page activity start in
+// order but do not hold the queue (a promise an Input event settles, a
+// navigation that request interception pauses). Commands that answer such a
+// wait bypass the queue: a screenshot whose subresource is paused by
+// Fetch interception must not wait behind itself for Fetch.continueRequest.
+const UNORDERED_COMMAND_PREFIXES = ["Fetch.", "Target.", "Browser."];
+const UNORDERED_COMMANDS = new Set(["Page.handleJavaScriptDialog", "Runtime.terminateExecution"]);
+const NON_BLOCKING_COMMANDS = new Set([
+  "Runtime.evaluate",
+  "Runtime.callFunctionOn",
+  "Runtime.awaitPromise",
+  "Page.navigate",
+  "Page.reload",
+  "Page.navigateToHistoryEntry",
+  "Page.setDocumentContent",
+]);
+
+function commandOrdering(method) {
+  if (typeof method !== "string" || UNORDERED_COMMANDS.has(method) ||
+      UNORDERED_COMMAND_PREFIXES.some((prefix) => method.startsWith(prefix))) {
+    return "unordered";
+  }
+  return NON_BLOCKING_COMMANDS.has(method) ? "start" : "complete";
+}
 
 // Hoisted so per-command dispatch does not allocate a fresh Set on every call.
 // These lists are part of the portable CDP migration boundary: methods outside
@@ -143,16 +243,26 @@ function parseJsonMessage(text) {
   if (!Number.isSafeInteger(message.id) || message.id < 0) {
     throw cdpError(-32600, "CDP command id must be a non-negative integer");
   }
+  // Once the id is valid, answer the client's own request id (and session)
+  // so a malformed command fails instead of leaving the client waiting.
+  const invalid = (code, text) => {
+    const error = cdpError(code, text);
+    error.commandId = message.id;
+    if (typeof message.sessionId === "string" && message.sessionId.length > 0 && message.sessionId.length <= 256) {
+      error.sessionId = message.sessionId;
+    }
+    return error;
+  };
   if (typeof message.method !== "string" || message.method.length === 0 || message.method.length > 256) {
-    throw cdpError(-32600, "CDP command method must be a bounded string");
+    throw invalid(-32600, "CDP command method must be a bounded string");
   }
   if (message.params !== undefined &&
       (message.params === null || typeof message.params !== "object" || Array.isArray(message.params))) {
-    throw cdpError(-32602, "CDP params must be an object");
+    throw invalid(-32602, "CDP params must be an object");
   }
   if (message.sessionId !== undefined &&
       (typeof message.sessionId !== "string" || message.sessionId.length === 0 || message.sessionId.length > 256)) {
-    throw cdpError(-32600, "CDP sessionId must be a bounded string");
+    throw invalid(-32600, "CDP sessionId must be a bounded string");
   }
   return message;
 }
@@ -184,6 +294,18 @@ function cdpCookie(value) {
     expires: Number.isFinite(value?.expires) ? Number(value.expires) : -1,
     sameSite: value?.sameSite === "Strict" || value?.sameSite === "None" ? value.sameSite : "Lax",
   };
+}
+
+// RFC 6265 domain, path and secure matching, for Storage.getCookies urls.
+function cookieMatchesUrl(cookie, href) {
+  let url;
+  try { url = new URL(href); } catch { return false; }
+  const host = url.hostname.toLowerCase();
+  const domain = String(cookie?.domain ?? "").toLowerCase().replace(/^\.+/u, "");
+  const domainMatches = host === domain || (cookie?.hostOnly !== true && host.endsWith(`.${domain}`));
+  const path = typeof cookie?.path === "string" && cookie.path.startsWith("/") ? cookie.path : "/";
+  const pathMatches = url.pathname === path || url.pathname.startsWith(path.endsWith("/") ? path : `${path}/`);
+  return domainMatches && pathMatches && (cookie?.secure !== true || url.protocol === "https:");
 }
 
 function portableCookieUrl(cookie, target) {
@@ -234,42 +356,6 @@ function rewritePortableTargetIds(value, internalTargetId, externalTargetId) {
   return value;
 }
 
-function normalizeRemote(value, target, returnByValue = false) {
-  if (value === undefined) return { type: "undefined" };
-  if (value === null) return { type: "object", subtype: "null", value: null };
-  if (typeof value === "boolean") return { type: "boolean", value, description: String(value) };
-  if (typeof value === "string") return { type: "string", value, description: value };
-  if (typeof value === "number") {
-    if (Number.isNaN(value)) return { type: "number", unserializableValue: "NaN", description: "NaN" };
-    if (value === Infinity) return { type: "number", unserializableValue: "Infinity", description: "Infinity" };
-    if (value === -Infinity) return { type: "number", unserializableValue: "-Infinity", description: "-Infinity" };
-    if (Object.is(value, -0)) return { type: "number", unserializableValue: "-0", description: "-0" };
-    return { type: "number", value, description: String(value) };
-  }
-  if (typeof value === "bigint") {
-    return { type: "bigint", unserializableValue: `${value}n`, description: `${value}n` };
-  }
-  if (returnByValue) {
-    return { type: "object", value };
-  }
-  const objectId = target.storeRemote(value);
-  return {
-    type: "object",
-    objectId,
-    className: Array.isArray(value) ? "Array" : "Object",
-    description: Array.isArray(value) ? `Array(${value.length})` : "Object",
-    preview: {
-      type: "object",
-      overflow: Object.keys(value).length > 50,
-      properties: Object.keys(value).slice(0, 50).map((name) => ({
-        name,
-        type: typeof value[name],
-        value: typeof value[name] === "string" ? value[name].slice(0, 256) : undefined,
-      })),
-    },
-  };
-}
-
 function exceptionDetails(error, expression = "") {
   return {
     exceptionId: 1,
@@ -289,60 +375,10 @@ function exceptionDetails(error, expression = "") {
   };
 }
 
-function findEncodedProperty(value, wanted, seen = new Set()) {
-  if (!value || typeof value !== "object" || seen.has(value)) return undefined;
-  seen.add(value);
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findEncodedProperty(item, wanted, seen);
-      if (found !== undefined) return found;
-    }
-    return undefined;
-  }
-  if (Object.hasOwn(value, wanted)) return value[wanted];
-  for (const item of Object.values(value)) {
-    const found = findEncodedProperty(item, wanted, seen);
-    if (found !== undefined) return found;
-  }
-  return undefined;
-}
-
-function decodePlaywrightValue(value, refs = new Map()) {
-  if (value === null || typeof value !== "object") return value;
-  if (Object.hasOwn(value, "h")) return { __remoteHandle: value.h };
-  if (Object.hasOwn(value, "v") && Object.keys(value).length === 1) {
-    if (value.v === "undefined") return undefined;
-    if (value.v === "null") return null;
-    if (value.v === "NaN") return Number.NaN;
-    if (value.v === "Infinity") return Infinity;
-    if (value.v === "-Infinity") return -Infinity;
-    if (value.v === "-0") return -0;
-    return value.v;
-  }
-  if (Object.hasOwn(value, "ref")) return refs.get(value.ref);
-  if (Array.isArray(value)) return value.map((item) => decodePlaywrightValue(item, refs));
-  if (Array.isArray(value.a)) {
-    const result = [];
-    if (Number.isSafeInteger(value.id)) refs.set(value.id, result);
-    for (const item of value.a) result.push(decodePlaywrightValue(item, refs));
-    return result;
-  }
-  if (Array.isArray(value.o)) {
-    const result = Object.create(null);
-    if (Number.isSafeInteger(value.id)) refs.set(value.id, result);
-    for (const entry of value.o) {
-      if (Array.isArray(entry) && entry.length === 2) result[entry[0]] = decodePlaywrightValue(entry[1], refs);
-      else if (entry && typeof entry === "object" && typeof entry.k === "string") result[entry.k] = decodePlaywrightValue(entry.v, refs);
-    }
-    return result;
-  }
-  const result = Object.create(null);
-  for (const [key, item] of Object.entries(value)) result[key] = decodePlaywrightValue(item, refs);
-  return result;
-}
 
 const NETWORK_FLUSH_MIN_MS = 25;
 const NETWORK_FLUSH_MAX_MS = 200;
+const ACTIVITY_POLL_MS = 250;
 
 class PageTarget {
   constructor(server, id, contextId = "default") {
@@ -353,13 +389,14 @@ class PageTarget {
     // it is assembling a newly attached CRPage. Reuse the opaque target id so
     // frame/session lookup cannot observe a transient detached frame.
     this.frameId = id;
+    // CDP remote objects live in the page realm (see page-runtime.mts).
+    this.pageRuntime = new PageRuntime(this);
     this.loaderId = `${id}-loader-0`;
     this.url = "about:blank";
     this.title = "";
     this.worker = null;
     this.startPromise = null;
     this.sessions = new Set();
-    this.remoteObjects = new Map();
     this.portableCdpConnections = new Map();
     this.portableCdpRawMode = null;
     this.networkFlushPromise = null;
@@ -370,6 +407,108 @@ class PageTarget {
     this.viewport = { width: 800, height: 600, deviceScaleFactor: 1 };
     this.embeddedClaimed = false;
     this.closed = false;
+    // Page.addScriptToEvaluateOnNewDocument, by identifier, in order added.
+    this.initScripts = new Map();
+    this.initScriptSerial = 0;
+    // "<connection>:<requestId>" -> "seen" | "synthetic": requests whose
+    // requestWillBeSent a client has received (see forwardPortableEvent).
+    this.announcedRequests = new Map();
+    this.pendingDocumentRequest = null;
+    // A committed portable navigation waiting to be announced after its
+    // document Network events (see #portablePageDispatch).
+    this.pendingAnnouncement = null;
+  }
+
+  // Console calls and document.close() the page runtime collected, sent to
+  // every session attached to the page.
+  emitPageActivity() {
+    const target = this;
+    const entries = this.pageRuntime?.takeActivity?.();
+    if (!entries || entries.length === 0) return;
+    this.activityEmitted = (this.activityEmitted ?? 0) + entries.length;
+    const sessions = [];
+    for (const connection of target.sessions) {
+      for (const [id, sessionTarget] of connection.sessions) if (sessionTarget === target) sessions.push([connection, id]);
+    }
+    for (const entry of entries) {
+      const timestamp = Number.isFinite(entry.timestamp) ? entry.timestamp : Date.now();
+      for (const [connection, id] of sessions) {
+        if (typeof entry.console === "string") {
+          connection.event("Runtime.consoleAPICalled", {
+            type: entry.console,
+            args: Array.isArray(entry.args) ? entry.args : [],
+            executionContextId: entry.executionContextId,
+            timestamp,
+            stackTrace: { callFrames: [] },
+          }, id);
+        } else if (entry.lifecycle === "load") {
+          const lifecycle = { frameId: target.frameId, loaderId: target.loaderId, timestamp: timestamp / 1000 };
+          connection.event("Page.domContentEventFired", { timestamp: timestamp / 1000 }, id);
+          connection.event("Page.lifecycleEvent", { ...lifecycle, name: "DOMContentLoaded" }, id);
+          connection.event("Page.loadEventFired", { timestamp: timestamp / 1000 }, id);
+          connection.event("Page.lifecycleEvent", { ...lifecycle, name: "load" }, id);
+        }
+      }
+    }
+  }
+
+  // Forwards one event from the portable CDP core to a client session.
+  //
+  // A paused request (Fetch.requestPaused) is announced with its
+  // Network.requestWillBeSent first when the core has not reported it yet:
+  // clients such as Playwright pair the two before they run a route handler,
+  // and the core reports a navigation's Network events (the document and the
+  // stylesheets and scripts it loads) only once the navigation commits, which
+  // waits for the route. The core's own requestWillBeSent for such a request
+  // is then not repeated.
+  forwardPortableEvent(connection, event, sessionId) {
+    const params = event.params ?? {};
+    if (event.method === "Network.requestWillBeSent" && typeof params.requestId === "string") {
+      const key = `${connection.id}:${params.requestId}`;
+      if (!params.redirectResponse && this.announcedRequests.get(key) === "synthetic") {
+        this.announcedRequests.set(key, "seen");
+        return;
+      }
+      this.#rememberRequest(key, "seen");
+    } else if (event.method === "Fetch.requestPaused" && typeof params.networkId === "string" &&
+        params.request && typeof params.request.url === "string") {
+      const key = `${connection.id}:${params.networkId}`;
+      const document = params.resourceType === "Document";
+      // A subresource is announced early only after its document was: the
+      // document's requestWillBeSent must come first, and an unpaused
+      // document is reported by the core in order.
+      if (!this.announcedRequests.has(key) && (document || this.pendingDocumentRequest?.connectionId === connection.id)) {
+        this.#rememberRequest(key, "synthetic");
+        if (document) this.pendingDocumentRequest = { id: params.networkId, url: params.request.url, connectionId: connection.id };
+        const now = Date.now() / 1000;
+        connection.event("Network.requestWillBeSent", {
+          requestId: params.networkId,
+          loaderId: document ? params.networkId : (this.pendingDocumentRequest?.id ?? this.loaderId),
+          documentURL: document ? params.request.url : (this.pendingDocumentRequest?.url ?? this.url),
+          request: { url: params.request.url, method: params.request.method ?? "GET", headers: params.request.headers ?? {} },
+          timestamp: now,
+          wallTime: now,
+          initiator: { type: document ? "other" : "parser" },
+          type: typeof params.resourceType === "string" ? params.resourceType : "Other",
+          frameId: params.frameId ?? this.frameId,
+        }, sessionId);
+      }
+    }
+    connection.event(event.method, params, sessionId);
+  }
+
+  #rememberRequest(key, state) {
+    if (this.announcedRequests.size >= 1024) this.announcedRequests.delete(this.announcedRequests.keys().next().value);
+    this.announcedRequests.set(key, state);
+  }
+
+  // Sends the init scripts to the current Worker (a recycled or restarted
+  // page gets a fresh one, which starts without them).
+  async syncInitScripts() {
+    if (!this.worker || typeof this.worker.setInitScripts !== "function") return;
+    if (this.initScripts.size === 0 && !this.initScriptsSent) return;
+    await this.worker.setInitScripts([...this.initScripts.values()], { requestTimeoutMs: this.server.requestTimeoutMs });
+    this.initScriptsSent = this.initScripts.size > 0;
   }
 
   async start() {
@@ -377,6 +516,7 @@ class PageTarget {
       await this.startPromise;
       return;
     }
+    if (this.worker?.closed === true) this.discardEndedWorker();
     if (this.worker) return;
     if (this.closed) throw cdpError(-32000, `Target ${this.id} is closed`);
     if (!this.startPromise) {
@@ -402,6 +542,8 @@ class PageTarget {
               });
             }
           }
+          this.initScriptsSent = false;
+          await this.syncInitScripts();
           // Fetch interception may pause a parser/resource request while the
           // navigation host action is awaiting network I/O. Poll portable CDP
           // events during that await so the client can continue/fulfill/fail it.
@@ -419,6 +561,53 @@ class PageTarget {
       }).catch(() => undefined);
     }
     await this.startPromise;
+    // Seeding restarts this target through start(); it runs after the start
+    // promise has settled so it cannot wait on itself.
+    if (this.reseedFromContext) {
+      this.reseedFromContext = false;
+      await this.server.seedTargetFromContext(this);
+    }
+  }
+
+  // WebAssembly memory never shrinks: after a large document, a page Worker
+  // keeps that memory for its whole life. Before the next document replaces
+  // the current one, a page above the threshold moves to a fresh Worker so the
+  // memory returns to the system; its cookies and context options move along.
+  async releaseEngineMemoryIfHigh() {
+    const threshold = this.server.engineMemoryRecycleBytes;
+    const worker = this.worker;
+    if (!threshold || !worker || typeof worker.memorySnapshot !== "function") return;
+    let bytes = 0;
+    try {
+      bytes = Number((await worker.memorySnapshot())?.wasmLinearBytes) || 0;
+    } catch {
+      return;
+    }
+    if (bytes < threshold) return;
+    let snapshot = null;
+    try { snapshot = await this.server.exportTargetState(this); } catch {}
+    this.discardEndedWorker();
+    this.reseedFromContext = false;
+    await worker.close().catch(() => undefined);
+    await this.start();
+    if (snapshot) {
+      try { await this.server.restoreTargetState(this, snapshot); } catch {}
+    }
+  }
+
+  // A Worker ends when an operation passes its deadline (synchronous V8 work
+  // cannot be interrupted any other way) or its heap cap. Without this the
+  // page kept the ended Worker and every later call failed. It starts over at
+  // about:blank on a fresh Worker, with the context's cookies copied in as for
+  // a new page.
+  discardEndedWorker() {
+    this.worker = null;
+    this.portableCdpConnections.clear();
+    this.portableCdpRawMode = null;
+    this.url = "about:blank";
+    this.title = "";
+    this.loaderId = `${this.id}-loader-${Date.now()}`;
+    this.reseedFromContext = true;
   }
 
   async close() {
@@ -429,9 +618,16 @@ class PageTarget {
       clearTimeout(this.networkFlushTimer);
       this.networkFlushTimer = null;
     }
-    for (const session of this.sessions) session.target = null;
+    // `sessions` holds the connections attached to this target; drop their
+    // session ids for it so no later command is routed to a closed target.
+    // (#closeTarget detaches and notifies first; this covers every other
+    // close path.)
+    for (const connection of this.sessions) {
+      for (const [sessionId, sessionTarget] of connection.sessions) {
+        if (sessionTarget === this) connection.sessions.delete(sessionId);
+      }
+    }
     this.sessions.clear();
-    this.remoteObjects.clear();
     for (const record of this.portableCdpConnections.values()) {
       try {
         if (record.raw) await this.worker?.portableCdpRawClose(record.connectionId);
@@ -450,13 +646,35 @@ class PageTarget {
     if (this.networkFlushTimer) clearTimeout(this.networkFlushTimer);
     this.networkFlushTimer = setTimeout(async () => {
       this.networkFlushTimer = null;
-      const active = await this.flushPortableNetworkEvents({ allowWhilePaused: true }).catch(() => false);
+      let active = await this.flushPortableNetworkEvents({ allowWhilePaused: true }).catch(() => false);
+      if (await this.collectBackgroundActivity()) active = true;
       this.networkFlushDelay = active || this.networkFlushPaused
         ? NETWORK_FLUSH_MIN_MS
         : Math.min(this.networkFlushDelay * 2, NETWORK_FLUSH_MAX_MS);
       this.scheduleNetworkFlush();
     }, delay);
     this.networkFlushTimer.unref?.();
+  }
+
+  // Page output between commands (timers, async code) reaches clients
+  // without waiting for their next command. At most every
+  // ACTIVITY_POLL_MS, and only while a client is attached to a page whose
+  // runtime helper is installed.
+  async collectBackgroundActivity() {
+    if (this.closed || this.sessions.size === 0 || !this.worker || !this.pageRuntime?.installed) return false;
+    if (this.activityPolling || Date.now() - (this.lastActivityPoll ?? 0) < ACTIVITY_POLL_MS) return false;
+    this.activityPolling = true;
+    this.lastActivityPoll = Date.now();
+    try {
+      await this.pageRuntime.collectActivity({ timeoutMs: 1_000 });
+      const before = this.activityEmitted ?? 0;
+      this.emitPageActivity();
+      return (this.activityEmitted ?? 0) > before;
+    } catch {
+      return false;
+    } finally {
+      this.activityPolling = false;
+    }
   }
 
   wakeNetworkFlush() {
@@ -508,7 +726,7 @@ class PageTarget {
           const sessionId = core.externalSessionId ?? core.sessionId;
           if (typeof event.sessionId === "string") event.sessionId = sessionId;
           rewritePortableTargetIds(event, "page-1", this.frameId);
-          connection.event(event.method, event.params ?? {}, sessionId);
+          this.forwardPortableEvent(connection, event, sessionId);
           active = true;
         }
       }
@@ -517,23 +735,6 @@ class PageTarget {
       this.networkFlushPromise = null;
     });
     return this.networkFlushPromise;
-  }
-
-  storeRemote(value) {
-    if (this.remoteObjects.size >= MAX_REMOTE_OBJECTS) {
-      const oldest = this.remoteObjects.keys().next().value;
-      this.remoteObjects.delete(oldest);
-    }
-    const id = `${this.id}:object-${this.nextRemoteId++}`;
-    this.remoteObjects.set(id, value);
-    return id;
-  }
-
-  getRemote(id) {
-    if (typeof id !== "string" || !this.remoteObjects.has(id)) {
-      throw cdpError(-32000, "Could not find object with given id");
-    }
-    return this.remoteObjects.get(id);
   }
 
   async evaluate(expression, options = {}) {
@@ -546,6 +747,7 @@ class PageTarget {
 
   async navigate(url, params = {}) {
     await this.start();
+    await this.releaseEngineMemoryIfHigh();
     const holdNetworkFlush = params.holdNetworkFlush === true;
     this.networkFlushPaused = true;
     let result;
@@ -578,7 +780,6 @@ class PageTarget {
     } catch {
       this.title = "";
     }
-    this.remoteObjects.clear();
     return result;
   }
 
@@ -871,14 +1072,17 @@ class PageTarget {
     return { record, response, events };
   }
 
-  async portableCdpComplete(record, actionId, result) {
+  // `generation` is the generation of this action. Actions of one connection
+  // can overlap (an evaluation still settling when a navigation starts), so
+  // the generation recorded last on the connection may belong to another one.
+  async portableCdpComplete(record, actionId, result, generation = record?.actionGeneration) {
     if (!record) return null;
     if (record.raw) {
       if (typeof this.worker.portableCdpRawComplete !== "function") return null;
-      if (!Number.isSafeInteger(record.actionGeneration)) return null;
+      if (!Number.isSafeInteger(generation)) return null;
       return this.worker.portableCdpRawComplete(
         actionId,
-        record.actionGeneration,
+        generation,
         JSON.stringify(result),
         { requestTimeoutMs: this.server.requestTimeoutMs },
       );
@@ -921,6 +1125,10 @@ class PageTarget {
 }
 
 class CdpConnection {
+  // Per page session: settles when the previous command allows the next one
+  // to start (see commandOrdering).
+  #sessionQueues = new Map();
+
   constructor(server, peer, initialTarget = null) {
     this.server = server;
     this.peer = peer;
@@ -952,10 +1160,35 @@ class CdpConnection {
 
   send(message) {
     if (this.closed) return;
-    const text = jsonBytes(message);
+    let text;
     try {
+      text = JSON.stringify(message);
+    } catch {
+      text = undefined;
+    }
+    try {
+      if (typeof text !== "string") throw cdpError(-32603, "CDP message is not JSON serializable");
       this.peer.sendText(text);
     } catch (error) {
+      // A response that cannot be sent becomes an error for that request; an
+      // event is dropped. Either way the session stays usable.
+      const replyable = Number.isSafeInteger(message?.id) && message.error === undefined;
+      if (error instanceof RangeError || error?.code === -32603) {
+        this.server.emit("error", error);
+        if (replyable) {
+          this.send({
+            id: message.id,
+            error: {
+              code: -32000,
+              message: error instanceof RangeError
+                ? `CDP response exceeds the ${MAX_WS_OUTBOUND_MESSAGE_BYTES}-byte message limit`
+                : error.message,
+            },
+            ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          });
+        }
+        return;
+      }
       this.server.emit("error", error);
       void this.close();
     }
@@ -970,14 +1203,42 @@ class CdpConnection {
     try {
       command = parseJsonMessage(text);
     } catch (error) {
-      this.send({ id: 0, error: { code: error.code ?? -32600, message: error.message } });
+      const id = Number.isSafeInteger(error.commandId) ? error.commandId : 0;
+      this.send({
+        id,
+        error: { code: error.code ?? -32600, message: error.message },
+        ...(error.sessionId ? { sessionId: error.sessionId } : {}),
+      });
       return;
     }
+    const sessionId = command.sessionId;
+    const ordering = commandOrdering(command.method);
+    if (typeof sessionId !== "string" || sessionId === this.browserSession || ordering === "unordered" ||
+        !this.sessions.has(sessionId)) {
+      await this.#run(command);
+      return;
+    }
+    const previous = this.#sessionQueues.get(sessionId) ?? Promise.resolve();
+    const start = () => {
+      const done = this.#run(command);
+      return ordering === "complete" ? done : undefined;
+    };
+    // A failed predecessor must not stop the commands queued after it.
+    const tail = previous.then(start, start).catch(() => undefined);
+    this.#sessionQueues.set(sessionId, tail);
+    await tail;
+    if (this.#sessionQueues.get(sessionId) === tail) this.#sessionQueues.delete(sessionId);
+  }
+
+  // Never rejects: every failure becomes the command's error response.
+  async #run(command) {
     try {
       const result = await this.server.dispatch(this, command);
+      this.#emitPageActivity(command.sessionId);
       if (result === undefined) return;
       this.send({ id: command.id, result, ...(command.sessionId ? { sessionId: command.sessionId } : {}) });
     } catch (error) {
+      this.#emitPageActivity(command.sessionId);
       this.send({
         id: command.id,
         ...(command.sessionId ? { sessionId: command.sessionId } : {}),
@@ -988,6 +1249,20 @@ class CdpConnection {
         },
       });
     }
+  }
+
+  // Console calls and document.close() the page runtime collected while the
+  // command ran, sent to every session attached to the page before the
+  // command's response.
+  #emitPageActivity(sessionId) {
+    try {
+      this.#emitPageActivityUnchecked(sessionId);
+    } catch {}
+  }
+
+  #emitPageActivityUnchecked(sessionId) {
+    const target = typeof sessionId === "string" ? this.sessions.get(sessionId) : undefined;
+    target?.emitPageActivity?.();
   }
 
   async close() {
@@ -1041,6 +1316,11 @@ export class DomjetCdpServer {
     allowPrivateNetwork = false,
     prewarmPages = 0,
     allowedOrigins = [] as readonly string[],
+    allowRemote = false,
+    allowedHosts = undefined,
+    maxTargets = undefined as number | undefined,
+    minFreeMemoryMb = 256,
+    engineMemoryRecycleMb = 256,
   } = {}) {
     if (!Array.isArray(allowedOrigins) || allowedOrigins.some((origin) => typeof origin !== "string" || origin.length === 0)) {
       throw new TypeError("allowedOrigins must be an array of origin strings");
@@ -1065,6 +1345,27 @@ export class DomjetCdpServer {
       ...(this.bootstrapPath ? { bootstrapPath: this.bootstrapPath } : {}),
     };
     this.workerFactory = workerFactory;
+    // Listening on anything but loopback exposes an unauthenticated endpoint
+    // that controls the browser; it needs an explicit opt-in.
+    this.allowRemote = allowRemote === true;
+    this.allowedHosts = normalizeAllowedHosts(allowedHosts);
+    // /json/* discovery answers with the WebSocket URL; listeners started for
+    // an embedded client turn it off so other local processes cannot read it.
+    this.discovery = true;
+    if (maxTargets === undefined) {
+      this.maxTargets = defaultMaxTargets(this.workerOptions.resourceLimits.maxOldGenerationSizeMb);
+    } else if (maxTargets === Infinity || (Number.isSafeInteger(maxTargets) && maxTargets >= 1)) {
+      this.maxTargets = maxTargets;
+    } else {
+      throw new RangeError("maxTargets must be a positive integer or Infinity");
+    }
+    for (const [name, value] of [["minFreeMemoryMb", minFreeMemoryMb], ["engineMemoryRecycleMb", engineMemoryRecycleMb]]) {
+      if (!Number.isFinite(value) || value < 0) throw new RangeError(`${name} must be a non-negative number of MiB (0 disables)`);
+    }
+    // New pages are refused while less memory than this is free, rather than
+    // pushing the machine into swap or the OOM killer.
+    this.minFreeMemoryBytes = minFreeMemoryMb * 1024 * 1024;
+    this.engineMemoryRecycleBytes = engineMemoryRecycleMb * 1024 * 1024;
     this.readyTimeoutMs = readyTimeoutMs;
     this.requestTimeoutMs = requestTimeoutMs;
     this.evaluateTimeoutMs = evaluateTimeoutMs;
@@ -1074,6 +1375,14 @@ export class DomjetCdpServer {
     this.connections = new Set();
     this.targets = new Map();
     this.contexts = new Set(["default"]);
+    // Ids are never reused: a disposed id handed out again would merge two
+    // clients' contexts (cookies, storage, and page lifetime).
+    this.contextSerial = 0;
+    this.closing = false;
+    // Durable state (cookies, context options) of a context whose last page
+    // closed. It lives in page Workers; without this copy, closing the last
+    // page dropped it and the next profile backup saved an empty profile.
+    this.contextSnapshots = new Map();
     this.connectionCounter = 0;
     this.targetCounter = 0;
     this.sessionCounter = 0;
@@ -1165,7 +1474,12 @@ export class DomjetCdpServer {
 
   claimInitialTarget(contextId = "default") {
     if ([...this.connections].some((connection) => connection.discoverTargets || connection.autoAttach)) return null;
+    // Only the server's initial page is claimable. Any other about:blank
+    // target belongs to whoever created it: a target that another newPage()
+    // call is still starting looks unclaimed, and claiming it made two Page
+    // objects drive one page (each saw the other's document).
     const target = [...this.targets.values()].find((candidate) =>
+      candidate.initial === true &&
       candidate.contextId === contextId &&
       candidate.url === "about:blank" &&
       !candidate.closed &&
@@ -1206,7 +1520,8 @@ export class DomjetCdpServer {
   async evaluateTarget(targetId, expression) {
     const target = this.targets.get(targetId);
     if (!target || target.closed) throw cdpError(-32000, `Target ${targetId} was not found`);
-    return target.evaluate(expression);
+    await target.start();
+    return target.pageRuntime.evaluateValue(expression);
   }
 
   setTargetViewport(targetId, { width, height, deviceScaleFactor = 1 } = {}) {
@@ -1236,10 +1551,34 @@ export class DomjetCdpServer {
   }
 
   async createTarget(url = "about:blank", contextId = "default") {
+    if (this.closing) throw cdpError(-32000, "Browser is closing");
+    if (this.targets.size >= this.maxTargets) {
+      throw cdpError(-32000, `Domjet allows at most ${this.maxTargets} open pages (maxTargets); close a page or raise maxTargets`);
+    }
+    if (this.minFreeMemoryBytes > 0 && typeof process.availableMemory === "function") {
+      const available = Number(process.availableMemory());
+      if (available > 0 && available < this.minFreeMemoryBytes) {
+        const mib = (bytes) => Math.round(bytes / 1048576);
+        throw cdpError(-32000, `Not enough free memory to open another page (${mib(available)} MiB free, ${mib(this.minFreeMemoryBytes)} MiB required by minFreeMemoryMb); close pages or lower minFreeMemoryMb`);
+      }
+    }
     if (!this.contexts.has(contextId)) throw cdpError(-32000, `Browser context ${contextId} was not found`);
     const source = [...this.targets.values()].filter((candidate) => candidate.contextId === contextId).at(-1);
     const target = new PageTarget(this, this.allocateTargetId(), contextId);
     this.targets.set(target.id, target);
+    try {
+      await this.#prepareTarget(target, source, contextId, url);
+    } catch (error) {
+      // A page that failed to start or to load its first URL must not keep
+      // its slot (and Worker): a few failures would exhaust maxTargets.
+      this.targets.delete(target.id);
+      await target.close().catch(() => undefined);
+      throw error;
+    }
+    return target;
+  }
+
+  async #prepareTarget(target, source, contextId, url) {
     await target.start();
     // Until the portable core owns multiple pages in one Worker, seed a new
     // page Worker from the latest profile snapshot in its Chrome-style
@@ -1251,15 +1590,45 @@ export class DomjetCdpServer {
         const snapshot = await this.#exportTargetSnapshot(source);
         await this.#restoreTargetSnapshot(target, snapshot);
       } catch {}
+    } else if (!source && this.contextSnapshots.has(contextId) &&
+        typeof target.worker?.portableCdpRawContextRestore === "function") {
+      try {
+        await this.#restoreTargetSnapshot(target, this.contextSnapshots.get(contextId));
+      } catch {}
     }
     if (url && url !== "about:blank") await target.navigate(url, { allowPrivateNetwork: this.allowPrivateNetwork });
-    return target;
   }
 
   async #exportTargetSnapshot(target) {
     await target.start();
     await target.portableCdpRawCommand(0, { id: 0, method: "Browser.getVersion", params: {} });
     return target.worker.portableCdpRawContextExport(1, { requestTimeoutMs: this.requestTimeoutMs });
+  }
+
+  exportTargetState(target) {
+    return this.#exportTargetSnapshot(target);
+  }
+
+  restoreTargetState(target, snapshot) {
+    return this.#restoreTargetSnapshot(target, snapshot);
+  }
+
+  // Copies the context's durable state into a target that restarted: from the
+  // most recent live page of the context, else from the copy kept when its
+  // last page closed.
+  async seedTargetFromContext(target) {
+    if (typeof target.worker?.portableCdpRawContextRestore !== "function") return;
+    const source = [...this.targets.values()]
+      .filter((candidate) => candidate !== target && candidate.contextId === target.contextId &&
+        candidate.worker && candidate.worker.closed !== true)
+      .at(-1);
+    try {
+      if (source && typeof source.worker.portableCdpRawContextExport === "function") {
+        await this.#restoreTargetSnapshot(target, await this.#exportTargetSnapshot(source));
+      } else if (this.contextSnapshots.has(target.contextId)) {
+        await this.#restoreTargetSnapshot(target, this.contextSnapshots.get(target.contextId));
+      }
+    } catch {}
   }
 
   async #restoreTargetSnapshot(target, snapshot) {
@@ -1274,6 +1643,8 @@ export class DomjetCdpServer {
     }
     if (!this.runtimeStarted) {
       const target = new PageTarget(this, this.allocateTargetId());
+      // Only this target may be claimed by the embedded API (see claimInitialTarget).
+      target.initial = true;
       this.targets.set(target.id, target);
       this.runtimeStarted = true;
     }
@@ -1281,11 +1652,19 @@ export class DomjetCdpServer {
     return this.listen();
   }
 
-  async listen({ host = this.host, port = this.port } = {}) {
+  async listen({ host = this.host, port = this.port, allowRemote = this.allowRemote, discovery = true, allowedHosts } = {}) {
+    if (allowedHosts !== undefined) this.allowedHosts = normalizeAllowedHosts(allowedHosts);
     if (!this.runtimeStarted) await this.start({ listen: false });
     if (this.server) return this;
+    if (!isLoopbackHost(host) && allowRemote !== true) {
+      throw new Error(
+        `Refusing to listen on ${host}: the CDP endpoint has no authentication and controls the browser. ` +
+        "Pass allowRemote: true to expose it beyond this machine.",
+      );
+    }
     this.host = host;
     this.port = port;
+    this.discovery = discovery !== false;
     this.server = createServer((request, response) => this.#http(request, response));
     this.server.on("upgrade", (request, socket, head) => this.#upgrade(request, socket, head));
     await new Promise((resolvePromise, reject) => {
@@ -1312,6 +1691,9 @@ export class DomjetCdpServer {
     if (!this.contexts.has(contextId)) throw cdpError(-32000, `Browser context ${contextId} was not found`);
     const targets = [...this.targets.values()].filter((candidate) => candidate.contextId === contextId);
     let target = targets.at(-1);
+    // No page open: the state kept when the last one closed is current, and no
+    // Worker has to start just to export it.
+    if (!target && this.contextSnapshots.has(contextId)) return new Uint8Array(this.contextSnapshots.get(contextId));
     if (!target) target = await this.createTarget("about:blank", contextId);
     await target.start();
     if (typeof target.worker?.portableCdpRawContextExport !== "function") {
@@ -1370,19 +1752,31 @@ export class DomjetCdpServer {
   }
 
   async close() {
-    await this.closeSpareWorkers();
-    if (!this.server && this.targets.size === 0) return;
-    for (const connection of [...this.connections]) await connection.close();
-    for (const target of [...this.targets.values()]) await target.close();
-    this.targets.clear();
-    this.streams.clear();
-    this.runtimeStarted = false;
-    if (this.server) {
+    // Refuse new HTTP requests, upgrades and targets while shutting down, so a
+    // client that connects during close() cannot leave a live Worker behind.
+    this.closing = true;
+    try {
+      await this.closeSpareWorkers();
+      if (!this.server && this.targets.size === 0) return;
       const server = this.server;
-      this.server = null;
-      await new Promise((resolvePromise) => server.close(() => resolvePromise()));
+      // Stop accepting connections first; the callback runs once the live ones end.
+      const serverClosed = server ? new Promise((resolvePromise) => server.close(() => resolvePromise())) : null;
+      while (this.connections.size > 0 || this.targets.size > 0) {
+        for (const connection of [...this.connections]) await connection.close();
+        for (const target of [...this.targets.values()]) await target.close();
+        this.targets.clear();
+      }
+      this.streams.clear();
+      this.runtimeStarted = false;
+      if (server) {
+        this.server = null;
+        server.closeIdleConnections?.();
+        await serverClosed;
+      }
+      this.addressInfo = null;
+    } finally {
+      this.closing = false;
     }
-    this.addressInfo = null;
   }
 
   #json(response, status, value) {
@@ -1397,7 +1791,12 @@ export class DomjetCdpServer {
   }
 
   #http(request, response) {
-    if (!hostHeaderAllowed(request.headers.host, this.host) || !originAllowed(request.headers.origin, this.allowedOrigins)) {
+    if (this.closing) {
+      response.writeHead(503, { connection: "close" });
+      response.end();
+      return;
+    }
+    if (!hostHeaderAllowed(request.headers.host, this.host, this.allowedHosts) || !originAllowed(request.headers.origin, this.allowedOrigins)) {
       response.writeHead(403, { connection: "close" });
       response.end();
       return;
@@ -1414,6 +1813,11 @@ export class DomjetCdpServer {
       return;
     }
     const pathname = url.pathname.length > 1 ? url.pathname.replace(/\/+$/u, "") : url.pathname;
+    if (!this.discovery) {
+      response.writeHead(404, { connection: "close" });
+      response.end();
+      return;
+    }
     if (pathname === "/json/version") {
       this.#json(response, 200, {
         Browser: "Domjet",
@@ -1451,12 +1855,16 @@ export class DomjetCdpServer {
         socket.destroy();
       }
     };
+    if (this.closing) {
+      fail("503 Service Unavailable", "browser closing");
+      return;
+    }
     if (request.method !== "GET" || String(request.headers.upgrade).toLowerCase() !== "websocket" ||
         !String(request.headers.connection).toLowerCase().split(",").map((value) => value.trim()).includes("upgrade")) {
       fail("400 Bad Request", "invalid websocket upgrade");
       return;
     }
-    if (!hostHeaderAllowed(request.headers.host, this.host)) {
+    if (!hostHeaderAllowed(request.headers.host, this.host, this.allowedHosts)) {
       fail("403 Forbidden", "host not allowed");
       return;
     }
@@ -1528,9 +1936,14 @@ export class DomjetCdpServer {
     if (!PORTABLE_PAGE_METHODS.has(method)) {
       return undefined;
     }
+    // Remote objects belong to the page runtime, not the portable DOM state.
+    if (method === "DOM.describeNode" && typeof command.params?.objectId === "string") return undefined;
     if (method === "Page.captureScreenshot") {
       await target.prepareRenderResources({ requestTimeoutMs: this.requestTimeoutMs });
     }
+    // Each navigation's document decides afresh whether its subresources are
+    // announced ahead of the core (see forwardPortableEvent).
+    if (method === "Page.navigate" || method === "Page.reload") target.pendingDocumentRequest = null;
     const replaceInitialHistory = method === "Page.navigate" && target.url === "about:blank";
     const routed = await target.portableCdpCommand(connection.id, command);
     if (!routed) return undefined;
@@ -1547,7 +1960,7 @@ export class DomjetCdpServer {
       response.result.cookies = response.result.cookies.map(cdpCookie);
     }
     for (const event of routed.events ?? []) {
-      if (typeof event?.method === "string") connection.event(event.method, event.params ?? {}, command.sessionId);
+      if (typeof event?.method === "string") target.forwardPortableEvent(connection, event, command.sessionId);
     }
     if (response?.error) {
       if (deferNetworkFlush) target.networkFlushPaused = false;
@@ -1575,7 +1988,7 @@ export class DomjetCdpServer {
     if (routed.record.raw && Number.isSafeInteger(action.generation)) {
       routed.record.actionGeneration = action.generation;
     }
-    const hostParams = { ...(command.params ?? {}) };
+    const hostParams = { ...(command.params ?? {}), _obscuraDeferAnnouncement: true };
     if (action.payload?.extraHTTPHeaders && typeof action.payload.extraHTTPHeaders === "object") {
       hostParams._obscuraExtraHTTPHeaders = action.payload.extraHTTPHeaders;
     }
@@ -1583,6 +1996,7 @@ export class DomjetCdpServer {
     try {
       hostResult = await this.#dispatchPage(connection, command.sessionId, target, method, hostParams);
     } catch (error) {
+      this.#announcePendingDocument(target);
       hostResult = { error: { code: Number.isInteger(error?.code) ? error.code : -32603, message: error?.message ?? "Portable host action failed" } };
     }
     if (!deferNetworkFlush) await target.flushPortableNetworkEvents();
@@ -1614,14 +2028,18 @@ export class DomjetCdpServer {
     }
     let completed;
     try {
-      completed = await target.portableCdpComplete(routed.record, action.actionId, completion);
+      completed = await target.portableCdpComplete(routed.record, action.actionId, completion,
+        Number.isSafeInteger(action.generation) ? action.generation : routed.record.actionGeneration);
+    } catch (error) {
+      this.#announcePendingDocument(target);
+      throw error;
     } finally {
       if (deferNetworkFlush) target.networkFlushPaused = false;
     }
     if (completed?.error) {
+      this.#announcePendingDocument(target);
       throw cdpError(completed.error.code ?? -32603, completed.error.message ?? "Portable CDP action failed", completed.error.data);
     }
-    await target.flushPortableNetworkEvents();
     // Completion may enqueue WASM-owned Network events (and response-body
     // state). Drain them before returning the command so ordering is
     // deterministic for CDP clients which await Page.navigate.
@@ -1641,9 +2059,13 @@ export class DomjetCdpServer {
         if (typeof event?.method !== "string") continue;
         if (typeof event.sessionId === "string") event.sessionId = command.sessionId;
         rewritePortableTargetIds(event, "page-1", target.frameId);
-        connection.event(event.method, event.params ?? {}, command.sessionId);
+        target.forwardPortableEvent(connection, event, command.sessionId);
       }
     } catch {}
+    // Chrome reports the document request before the commit, and parser
+    // subresources after it. Announce the committed document between the two.
+    this.#announcePendingDocument(target);
+    await target.flushPortableNetworkEvents();
     if (replaceInitialHistory && !completed?.error) {
       try {
         await target.portableCdpCommand(connection.id, {
@@ -1670,13 +2092,14 @@ export class DomjetCdpServer {
       case "Target.getBrowserContexts":
         return { browserContextIds: [...this.contexts].filter((id) => id !== "default") };
       case "Target.createBrowserContext": {
-        const id = `context-${this.contexts.size}`;
+        const id = `context-${++this.contextSerial}`;
         this.contexts.add(id);
         return { browserContextId: id };
       }
       case "Target.disposeBrowserContext": {
         const id = params.browserContextId;
         if (id === "default" || !this.contexts.delete(id)) throw cdpError(-32000, "Browser context cannot be disposed");
+        this.contextSnapshots.delete(id);
         for (const target of [...this.targets.values()]) if (target.contextId === id) await this.#closeTarget(target);
         return {};
       }
@@ -1759,14 +2182,46 @@ export class DomjetCdpServer {
         return {};
       case "Storage.getCookies": {
         const contextId = params.browserContextId || "default";
-        const target = [...this.targets.values()].find((candidate) => candidate.contextId === contextId);
-        if (!target) return { cookies: [] };
-        const portable = await this.#portablePageDispatch(connection, command, target, method);
-        if (portable !== undefined) return portable;
-        return { cookies: (await target.cookies("getAll")).map(cdpCookie) };
+        if (!this.contexts.has(contextId)) throw cdpError(-32000, `Browser context ${contextId} was not found`);
+        const inContext = [...this.targets.values()].filter((candidate) => candidate.contextId === contextId && !candidate.closed);
+        const urlFilter = (cookies) => (Array.isArray(params.urls) && params.urls.length > 0
+          ? cookies.filter((cookie) => params.urls.some((href) => cookieMatchesUrl(cookie, href)))
+          : cookies);
+        // No page running: report the state the context kept when its last
+        // page closed (what its next page starts with), without starting a
+        // Worker. The snapshot is versioned JSON.
+        if (!inContext.some((candidate) => candidate.worker && candidate.worker.closed !== true) && this.contextSnapshots.has(contextId)) {
+          try {
+            const snapshot = JSON.parse(new TextDecoder().decode(this.contextSnapshots.get(contextId)));
+            if (snapshot?.schemaVersion === 1 && Array.isArray(snapshot.cookies)) {
+              const now = Date.now() / 1000;
+              return { cookies: urlFilter(snapshot.cookies.filter((cookie) => !(Number.isFinite(cookie?.expires) && cookie.expires > 0 && cookie.expires < now)).map(cdpCookie)) };
+            }
+          } catch {}
+        }
+        if (inContext.length === 0) return { cookies: [] };
+        // Each page Worker keeps its own cookie jar until the portable core
+        // shares one per context, so the first page alone (often the unused
+        // initial one) missed cookies a navigated page received. Merge the
+        // started pages, later ones winning; idle pages are not started.
+        const started = inContext.filter((candidate) => candidate.worker && candidate.worker.closed !== true);
+        const merged = new Map();
+        for (const target of started.length > 0 ? started : inContext.slice(0, 1)) {
+          // Set-Cookie and document.cookie write the document core's jar;
+          // the portable CDP core answers from its own. Cookies set over CDP
+          // reach both, so the document jar wins.
+          const portable = await this.#portablePageDispatch(connection, command, target, method);
+          const fromCore = Array.isArray(portable?.cookies) ? portable.cookies : [];
+          const fromDocument = (await target.cookies("getAll")).map(cdpCookie);
+          for (const cookie of [...fromCore, ...fromDocument]) {
+            merged.set(`${cookie.name}\u0000${cookie.domain}\u0000${cookie.path}`, cookie);
+          }
+        }
+        return { cookies: urlFilter([...merged.values()]) };
       }
       case "Storage.setCookies": {
         const contextId = params.browserContextId || "default";
+        if (!this.contexts.has(contextId)) throw cdpError(-32000, `Browser context ${contextId} was not found`);
         const targets = [...this.targets.values()].filter((candidate) => candidate.contextId === contextId);
         const cookies = Array.isArray(params.cookies) ? params.cookies : [];
         for (const target of targets) {
@@ -1779,6 +2234,7 @@ export class DomjetCdpServer {
       }
       case "Storage.clearDataForOrigin": {
         const contextId = params.browserContextId || "default";
+        if (!this.contexts.has(contextId)) throw cdpError(-32000, `Browser context ${contextId} was not found`);
         for (const target of this.targets.values()) {
           if (target.contextId !== contextId) continue;
           const portable = await this.#portablePageDispatch(connection, command, target, method);
@@ -1792,6 +2248,15 @@ export class DomjetCdpServer {
   }
 
   async #closeTarget(target) {
+    if (!this.targets.has(target.id)) return;
+    const lastInContext = ![...this.targets.values()].some((other) => other !== target && other.contextId === target.contextId);
+    if (lastInContext && !this.closing && this.contexts.has(target.contextId) &&
+        typeof target.worker?.portableCdpRawContextExport === "function") {
+      try {
+        const snapshot = await this.#exportTargetSnapshot(target);
+        this.contextSnapshots.set(target.contextId, snapshot instanceof Uint8Array ? snapshot : new Uint8Array(snapshot));
+      } catch {}
+    }
     if (!this.targets.delete(target.id)) return;
     for (const connection of this.connections) {
       for (const [sessionId, sessionTarget] of connection.sessions) {
@@ -1803,6 +2268,50 @@ export class DomjetCdpServer {
       if (connection.discoverTargets) connection.event("Target.targetDestroyed", { targetId: target.id });
     }
     await target.close();
+  }
+
+  // A committed navigation replaces the document and with it every execution
+  // context. Clients drop their contexts (and the remote objects in them) on
+  // executionContextsCleared and wait for the new default world, and for the
+  // isolated world under the name they registered (Playwright's utility
+  // world, Puppeteer's), before evaluating in the new document.
+  #announceOrDefer(connection, sessionId, target, params) {
+    if (params._obscuraDeferAnnouncement === true) target.pendingAnnouncement = { connection, sessionId };
+    else this.#announceCommittedDocument(connection, sessionId, target);
+  }
+
+  #announcePendingDocument(target) {
+    const pending = target.pendingAnnouncement;
+    if (!pending) return;
+    target.pendingAnnouncement = null;
+    this.#announceCommittedDocument(pending.connection, pending.sessionId, target);
+  }
+
+  #announceCommittedDocument(connection, sessionId, target) {
+    // Every session attached to the page sees the new document, not only the
+    // one that navigated.
+    const sessions = [];
+    for (const attached of target.sessions) {
+      for (const [id, sessionTarget] of attached.sessions) if (sessionTarget === target) sessions.push([attached, id]);
+    }
+    if (!sessions.some(([attached, id]) => attached === connection && id === sessionId)) sessions.push([connection, sessionId]);
+    const timestamp = Date.now() / 1000;
+    for (const [attached, id] of sessions) {
+      attached.event("Page.frameNavigated", { frame: frameTree(target).frameTree.frame }, id);
+      attached.event("Runtime.executionContextsCleared", {}, id);
+      attached.event("Runtime.executionContextCreated", {
+        context: { id: 1, origin: target.url, name: "", uniqueId: `${target.id}:default:${target.loaderId}`, auxData: { isDefault: true, type: "default", frameId: target.frameId } },
+      }, id);
+      const worldName = target.isolatedWorldNames?.get(isolatedWorldKey(attached, id));
+      if (typeof worldName === "string") {
+        attached.event("Runtime.executionContextCreated", {
+          context: { id: 2, origin: target.url, name: worldName, uniqueId: `${target.id}:utility:${target.loaderId}`, auxData: { isDefault: false, type: "isolated", frameId: target.frameId } },
+        }, id);
+      }
+      attached.event("Page.lifecycleEvent", { frameId: target.frameId, loaderId: target.loaderId, name: "DOMContentLoaded", timestamp }, id);
+      attached.event("Page.lifecycleEvent", { frameId: target.frameId, loaderId: target.loaderId, name: "load", timestamp }, id);
+      attached.event("Page.frameStoppedLoading", { frameId: target.frameId }, id);
+    }
   }
 
   async #dispatchPage(connection, sessionId, target, method, params) {
@@ -1831,8 +2340,6 @@ export class DomjetCdpServer {
       case "Page.bringToFront":
       case "Page.stopLoading":
       case "Page.setWebLifecycleState":
-      case "Page.addScriptToEvaluateOnNewDocument":
-      case "Page.removeScriptToEvaluateOnNewDocument":
       case "Page.setBypassCSP":
       case "Network.setCacheDisabled":
       case "Network.setUserAgentOverride":
@@ -1844,12 +2351,13 @@ export class DomjetCdpServer {
       case "Console.enable":
       case "Console.disable":
       case "Log.disable":
+      case "Audits.enable":
+      case "Audits.disable":
         return {};
       case "Page.setDocumentContent":
         if (typeof params.html !== "string") throw cdpError(-32602, "Page.setDocumentContent requires html");
         {
           const content = await target.setDocumentContent(params.html, { holdNetworkFlush: true });
-          target.remoteObjects.clear();
           return { result: { __obscuraNetwork: content?.__obscuraNetwork ?? [] } };
         }
       case "Input.dispatchMouseEvent": {
@@ -1939,19 +2447,7 @@ export class DomjetCdpServer {
             extraHTTPHeaders: params._obscuraExtraHTTPHeaders,
             holdNetworkFlush: true,
           });
-          connection.event("Page.frameNavigated", { frame: frameTree(target).frameTree.frame }, sessionId);
-          // A committed navigation replaces both the default and utility
-          // execution worlds. Playwright waits for these notifications before
-          // issuing page.evaluate()/locator calls in the new document.
-          connection.event("Runtime.executionContextCreated", {
-            context: { id: 1, origin: target.url, name: "", uniqueId: `${target.id}:default:${target.loaderId}`, auxData: { isDefault: true, type: "default", frameId: target.frameId } },
-          }, sessionId);
-          connection.event("Runtime.executionContextCreated", {
-            context: { id: 2, origin: target.url, name: "", uniqueId: `${target.id}:utility:${target.loaderId}`, auxData: { isDefault: false, type: "isolated", frameId: target.frameId } },
-          }, sessionId);
-          connection.event("Page.lifecycleEvent", { frameId: target.frameId, loaderId: target.loaderId, name: "DOMContentLoaded", timestamp: Date.now() / 1000 }, sessionId);
-          connection.event("Page.lifecycleEvent", { frameId: target.frameId, loaderId: target.loaderId, name: "load", timestamp: Date.now() / 1000 }, sessionId);
-          connection.event("Page.frameStoppedLoading", { frameId: target.frameId }, sessionId);
+          this.#announceOrDefer(connection, sessionId, target, params);
           return { frameId: target.frameId, loaderId: target.loaderId, errorText: undefined, isDownload: false, result };
         } catch (error) {
           connection.event("Page.frameStoppedLoading", { frameId: target.frameId }, sessionId);
@@ -1959,11 +2455,18 @@ export class DomjetCdpServer {
         }
       }
       case "Page.reload":
-        await target.navigate(target.url, {
-          allowPrivateNetwork: this.allowPrivateNetwork,
-          extraHTTPHeaders: params._obscuraExtraHTTPHeaders,
-          holdNetworkFlush: true,
-        });
+        connection.event("Page.frameStartedLoading", { frameId: target.frameId }, sessionId);
+        try {
+          await target.navigate(target.url, {
+            allowPrivateNetwork: this.allowPrivateNetwork,
+            extraHTTPHeaders: params._obscuraExtraHTTPHeaders,
+            holdNetworkFlush: true,
+          });
+        } catch (error) {
+          connection.event("Page.frameStoppedLoading", { frameId: target.frameId }, sessionId);
+          throw error;
+        }
+        this.#announceOrDefer(connection, sessionId, target, params);
         return {};
       case "Page.captureScreenshot": {
         const format = params.format ?? "png";
@@ -2009,8 +2512,66 @@ export class DomjetCdpServer {
       case "IO.close":
         this.streams.delete(params.handle);
         return {};
+      case "Page.addScriptToEvaluateOnNewDocument": {
+        const source = params.source;
+        if (typeof source !== "string") throw cdpError(-32602, "Page.addScriptToEvaluateOnNewDocument requires source");
+        if (target.initScripts.size >= MAX_INIT_SCRIPTS_PER_TARGET) throw cdpError(-32000, `At most ${MAX_INIT_SCRIPTS_PER_TARGET} scripts can be added to evaluate on new documents`);
+        // Playwright creates its utility world this way, with an empty source.
+        if (typeof params.worldName === "string" && params.worldName.length > 0) {
+          target.isolatedWorldNames ??= new Map();
+          if (!target.isolatedWorldNames.has(isolatedWorldKey(connection, sessionId))) {
+            target.isolatedWorldNames.set(isolatedWorldKey(connection, sessionId), params.worldName.slice(0, 256));
+          }
+        }
+        const identifier = String(++target.initScriptSerial);
+        // Scripts for an isolated world would run where page code sees them:
+        // the default and isolated worlds share one realm here. Only the empty
+        // source Playwright uses to create its world is accepted for them.
+        if (typeof params.worldName === "string" && params.worldName.length > 0 && source.length > 0) {
+          throw cdpError(-32000, "Scripts for an isolated world are not supported; omit worldName to run the script in the page");
+        }
+        target.initScripts.set(identifier, source);
+        try {
+          await target.start();
+          await target.syncInitScripts();
+        } catch (error) {
+          target.initScripts.delete(identifier);
+          throw error;
+        }
+        if (params.runImmediately === true && source.length > 0) {
+          try { await target.evaluate(source); } catch {}
+        }
+        return { identifier };
+      }
+      case "Page.removeScriptToEvaluateOnNewDocument": {
+        if (typeof params.identifier === "string" && target.initScripts.delete(params.identifier)) {
+          await target.syncInitScripts();
+        }
+        return {};
+      }
+      case "DOM.scrollIntoViewIfNeeded": {
+        await this.#withElement(target, params, (objectId) => this.#callOnElement(target, objectId, `function () {
+          if (typeof this.scrollIntoView === "function") this.scrollIntoView({ block: "center", inline: "center" });
+        }`));
+        return {};
+      }
+      case "DOM.getContentQuads": {
+        const rects = await this.#elementRects(target, params);
+        return { quads: rects.map(rectQuad) };
+      }
+      case "DOM.getBoxModel": {
+        const rects = await this.#elementRects(target, params, { bounding: true });
+        const [rect] = rects;
+        if (!rect) throw cdpError(-32000, "Could not compute box model.");
+        const quad = rectQuad(rect);
+        return { model: { content: quad, padding: quad, border: quad, margin: quad, width: rect.width, height: rect.height } };
+      }
       case "Page.createIsolatedWorld": {
         const contextId = 2;
+        // Every document has one isolated world; later documents announce it
+        // under the name the client asked for.
+        target.isolatedWorldNames ??= new Map();
+        target.isolatedWorldNames.set(isolatedWorldKey(connection, sessionId), typeof params.worldName === "string" ? params.worldName.slice(0, 256) : "");
         connection.event("Runtime.executionContextCreated", {
           context: {
             id: contextId,
@@ -2041,16 +2602,19 @@ export class DomjetCdpServer {
       case "Runtime.callFunctionOn":
         return this.#runtimeCallFunction(target, params);
       case "Runtime.releaseObject":
-        target.remoteObjects.delete(params.objectId);
+        if (typeof params.objectId === "string") await target.pageRuntime.releaseObject(params.objectId);
         return {};
       case "Runtime.releaseObjectGroup":
-        target.remoteObjects.clear();
+        if (typeof params.objectGroup === "string") await target.pageRuntime.releaseObjectGroup(params.objectGroup);
         return {};
       case "Runtime.getIsolateId":
         return { id: `${target.id}-isolate` };
       case "Runtime.getProperties": {
-        const value = target.getRemote(params.objectId);
-        return { result: Object.keys(value).map((name) => ({ name, enumerable: true, configurable: true, writable: true, value: normalizeRemote(value[name], target, Boolean(params.generatePreview)) })) };
+        if (typeof params.objectId !== "string") throw cdpError(-32602, "Runtime.getProperties requires objectId");
+        return target.pageRuntime.getProperties(params.objectId, {
+          ownProperties: params.ownProperties === true,
+          accessorPropertiesOnly: params.accessorPropertiesOnly === true,
+        });
       }
       case "DOM.getDocument": {
         const status = await target.status();
@@ -2080,7 +2644,11 @@ export class DomjetCdpServer {
         return { attributes: Array.isArray(attributes) ? attributes.flatMap((entry) => Array.isArray(entry) ? entry : []) : [] };
       }
       case "DOM.describeNode":
+        if (typeof params.objectId === "string") return target.pageRuntime.describeNode(params.objectId);
         return { node: { nodeId: params.nodeId, backendNodeId: params.nodeId, nodeType: 1, nodeName: "ELEMENT", localName: "", nodeValue: "", childNodeCount: 0 } };
+      case "DOM.resolveNode":
+        if (!Number.isSafeInteger(params.backendNodeId)) throw cdpError(-32000, "No node with given id found");
+        return target.pageRuntime.resolveNode(params.backendNodeId, typeof params.objectGroup === "string" ? params.objectGroup : "");
       case "DOM.requestChildNodes":
         return {};
       case "Network.getAllCookies":
@@ -2123,146 +2691,104 @@ export class DomjetCdpServer {
     }
   }
 
+  // The element a DOM geometry command names: an objectId, or a backend node
+  // id described earlier. (CDP nodeIds belong to the portable DOM state and
+  // are not resolved here.)
+  // Runs use(objectId); an object resolved here from a backendNodeId is
+  // released afterwards, so geometry queries do not accumulate handles.
+  async #withElement(target, params, use) {
+    if (typeof params.objectId === "string") return use(params.objectId);
+    if (Number.isSafeInteger(params.backendNodeId)) {
+      const resolved = await target.pageRuntime.resolveNode(params.backendNodeId, "");
+      const objectId = resolved?.object?.objectId;
+      if (typeof objectId !== "string") throw cdpError(-32000, "No node with given id found");
+      try {
+        return await use(objectId);
+      } finally {
+        await target.pageRuntime.releaseObject(objectId);
+      }
+    }
+    throw cdpError(-32000, "Either nodeId, backendNodeId or objectId must be specified");
+  }
+
+  async #callOnElement(target, objectId, functionDeclaration) {
+    const result = await target.pageRuntime.callFunctionOn(functionDeclaration, { objectId, returnByValue: true });
+    if (result?.exceptionDetails) throw cdpError(-32000, "Node is not an element");
+    return result?.result?.value;
+  }
+
+  // Viewport rectangles of an element's boxes (getClientRects, so a wrapped
+  // inline element yields one per line), without empty boxes.
+  async #elementRects(target, params, { bounding = false } = {}) {
+    const rects = await this.#withElement(target, params, (objectId) => this.#callOnElement(target, objectId, `function (bounding) {
+      if (!this || typeof this.getBoundingClientRect !== "function") throw new TypeError("not an element");
+      const list = !bounding && typeof this.getClientRects === "function" ? Array.from(this.getClientRects()) : [this.getBoundingClientRect()];
+      return list.map((r) => ({ x: Number(r.left) || 0, y: Number(r.top) || 0, width: Number(r.width) || 0, height: Number(r.height) || 0 }));
+    }`.replace("function (bounding)", `function (bounding = ${bounding ? "true" : "false"})`)));
+    const list = Array.isArray(rects) ? rects.filter((rect) => rect.width > 0 && rect.height > 0) : [];
+    if (list.length === 0) throw cdpError(-32000, "Could not compute content quads.");
+    return list;
+  }
+
+  // Page-realm failures (a thrown value) come back as exceptionDetails from
+  // the page runtime; bridge failures such as a synchronous timeout are
+  // reported the same way, and protocol errors (unknown object, destroyed
+  // context) remain CDP errors.
   async #runtimeEvaluate(target, params) {
     const expression = params.expression;
     if (typeof expression !== "string") throw cdpError(-32602, "Runtime.evaluate requires expression");
-    // Playwright installs one helper object in the page realm and invokes its
-    // methods through Runtime.callFunctionOn. The bounded page bridge only
-    // transports clone-safe values, so keep this helper as a protocol-local
-    // remote object instead of attempting to serialize its class instance.
-    if (!params.returnByValue && /module\.exports\.UtilityScript/.test(expression) && /new\s+\(/.test(expression)) {
-      const objectId = target.storeRemote({ __obscuraUtilityScript: true });
-      return {
-        result: { type: "object", objectId, className: "UtilityScript", description: "UtilityScript" },
-        executionContextId: Number.isSafeInteger(params.contextId) ? params.contextId : 1,
-      };
-    }
-    if (!params.returnByValue && /module\.exports\.InjectedScript/.test(expression) && /new\s+\(/.test(expression)) {
-      const objectId = target.storeRemote({ __obscuraInjectedScript: true });
-      return {
-        result: { type: "object", objectId, className: "InjectedScript", description: "InjectedScript" },
-        executionContextId: Number.isSafeInteger(params.contextId) ? params.contextId : 1,
-      };
-    }
     try {
-      const value = await target.evaluate(expression, { timeoutMs: params.timeout });
-      return {
-        result: normalizeRemote(value, target, Boolean(params.returnByValue)),
-        executionContextId: Number.isSafeInteger(params.contextId) ? params.contextId : 1,
-        exceptionDetails: undefined,
-      };
+      return await target.pageRuntime.evaluate(expression, {
+        contextId: evaluationContextId(params),
+        returnByValue: params.returnByValue === true,
+        awaitPromise: params.awaitPromise === true,
+        objectGroup: typeof params.objectGroup === "string" ? params.objectGroup : "",
+        timeoutMs: params.timeout,
+      });
     } catch (error) {
-      return {
-        result: { type: "undefined" },
-        exceptionDetails: exceptionDetails(error, expression),
-        executionContextId: Number.isSafeInteger(params.contextId) ? params.contextId : 1,
-      };
+      if (error?.code === -32000) throw error;
+      return { result: { type: "undefined" }, exceptionDetails: exceptionDetails(error, expression) };
     }
   }
 
   async #runtimeCallFunction(target, params) {
     if (typeof params.functionDeclaration !== "string") throw cdpError(-32602, "Runtime.callFunctionOn requires functionDeclaration");
+    if (params.objectId !== undefined && typeof params.objectId !== "string") throw cdpError(-32602, "objectId must be a string");
     const args = Array.isArray(params.arguments) ? params.arguments : [];
-    const receiver = params.objectId ? target.getRemote(params.objectId) : undefined;
-    if (receiver?.__obscuraUtilityScript) {
-      // The Playwright utility object is represented by a private marker. Its
-      // methods are intentionally narrow: evaluate() executes the supplied
-      // page expression, while jsonValue() returns a clone-safe value.
-      if (params.functionDeclaration.includes(".evaluate(")) {
-        const isFunction = args[1]?.value === true;
-        const returnByValue = args[2]?.value === true;
-        const functionSource = args[3]?.value;
-        const argCount = Number.isSafeInteger(args[4]?.value) ? args[4].value : 0;
-        if (typeof functionSource === "string" && functionSource.includes("injected.querySelector")) {
-          const encoded = decodePlaywrightValue(args[6]?.value);
-          const selector = findEncodedProperty(encoded, "source");
-          const callbackText = findEncodedProperty(encoded, "callbackText");
-          if (typeof selector === "string" && typeof callbackText === "string") {
-            const expression = `(() => { const element = document.querySelector(${JSON.stringify(selector)}); if (!element) return { success: false }; return { success: true, value: (${callbackText})(null, element) }; })()`;
-            return this.#runtimeEvaluate(target, {
-              expression,
-              returnByValue: true,
-              timeout: params.timeout,
-              contextId: params.executionContextId,
-            });
-          }
-        }
-        if (typeof functionSource === "string" && functionSource.includes("new Promise")) {
-          // Playwright uses an injected polling promise to obtain viewport
-          // metrics before a screenshot. The portable target already owns the
-          // metrics, so resolve the protocol shape synchronously and let the
-          // following Page.captureScreenshot command perform the real WASM
-          // capture.
-          return {
-            result: {
-              type: "object",
-              value: {
-                result: JSON.stringify({ width: target.viewport.width, height: target.viewport.height }),
-                abort: null,
-              },
-            },
-            executionContextId: params.executionContextId ?? 1,
-          };
-        }
-        const callArgs = args.slice(5, 5 + argCount).map((arg) => {
-          if (Object.hasOwn(arg ?? {}, "value")) return decodePlaywrightValue(arg.value);
-          if (arg?.unserializableValue === "undefined") return undefined;
-          if (arg?.unserializableValue === "NaN") return Number.NaN;
-          if (arg?.unserializableValue === "Infinity") return Infinity;
-          if (arg?.unserializableValue === "-Infinity") return -Infinity;
-          return undefined;
-        });
-        if (typeof functionSource !== "string") throw cdpError(-32602, "UtilityScript.evaluate source is invalid");
-        const source = isFunction
-          ? `(${functionSource})(...${JSON.stringify(callArgs)})`
-          : functionSource;
-        return this.#runtimeEvaluate(target, {
-          expression: source,
-          returnByValue,
-          timeout: params.timeout,
-          contextId: params.executionContextId,
-        });
-      }
-      if (params.functionDeclaration.includes("this.jsonValue") || params.functionDeclaration.includes("_promiseAwareJsonValueNoThrow")) {
-        const value = args[1]?.value ?? args[0]?.value;
-        return { result: normalizeRemote(value, target, Boolean(params.returnByValue)), executionContextId: params.executionContextId ?? 1 };
-      }
+    try {
+      return await target.pageRuntime.callFunctionOn(params.functionDeclaration, {
+        contextId: Number.isSafeInteger(params.executionContextId) ? params.executionContextId : undefined,
+        objectId: params.objectId ?? null,
+        args,
+        returnByValue: params.returnByValue === true,
+        awaitPromise: params.awaitPromise === true,
+        objectGroup: typeof params.objectGroup === "string" ? params.objectGroup : "",
+        timeoutMs: params.timeout,
+      });
+    } catch (error) {
+      if (error?.code === -32000) throw error;
+      return { result: { type: "undefined" }, exceptionDetails: exceptionDetails(error, params.functionDeclaration) };
     }
-    if (receiver?.__obscuraInjectedScript) {
-      // Keep the injected helper as a protocol-local remote object. The
-      // concrete DOM operation is handled by the WASM-backed page facade in
-      // later revisions; returning a stable remote marker keeps the CDP
-      // session alive while callers probe helper capabilities.
-      const nestedFunctionSource = args[3]?.value;
-      if (typeof nestedFunctionSource === "string" && nestedFunctionSource.includes("injected.querySelector")) {
-        const encoded = decodePlaywrightValue(args[6]?.value);
-        const selector = findEncodedProperty(encoded, "source");
-        const callbackText = findEncodedProperty(encoded, "callbackText");
-        if (typeof selector === "string" && typeof callbackText === "string") {
-          const expression = `(() => { const element = document.querySelector(${JSON.stringify(selector)}); if (!element) return { success: false }; return { success: true, value: (${callbackText})(null, element) }; })()`;
-          return this.#runtimeEvaluate(target, {
-            expression,
-            returnByValue: true,
-            timeout: params.timeout,
-            contextId: params.executionContextId,
-          });
-        }
-      }
-      const objectId = target.storeRemote({ __obscuraInjectedResult: true });
-      return { result: { type: "object", objectId, className: "Object", description: "Object" }, executionContextId: params.executionContextId ?? 1 };
-    }
-    const encoded = args.map((arg) => {
-      if (!arg || Object.hasOwn(arg, "objectId")) {
-        if (arg?.objectId) return target.getRemote(arg.objectId);
-        return undefined;
-      }
-      return arg.value;
-    });
-    const source = `(${params.functionDeclaration}).apply(null, ${JSON.stringify(encoded)})`;
-    // Host remote objects cannot cross the page boundary. Utility objects use
-    // the private path above; ordinary callFunctionOn values are clone-safe.
-    return this.#runtimeEvaluate(target, { ...params, expression: source });
   }
+}
+
+const MAX_INIT_SCRIPTS_PER_TARGET = 64;
+
+// The isolated world a client created belongs to its own session.
+function isolatedWorldKey(connection, sessionId) {
+  return `${connection.id}:${sessionId ?? ""}`;
+}
+
+function rectQuad({ x, y, width, height }) {
+  return [x, y, x + width, y, x + width, y + height, x, y + height];
+}
+
+// Runtime.evaluate names its world by contextId or uniqueContextId
+// ("<target>:utility" for the isolated world); the default world is 1.
+function evaluationContextId(params) {
+  if (Number.isSafeInteger(params.contextId)) return params.contextId;
+  if (typeof params.uniqueContextId === "string" && /:utility(?::|$)/u.test(params.uniqueContextId)) return 2;
+  return 1;
 }
 
 export function defaultWasmModulePath() {

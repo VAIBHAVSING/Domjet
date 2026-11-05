@@ -16,8 +16,11 @@ export async function connectPlaywright<Browser = any>(
   controller: CdpController,
   options: PlaywrightAdapterOptions = {},
 ): Promise<Browser> {
-  await controller.listen();
-  return connectPlaywrightEndpoint(controller.httpEndpoint(), options);
+  // Playwright needs a socket. A listener started here serves no /json/*
+  // discovery, so only a client that knows the unguessable WebSocket path
+  // (this one) can connect; a listener the caller started is left as is.
+  await controller.listen({ discovery: false });
+  return connectPlaywrightEndpoint(controller.wsEndpoint(), options);
 }
 
 export async function connectPlaywrightEndpoint<Browser = any>(
