@@ -2297,6 +2297,9 @@ export class DomjetCdpServer {
     if (!sessions.some(([attached, id]) => attached === connection && id === sessionId)) sessions.push([connection, sessionId]);
     const timestamp = Date.now() / 1000;
     for (const [attached, id] of sessions) {
+      // "init" carries the new loader id; Puppeteer waits for it to tell a
+      // new document from the old one.
+      attached.event("Page.lifecycleEvent", { frameId: target.frameId, loaderId: target.loaderId, name: "init", timestamp }, id);
       attached.event("Page.frameNavigated", { frame: frameTree(target).frameTree.frame }, id);
       attached.event("Runtime.executionContextsCleared", {}, id);
       attached.event("Runtime.executionContextCreated", {
@@ -2345,6 +2348,7 @@ export class DomjetCdpServer {
       case "Network.setUserAgentOverride":
       case "Network.setExtraHTTPHeaders":
       case "Emulation.setFocusEmulationEnabled":
+      case "Emulation.setTouchEmulationEnabled":
       case "Emulation.setEmulatedMedia":
       case "Emulation.setDefaultBackgroundColorOverride":
       case "Security.setIgnoreCertificateErrors":
@@ -2524,13 +2528,12 @@ export class DomjetCdpServer {
           }
         }
         const identifier = String(++target.initScriptSerial);
-        // Scripts for an isolated world would run where page code sees them:
-        // the default and isolated worlds share one realm here. Only the empty
-        // source Playwright uses to create its world is accepted for them.
-        if (typeof params.worldName === "string" && params.worldName.length > 0 && source.length > 0) {
-          throw cdpError(-32000, "Scripts for an isolated world are not supported; omit worldName to run the script in the page");
-        }
-        target.initScripts.set(identifier, source);
+        // The default and isolated worlds share one realm here, so a script
+        // meant for an isolated world would run where page code sees it. It is
+        // registered (the call creates the world, which is how Playwright and
+        // Puppeteer use it) but not run.
+        const isolated = typeof params.worldName === "string" && params.worldName.length > 0;
+        target.initScripts.set(identifier, isolated ? "" : source);
         try {
           await target.start();
           await target.syncInitScripts();
@@ -2538,7 +2541,7 @@ export class DomjetCdpServer {
           target.initScripts.delete(identifier);
           throw error;
         }
-        if (params.runImmediately === true && source.length > 0) {
+        if (params.runImmediately === true && !isolated && source.length > 0) {
           try { await target.evaluate(source); } catch {}
         }
         return { identifier };

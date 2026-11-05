@@ -50,6 +50,7 @@ jobs:
           DOMJET_REQUIRE_REAL_ARTIFACTS: "1"
           # The locked optional peer; without it the Playwright-over-CDP test is skipped.
           DOMJET_PLAYWRIGHT_CORE_MODULE: ${{ github.workspace }}/packages/browser/node_modules/playwright-core/index.mjs
+          DOMJET_PUPPETEER_CORE_MODULE: ${{ github.workspace }}/packages/browser/node_modules/puppeteer-core/lib/puppeteer/puppeteer-core.js
         run: pnpm test
 
   package-smoke:
