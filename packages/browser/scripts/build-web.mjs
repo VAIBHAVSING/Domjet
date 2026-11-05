@@ -59,13 +59,14 @@ const SHIMS = {
   module: "module.mts",
   zlib: "zlib.mts",
   util: "util.mts",
+  dns: "dns.mts",
 };
 
 function webShims(side) {
   return {
     name: "domjet-web-shims",
     setup(builder) {
-      builder.onResolve({ filter: /^(node:)?(vm|fs|fs\/promises|url|path|v8|crypto|module|zlib|util|worker_threads)$/ }, (args) => {
+      builder.onResolve({ filter: /^(node:)?(vm|fs|fs\/promises|url|path|v8|crypto|module|zlib|util|dns|worker_threads)$/ }, (args) => {
         const name = args.path.replace(/^node:/, "");
         return { path: resolve(shimRoot, name === "worker_threads" ? `worker-threads.${side}.mts` : SHIMS[name]) };
       });

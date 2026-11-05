@@ -14,6 +14,7 @@ for (const name of [
   "client.mts",
   "limits.mts",
   "module-loader.mts",
+  "network-policy.mts",
   "task-runtime.mts",
   "worker.mts",
 ]) {

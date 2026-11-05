@@ -6,13 +6,16 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parentPort, workerData, threadId } from "node:worker_threads";
 import { getHeapStatistics, setFlagsFromString } from "node:v8";
+import dns from "node:dns";
 
 import {
   BOOTSTRAP_PLATFORM_OP_COMMANDS,
   compileBootstrapRuntime,
+  setPageDynamicImport,
 } from "./bootstrap-runtime.mjs";
 import { loadModule } from "./module-loader.mjs";
 import { PortableTaskHost } from "./task-runtime.mjs";
+import { assertPermittedUrl, fetchFollowingRedirects, guardLookup } from "./network-policy.mjs";
 import {
   MAX_DOCUMENT_METADATA_BYTES,
   MAX_DOM_ARGUMENT_BYTES,
@@ -353,7 +356,7 @@ const installBoundedEvaluateScript = new vm.Script(
       configurable: false,
     });
   })()`,
-  { filename: "domjet-bounded-evaluate-install.js" },
+  { filename: "domjet-bounded-evaluate-install.js", importModuleDynamically: pageImportHook },
 );
 const installDocumentFacadeScript = new vm.Script(
   `(() => {
@@ -441,7 +444,7 @@ const installDocumentFacadeScript = new vm.Script(
       configurable: false,
     });
   })()`,
-  { filename: "domjet-document-facade.js" },
+  { filename: "domjet-document-facade.js", importModuleDynamically: pageImportHook },
 );
 
 let target;
@@ -463,6 +466,50 @@ let bootstrapSourceText = null;
 let bootstrapCodeCachePublished = false;
 // Set once a realm exists or caller code was evaluated in this isolate.
 let callerScriptsMayHaveRun = false;
+// Scripts the host asked to run in every new document before its own scripts
+// (CDP Page.addScriptToEvaluateOnNewDocument, Playwright addInitScript,
+// Puppeteer evaluateOnNewDocument).
+const MAX_INIT_SCRIPTS = 64;
+const MAX_INIT_SCRIPT_BYTES = 4 * 1024 * 1024;
+const INIT_SCRIPT_TIMEOUT_MS = 5_000;
+let documentInitScripts = [];
+
+function setInitScripts(payload) {
+  const scripts = payload?.scripts;
+  if (!Array.isArray(scripts) || scripts.length > MAX_INIT_SCRIPTS) {
+    throw new RangeError(`init scripts must be an array of at most ${MAX_INIT_SCRIPTS} strings`);
+  }
+  let total = 0;
+  for (const script of scripts) {
+    if (typeof script !== "string") throw new TypeError("init scripts must be strings");
+    total += Buffer.byteLength(script, "utf8");
+  }
+  if (total > MAX_INIT_SCRIPT_BYTES) throw new RangeError(`init scripts exceed ${MAX_INIT_SCRIPT_BYTES} bytes`);
+  documentInitScripts = [...scripts];
+  return documentInitScripts.length;
+}
+
+// A failing init script is reported like a page script error and does not
+// stop the others or the document's own scripts. All of them share one
+// deadline, and their completion values are discarded rather than serialized.
+function runInitScripts() {
+  const failed = [];
+  const deadline = performance.now() + INIT_SCRIPT_TIMEOUT_MS;
+  for (const source of documentInitScripts) {
+    if (source.length === 0) continue;
+    const remaining = Math.floor(deadline - performance.now());
+    if (remaining < 1) {
+      failed.push("init scripts exceeded their time budget");
+      break;
+    }
+    try {
+      hostEvaluate(`${source}\n;undefined`, remaining);
+    } catch (error) {
+      failed.push(String(error?.message ?? error).slice(0, 1_000));
+    }
+  }
+  return failed;
+}
 let bridgeCapabilityProbePromise;
 let portablePlatformOp;
 let bridgeTaskHost;
@@ -488,6 +535,24 @@ let nextBootstrapNetworkRequestId = 1;
 const bootstrapNetworkEvents = [];
 let bootstrapNetworkEventBytes = 0;
 let activeAllowPrivateNetwork = false;
+// In-flight requests whose caller allowed private networks explicitly.
+let privateNetworkFetchesInFlight = 0;
+// Node's fetch exposes redirect responses (redirect: "manual"); a browser
+// host only returns an opaque redirect, so there the browser follows.
+const HOST_FETCH_EXPOSES_REDIRECTS = typeof process === "object" && typeof process?.versions?.node === "string";
+installConnectAddressGuard();
+// Page scripts run in this Worker's isolate, so a promise a page rejects
+// without a handler reaches Node's unhandled-rejection check, whose default
+// ends the Worker and the page with it. Browsers only report those. A page
+// promise is not an instance of this realm's Promise; the host's own
+// rejections keep Node's default. The page's reason is never touched.
+let pageUnhandledRejections = 0;
+if (typeof process?.on === "function") {
+  process.on("unhandledRejection", (reason, promise) => {
+    if (promise instanceof Promise) throw reason;
+    pageUnhandledRejections += 1;
+  });
+}
 const MAX_MODULES_PER_DOCUMENT = 256;
 const MAX_IMPORT_MAP_ENTRIES = 1_024;
 let moduleRecords = new Map();
@@ -804,6 +869,14 @@ function synchronousResult(value, label) {
   return value;
 }
 
+// The import() hook of every script compiled into a page realm (see
+// setPageDynamicImport in bootstrap-runtime.mts).
+function pageImportHook(specifier, referrer) {
+  const referrerUrl = typeof referrer?.identifier === "string" ? referrer.identifier : documentUrlForCookies();
+  return dynamicImportModule(specifier, referrerUrl, MAX_NAVIGATION_REQUEST_TIMEOUT_MS, activeAllowPrivateNetwork);
+}
+setPageDynamicImport(pageImportHook);
+
 function boundedEvaluateScript(source, filename) {
   const literal = JSON.stringify(sourceText(source));
   return new vm.Script(`globalThis.${BOUNDED_EVALUATE_BINDING}(${literal})`, {
@@ -812,12 +885,7 @@ function boundedEvaluateScript(source, filename) {
     // when the Worker is launched with --experimental-vm-modules. Keep the
     // hook on the script itself so a page-created import() remains in the
     // same bounded module graph and never falls back to host-realm import().
-    importModuleDynamically(specifier, script) {
-      const referrer = typeof script?.identifier === "string"
-        ? script.identifier
-        : documentUrlForCookies();
-      return dynamicImportModule(specifier, referrer, MAX_NAVIGATION_REQUEST_TIMEOUT_MS, activeAllowPrivateNetwork);
-    },
+    importModuleDynamically: pageImportHook,
   });
 }
 
@@ -1062,16 +1130,60 @@ async function evaluateWithModule(source, timeoutMs) {
   return moduleResult(await evaluate.fn(source, timeoutMs));
 }
 
+// The page realm's own error constructors, captured when the realm is created
+// and before any page code runs (page code may replace the globals later).
+const pageRealmIntrinsics = new WeakMap();
+
+function capturePageRealmIntrinsics(context) {
+  pageRealmIntrinsics.set(context, vm.runInContext(
+    "Object.freeze({ Error, TypeError, SyntaxError, RangeError, ReferenceError, getPrototypeOf: Object.getPrototypeOf })",
+    context,
+    { timeout: 1_000 },
+  ));
+}
+
+// An error safe to hand to page code: an error the page realm created stays
+// as is; anything from the host becomes a page-realm error with the same
+// name and message, so no host object (and through its constructor, no host
+// Function) reaches the page.
+function pageRealmError(context, error) {
+  const intrinsics = pageRealmIntrinsics.get(context);
+  if (!intrinsics) return error;
+  try {
+    let proto = error !== null && typeof error === "object" ? intrinsics.getPrototypeOf(error) : null;
+    for (let depth = 0; proto !== null && depth < 8; depth += 1) {
+      if (proto === intrinsics.Error.prototype) return error;
+      proto = intrinsics.getPrototypeOf(proto);
+    }
+  } catch {}
+  let name = "TypeError";
+  let message = "Failed to fetch dynamically imported module";
+  try {
+    if (error instanceof Error) {
+      name = ["TypeError", "SyntaxError", "RangeError", "ReferenceError"].includes(error.name) ? error.name : "TypeError";
+      message = String(error.message).slice(0, 4_096);
+    }
+  } catch {}
+  return new intrinsics[name](message);
+}
+
 function getHostContext() {
   if (hostContext) return hostContext;
   const sandbox = Object.create(null);
   callerScriptsMayHaveRun = true;
-  hostContext = vm.createContext(sandbox, {
+  const context = vm.createContext(sandbox, {
     name: "domjet-page",
     codeGeneration: { strings: true, wasm: false },
     microtaskMode: "afterEvaluate",
+    // Every import() in the realm, including code run through an indirect
+    // eval (where a Script's own hook does not apply), resolves through the
+    // bounded per-document module graph. Without a context hook Node rejects
+    // with a host-realm error.
+    importModuleDynamically: pageImportHook,
   });
-  installBoundedEvaluateScript.runInContext(hostContext, { timeout: 1_000 });
+  capturePageRealmIntrinsics(context);
+  installBoundedEvaluateScript.runInContext(context, { timeout: 1_000 });
+  hostContext = context;
   return hostContext;
 }
 
@@ -1150,8 +1262,49 @@ function hostEvaluate(source, timeoutMs = 1_000) {
 }
 
 function syncCall(callable, ...args) {
-  const value = callable.fn(...args);
+  let value;
+  try {
+    value = callable.fn(...args);
+  } catch (error) {
+    noteEngineFailure(error);
+    throw error;
+  }
   return synchronousResult(value, callable.name);
+}
+
+// A WebAssembly trap (an engine panic, or an allocation the engine's memory
+// ceiling cannot satisfy) leaves the core unusable: wasm-bindgen then refuses
+// every later call ("recursive use of an object"). Report it once with a
+// clear code and end this Worker so its owner can start a fresh one.
+let engineTrap = null;
+
+function noteEngineFailure(error) {
+  if (engineTrap) return;
+  let message = "";
+  let stack = "";
+  try {
+    message = String(error?.message ?? "");
+    stack = String(error?.stack ?? "");
+  } catch {}
+  let trapped = false;
+  try { trapped = error instanceof WebAssembly.RuntimeError; } catch {}
+  if (!trapped && !/recursive use of an object detected/u.test(message)) return;
+  engineTrap = { outOfMemory: /alloc_error|out of memory/iu.test(`${message}\n${stack}`) };
+}
+
+function engineTrapError() {
+  const error = new Error(engineTrap.outOfMemory
+    ? "The page needed more memory than the Domjet engine allows; its page worker has ended"
+    : "The Domjet engine stopped on an internal error; its page worker has ended");
+  error.code = engineTrap.outOfMemory ? "ERR_DOMJET_ENGINE_OUT_OF_MEMORY" : "ERR_DOMJET_ENGINE_TRAPPED";
+  return error;
+}
+
+function endAfterEngineTrap() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // The error reply is already queued on the port; end the thread after it.
+  setImmediate(() => process.exit(70));
 }
 
 // A core's host ABI is fixed for its lifetime. Resolve and bind it once,
@@ -2594,6 +2747,65 @@ function cancelBootstrapFetches(cdpCore = portableCdpCore) {
   portableFetchWaiters.clear();
 }
 
+// Node resolves host names during connect through dns.lookup. The guard
+// checks the address the socket will use, so a name that resolves (or
+// rebinds) to a private address is refused even though its URL passed
+// validateNavigationUrl. Web hosts have no dns module (the shim has no
+// lookup) and rely on the browser's own private-network rules.
+function installConnectAddressGuard() {
+  if (typeof dns?.lookup !== "function") return;
+  dns.lookup = guardLookup(dns.lookup, {
+    allowPrivateNetwork: () => activeAllowPrivateNetwork || privateNetworkFetchesInFlight > 0,
+    exemptHosts: environmentProxyHosts(),
+  });
+}
+
+// With NODE_USE_ENV_PROXY Node connects to the configured proxy, which then
+// resolves the target; the proxy host itself is not a page target.
+function environmentProxyHosts() {
+  const hosts = new Set();
+  const enabled = process.env?.NODE_USE_ENV_PROXY === "1" || process.execArgv?.includes("--use-env-proxy");
+  if (!enabled) return hosts;
+  for (const name of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) {
+    const value = process.env?.[name];
+    if (!value) continue;
+    try { hosts.add(new URL(value).hostname.toLowerCase()); } catch {}
+  }
+  return hosts;
+}
+
+// fetch() that reports a connect-time policy refusal as the policy error.
+// undici wraps a failed lookup as "fetch failed" with the cause attached.
+async function guardedFetch(input, init) {
+  try {
+    return await fetch(input, init);
+  } catch (error) {
+    if (error?.cause?.code === "ERR_OBSCURA_SSRF") throw error.cause;
+    throw error;
+  }
+}
+
+async function privateNetworkFetch(input, init) {
+  privateNetworkFetchesInFlight += 1;
+  try {
+    return await guardedFetch(input, init);
+  } finally {
+    privateNetworkFetchesInFlight -= 1;
+  }
+}
+
+// fetch() for page subresources: every redirect target passes the same SSRF
+// policy as the first URL before it is requested.
+function policyFetch(url, init, allowPrivateNetwork, { cookieHeader, storeCookies } = {}) {
+  const allowed = Boolean(allowPrivateNetwork);
+  return fetchFollowingRedirects(allowed ? privateNetworkFetch : guardedFetch, url, init, {
+    validate: (target) => assertPermittedUrl(target, allowed),
+    manualRedirects: HOST_FETCH_EXPOSES_REDIRECTS,
+    cookieHeader,
+    storeCookies,
+  });
+}
+
 function validateNavigationUrl(value, allowPrivateNetwork = false) {
   requireBoundedString(value, MAX_NAVIGATION_URL_BYTES, "navigation URL");
   let url;
@@ -2605,18 +2817,7 @@ function validateNavigationUrl(value, allowPrivateNetwork = false) {
   if (!new Set(["about:", "data:", "http:", "https:"]).has(url.protocol)) {
     throw new TypeError(`navigation scheme ${url.protocol} is not supported`);
   }
-  if (url.protocol === "http:" || url.protocol === "https:") {
-    const host = url.hostname.toLowerCase();
-    if (!allowPrivateNetwork &&
-        (host === "localhost" || host.endsWith(".localhost") || host === "metadata.google.internal" ||
-         host === "169.254.169.254" || host === "::1" || host === "[::1]" ||
-         /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) ||
-         /^172\.(1[6-9]|2\d|3[0-1])\./.test(host))) {
-      const error = new Error(`navigation target is blocked by the portable SSRF policy: ${host}`);
-      error.code = "ERR_OBSCURA_SSRF";
-      throw error;
-    }
-  }
+  assertPermittedUrl(url, allowPrivateNetwork);
   return url;
 }
 
@@ -3035,15 +3236,29 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
         requestHeaders = fetchHeadersFromCdp(resolution.headers, requestHeaders);
         if (typeof resolution.postData === "string") effectiveBody = resolution.postData;
       }
-      const response = await fetch(effectiveUrl, {
+      // Each redirect hop gets cookies by the same credentials rule as the
+      // first request, unless the page supplied its own Cookie header.
+      const jarCookies = !Object.keys(headers).some((name) => name.toLowerCase() === "cookie");
+      const hopSameOrigin = (hopUrl) => {
+        try { return requestOrigin !== "" && new URL(hopUrl).origin === requestOrigin; } catch { return false; }
+      };
+      const { response, url: fetchedUrl, redirected } = await policyFetch(effectiveUrl, {
         method: effectiveMethod,
         headers: requestHeaders,
         body: effectiveMethod === "GET" || effectiveMethod === "HEAD" ? undefined : binaryStringToBytes(effectiveBody),
-        redirect: "follow",
         signal: controller.signal,
+      }, activeAllowPrivateNetwork, {
+        cookieHeader: jarCookies
+          ? (hopUrl) => (credentials === "include" || (credentials === "same-origin" && hopSameOrigin(hopUrl))
+            ? cookieHeaderForUrl(hopUrl, credentials)
+            : "")
+          : undefined,
+        storeCookies: (hopUrl, hopResponse) => {
+          if (credentials !== "omit" && (credentials === "include" || hopSameOrigin(hopUrl))) storeResponseCookies(hopUrl, hopResponse);
+        },
       });
       let { headers: responseHeaders } = responseHeadersObject(response);
-      let responseUrl = response.url || effectiveUrl.toString();
+      let responseUrl = fetchedUrl;
       let responseStatus = response.status;
       let responseBytes = await readBoundedResponseBytes(response, MAX_NAVIGATION_RESPONSE_BYTES);
       const sameOrigin = (() => {
@@ -3162,7 +3377,7 @@ function startBootstrapFetch(url, method, headersJson, body, pageOrigin, mode, c
           body: Buffer.from(responseBytes).toString("utf8"),
           bodyBase64: Buffer.from(responseBytes).toString("base64"),
           url: responseUrl,
-          redirected: response.redirected,
+          redirected,
         }),
       });
     } catch (error) {
@@ -3241,16 +3456,17 @@ async function fetchClassicScript(url, requestTimeoutMs, allowPrivateNetwork, { 
         ({ headers: responseHeaders, url: responseUrl, status, bytes } = responseDecision);
       }
     } else {
-      response = await fetch(decision.url, {
+      ({ response, url: responseUrl } = await policyFetch(decision.url, {
         method: decision.method,
         headers: decision.headers,
         body: decision.method === "GET" || decision.method === "HEAD" ? undefined : binaryStringToBytes(decision.postData ?? ""),
-        redirect: "follow",
         signal: controller.signal,
-      });
-      storeResponseCookies(response.url || decision.url, response);
+      }, allowPrivateNetwork, {
+        cookieHeader: (hopUrl) => cookieHeaderForUrl(hopUrl, "include"),
+        storeCookies: storeResponseCookies,
+      }));
+      storeResponseCookies(responseUrl, response);
       ({ headers: responseHeaders } = responseHeadersObject(response));
-      responseUrl = response.url || decision.url;
       status = response.status;
       bytes = status >= 200 && status < 300 ? await readBoundedResponseBytes(response) : new Uint8Array();
       const responseDecision = await hostFetchResponseInterception({
@@ -3469,10 +3685,12 @@ async function fetchStylesheetCss(url, requestTimeoutMs, allowPrivateNetwork, se
           ({ headers: responseHeaders, url: responseUrl, status: responseStatus, bytes } = responseDecision);
         }
       } else {
-        const options = { headers: decision.headers, redirect: "follow", signal: controller.signal };
+        const options = { headers: decision.headers, signal: controller.signal };
         if (/^https?:/iu.test(referrer)) options.referrer = referrer;
-        response = await fetch(decision.url, options);
-        responseUrl = response.url || decision.url;
+        ({ response, url: responseUrl } = await policyFetch(decision.url, options, allowPrivateNetwork, {
+          cookieHeader: (hopUrl) => cookieHeaderForUrl(hopUrl, "include"),
+          storeCookies: storeResponseCookies,
+        }));
         storeResponseCookies(responseUrl, response);
         ({ headers: responseHeaders } = responseHeadersObject(response));
         responseStatus = response.status;
@@ -3695,8 +3913,17 @@ function resolveModuleSpecifier(specifier, referrer) {
 
 async function dynamicImportModule(specifier, referrer, requestTimeoutMs, allowPrivateNetwork) {
   const context = getHostContext();
+  try {
+    return await dynamicImportModuleUnchecked(context, specifier, referrer, requestTimeoutMs, allowPrivateNetwork);
+  } catch (error) {
+    // The rejection reaches page code through its import() promise.
+    throw pageRealmError(context, error);
+  }
+}
+
+async function dynamicImportModuleUnchecked(context, specifier, referrer, requestTimeoutMs, allowPrivateNetwork) {
   const generation = bridgeGeneration;
-  const targetUrl = resolveModuleSpecifier(specifier, referrer || documentUrlForCookies());
+  const targetUrl = resolveModuleSpecifier(String(specifier), referrer || documentUrlForCookies());
   // Static imports are linked by the parent module's graph evaluation. A
   // dynamic import has no such parent evaluation step, so evaluate the
   // fetched dependency before returning its Module to V8. This also keeps
@@ -3878,6 +4105,8 @@ async function executeDocumentScripts({ requestTimeoutMs, allowPrivateNetwork })
   const failed = [];
   const skipped = [];
   await installBootstrapRealm();
+  const initScriptErrors = runInitScripts();
+  for (const error of initScriptErrors) failed.push({ initScript: true, error });
   for (const script of records) {
     if (!script.classic || script.module || script.importMap || script.noModule) {
       skipped.push({ nid: script.nid, type: script.type || "classic" });
@@ -4044,7 +4273,7 @@ async function navigatePortable({ url, options = {}, allowPrivateNetwork = false
           fulfilledBytes = responseDecision.bytes;
         }
       } else {
-        response = await fetch(decision.url, {
+        response = await guardedFetch(decision.url, {
           method: decision.method,
           headers: decision.headers,
           body: decision.method === "GET" || decision.method === "HEAD" ? undefined : binaryStringToBytes(decision.postData ?? ""),
@@ -4623,14 +4852,15 @@ async function fetchAndSeedRenderResource(
         ({ headers: responseHeaders, url: responseUrl, status: responseStatus, bytes } = responseDecision);
       }
     } else {
-      response = await fetch(decision.url, {
+      ({ response, url: responseUrl } = await policyFetch(decision.url, {
         method: decision.method,
         headers: decision.headers,
-        redirect: "follow",
         signal: controller.signal,
         referrer: documentUrlForCookies(),
-      });
-      responseUrl = response.url || decision.url;
+      }, allowPrivateNetwork, {
+        cookieHeader: (hopUrl) => cookieHeaderForUrl(hopUrl, "include"),
+        storeCookies: storeResponseCookies,
+      }));
       responseStatus = response.status;
       traceMemory("render-resource:headers", { requestId, kind: request.kind, status: responseStatus });
       storeResponseCookies(responseUrl, response);
@@ -5142,6 +5372,8 @@ async function dispatch(operation, payload) {
       return portableCdpOperation(payload);
     case "portableCdpRaw":
       return portableCdpRawOperation(payload);
+    case "setInitScripts":
+      return setInitScripts(payload);
     case "bridgeStatus":
       return await bridgeStatus();
     case "allCookies":
@@ -5199,6 +5431,11 @@ function postError(id, error) {
 async function handleMessage(message) {
   const { id, operation, payload } = message ?? {};
   if (!Number.isSafeInteger(id) || id < 1 || typeof operation !== "string") return;
+  if (engineTrap) {
+    postError(id, engineTrapError());
+    endAfterEngineTrap();
+    return;
+  }
   if (shuttingDown) {
     postError(id, new Error("Harness worker is shutting down"));
     return;
@@ -5208,6 +5445,9 @@ async function handleMessage(message) {
       traceMemory(`${operation}:before`);
     }
     const result = await dispatch(operation, payload);
+    // A trap inside page script surfaces to the page as an ordinary error;
+    // the operation must still report that the engine is gone.
+    if (engineTrap) throw engineTrapError();
     if (["navigate", "prepareRenderResources", "screenshotPng", "pdf", "bridgeRelease", "shutdown"].includes(operation)) {
       traceMemory(`${operation}:after`, operation === "prepareRenderResources" ? {
         requested: result?.requested,
@@ -5235,7 +5475,9 @@ async function handleMessage(message) {
       postError(id, error);
     }
   } catch (error) {
-    postError(id, error);
+    noteEngineFailure(error);
+    postError(id, engineTrap ? engineTrapError() : error);
+    if (engineTrap) endAfterEngineTrap();
   } finally {
     if (operation === "shutdown") setImmediate(() => parentPort.close());
   }

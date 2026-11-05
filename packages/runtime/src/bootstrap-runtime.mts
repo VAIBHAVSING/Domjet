@@ -109,6 +109,29 @@ export const BOOTSTRAP_PLATFORM_OP_COMMANDS = Object.freeze([
   "op_url_set",
 ]);
 
+// import() in page code resolves through the hook of the script that compiled
+// the calling code (eval'd code inherits its caller's). Every script compiled
+// into a page realm therefore carries this hook; without one Node rejects the
+// import with a host-realm error object, whose constructor chain reaches the
+// host Function. The page Worker registers its module loader here.
+let pageDynamicImportHandler = null;
+
+export function setPageDynamicImport(handler) {
+  if (handler !== null && typeof handler !== "function") throw new TypeError("page dynamic import handler must be a function");
+  pageDynamicImportHandler = handler;
+}
+
+function pageImportHook(specifier, referrer, attributes) {
+  const handler = pageDynamicImportHandler;
+  if (typeof handler !== "function") return pageImportUnavailable();
+  return handler(specifier, referrer, attributes);
+}
+
+// No loader: reject with an inert value, never a host Error.
+function pageImportUnavailable() {
+  return Promise.reject("Failed to fetch dynamically imported module");
+}
+
 const installDomBridgeScript = new vm.Script(
   `(() => {
     "use strict";
@@ -143,6 +166,10 @@ const installDomBridgeScript = new vm.Script(
     const safeMapGet = Map.prototype.get;
     const safeMapSet = Map.prototype.set;
     const safeMapDelete = Map.prototype.delete;
+    const ContextSet = Set;
+    const safeSetHas = Set.prototype.has;
+    const safeSetAdd = Set.prototype.add;
+    const startedScripts = new ContextSet();
     const safeJsonParse = JSON.parse;
     const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const MAX_PLATFORM_BINARY_BYTES = 8 * 1024 * 1024;
@@ -162,6 +189,23 @@ const installDomBridgeScript = new vm.Script(
       const error = new ErrorConstructor(message);
       if (ErrorConstructor === ContextError && name !== "Error") error.name = name;
       return error;
+    };
+
+    // Keeps an error page code created; anything else (which could only be a
+    // host value reaching this realm by mistake) becomes a page-realm error.
+    const ContextObjectGetPrototypeOf = Object.getPrototypeOf;
+    const ContextErrorPrototype = ContextError.prototype;
+    const pageError = (error, fallbackMessage) => {
+      let proto = null;
+      try {
+        proto = error !== null && typeof error === "object" ? safeApply(ContextObjectGetPrototypeOf, undefined, [error]) : null;
+        for (let depth = 0; proto !== null && depth < 8 && proto !== ContextErrorPrototype; depth += 1) {
+          proto = safeApply(ContextObjectGetPrototypeOf, undefined, [proto]);
+        }
+      } catch {
+        proto = null;
+      }
+      return proto === ContextErrorPrototype ? error : new ContextTypeError(fallbackMessage);
     };
 
     const opDom = function op_dom(command, arg1 = "", arg2 = "") {
@@ -382,16 +426,21 @@ const installDomBridgeScript = new vm.Script(
     const opFetchUrl = function op_fetch_url(url, method, headers, body, pageOrigin, mode, credentials) {
       const promise = new ContextPromise((resolve, reject) => {
         try {
-          const id = safeApply(hostFetchOp, undefined, [
+          const response = safeApply(hostFetchOp, undefined, [
             stringValue(url), stringValue(method), stringValue(headers), stringValue(body),
             stringValue(pageOrigin), stringValue(mode), stringValue(credentials),
           ]);
+          if (response === null || typeof response !== "object") {
+            throw new ContextTypeError("Domjet fetch bridge returned an invalid response");
+          }
+          if (response.ok === false) throw translatedError(response.error);
+          const id = response.value;
           if (!safeNumberIsSafeInteger(id) || id < 1) {
             throw new ContextTypeError("Domjet fetch bridge returned an invalid request id");
           }
           safeApply(safeMapSet, fetchEntries, [id, { resolve, reject }]);
         } catch (error) {
-          reject(error);
+          reject(pageError(error, "Failed to fetch"));
         }
       });
       // A browser reports an unhandled rejection to the page rather than
@@ -414,20 +463,26 @@ const installDomBridgeScript = new vm.Script(
           safeApply(entry.reject, undefined, [new ContextTypeError("Domjet fetch bridge returned an invalid response")]);
         }
       } catch (error) {
-        safeApply(entry.reject, undefined, [error]);
+        safeApply(entry.reject, undefined, [pageError(error, "Failed to fetch")]);
       }
       return true;
     };
     [opFetchUrl, resolveFetch].forEach(Object.freeze);
 
-    const opGetCookies = function op_get_cookies() {
+    const callCookieHost = (command, argument) => {
       if (typeof hostCookieOp !== "function") return "";
-      const value = safeApply(hostCookieOp, undefined, ["get", ""]);
-      return typeof value === "string" ? value : "";
+      const response = safeApply(hostCookieOp, undefined, [command, argument]);
+      if (response === null || typeof response !== "object") {
+        throw new ContextTypeError("Domjet cookie bridge returned an invalid response");
+      }
+      if (response.ok === false) throw translatedError(response.error);
+      return typeof response.value === "string" ? response.value : "";
+    };
+    const opGetCookies = function op_get_cookies() {
+      return callCookieHost("get", "");
     };
     const opSetCookie = function op_set_cookie(value) {
-      if (typeof hostCookieOp !== "function") return;
-      safeApply(hostCookieOp, undefined, ["set", stringValue(value)]);
+      callCookieHost("set", stringValue(value));
     };
     [opGetCookies, opSetCookie].forEach(Object.freeze);
 
@@ -517,6 +572,28 @@ const installDomBridgeScript = new vm.Script(
       op_fetch_url: { value: opFetchUrl, enumerable: true },
       op_get_cookies: { value: opGetCookies, enumerable: true },
       op_set_cookie: { value: opSetCookie, enumerable: true },
+      // bootstrap.js prepares an inserted script only once per document, as
+      // the native op does with its already-started set. This realm is one
+      // document, so the set lives with the bridge.
+      op_script_try_start: { value: Object.freeze(function op_script_try_start(nid) {
+        const id = typeof nid === "number" ? nid : safeApply(ContextNumber, undefined, [nid]);
+        if (safeApply(safeSetHas, startedScripts, [id])) return false;
+        safeApply(safeSetAdd, startedScripts, [id]);
+        return true;
+      }), enumerable: true },
+      op_script_mark_started: { value: Object.freeze(function op_script_mark_started(nid) {
+        safeApply(safeSetAdd, startedScripts, [typeof nid === "number" ? nid : safeApply(ContextNumber, undefined, [nid])]);
+        return true;
+      }), enumerable: true },
+      // Import maps are installed by the host from parser-inserted scripts;
+      // a dynamically inserted map is accepted without error.
+      op_add_import_map: { value: Object.freeze(function op_add_import_map(_source, _base) {
+        return "";
+      }), enumerable: true },
+      // Script-initiated navigation is not routed through the portable host yet.
+      op_navigate: { value: Object.freeze(function op_navigate(_url, _method, _body) {
+        return false;
+      }), enumerable: true },
     });
     Object.freeze(ops);
 
@@ -550,7 +627,7 @@ const installDomBridgeScript = new vm.Script(
       configurable: true,
     });
   })()`,
-  { filename: "domjet-portable-dom-bridge.js" },
+  { filename: "domjet-portable-dom-bridge.js", importModuleDynamically: pageImportHook },
 );
 
 const initializePageScript = new vm.Script(
@@ -561,7 +638,7 @@ const initializePageScript = new vm.Script(
     }
     globalThis.__obscura_init();
   })()`,
-  { filename: "domjet-portable-page-init.js" },
+  { filename: "domjet-portable-page-init.js", importModuleDynamically: pageImportHook },
 );
 
 function vmTimeout(value) {
@@ -602,6 +679,27 @@ function hostResponse(call, fallbackMessage, ...args) {
     const value = call(...args);
     if (typeof value !== "string") {
       throw new TypeError("Portable bootstrap operation must return a string");
+    }
+    Object.defineProperties(response, {
+      ok: { enumerable: true, value: true },
+      value: { enumerable: true, value },
+    });
+  } catch (error) {
+    Object.defineProperties(response, {
+      ok: { enumerable: true, value: false },
+      error: { enumerable: true, value: safeErrorRecord(error, fallbackMessage) },
+    });
+  }
+  return Object.freeze(response);
+}
+
+// An inert envelope for a host callback whose result is a primitive.
+function hostValueResponse(call, fallbackMessage) {
+  const response = Object.create(null);
+  try {
+    const value = call();
+    if (typeof value !== "string" && typeof value !== "number") {
+      throw new TypeError("Portable bootstrap operation must return a primitive");
     }
     Object.defineProperties(response, {
       ok: { enumerable: true, value: true },
@@ -669,7 +767,9 @@ export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>
   // V8 checks a code cache against its version, flags, and the source length,
   // but not the source text: a same-length edit is accepted and runs the old
   // code. Callers must key cachedData by the source content.
-  const bootstrapScript = new vm.Script(source, cachedData === undefined ? { filename } : { filename, cachedData });
+  const bootstrapScript = new vm.Script(source, cachedData === undefined
+    ? { filename, importModuleDynamically: pageImportHook }
+    : { filename, cachedData, importModuleDynamically: pageImportHook });
   const codeCache = cachedData === undefined
     ? "none"
     : bootstrapScript.cachedDataRejected === false ? "accepted" : "rejected";
@@ -692,12 +792,12 @@ export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>
   const captureTaskDispatcherScript = new vm.Script(
     `const ${dispatchLexical} = globalThis[${JSON.stringify(dispatchSlot)}];\n` +
       `delete globalThis[${JSON.stringify(dispatchSlot)}];`,
-    { filename: "domjet-portable-task-capture.js" },
+    { filename: "domjet-portable-task-capture.js", importModuleDynamically: pageImportHook },
   );
   const captureFetchResolverScript = new vm.Script(
     `const ${fetchResolveLexical} = globalThis[${JSON.stringify(fetchDispatchSlot)}];\n` +
       `delete globalThis[${JSON.stringify(fetchDispatchSlot)}];`,
-    { filename: "domjet-portable-fetch-capture.js" },
+    { filename: "domjet-portable-fetch-capture.js", importModuleDynamically: pageImportHook },
   );
   const dispatchTaskScript = new vm.Script(
     `(() => {\n` +
@@ -706,7 +806,7 @@ export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>
       `  delete globalThis[${JSON.stringify(dispatchIdSlot)}];\n` +
       `  return ${dispatchLexical}(id);\n` +
       `})()`,
-    { filename: "domjet-portable-task-dispatch.js" },
+    { filename: "domjet-portable-task-dispatch.js", importModuleDynamically: pageImportHook },
   );
   const dispatchFetchScript = new vm.Script(
     `(() => {\n` +
@@ -717,7 +817,7 @@ export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>
       `  delete globalThis[${JSON.stringify(dispatchPayloadSlot)}];\n` +
       `  return ${fetchResolveLexical}(id, payload);\n` +
       `})()`,
-    { filename: "domjet-portable-fetch-dispatch.js" },
+    { filename: "domjet-portable-fetch-dispatch.js", importModuleDynamically: pageImportHook },
   );
   return Object.freeze({
     codeCache,
@@ -767,17 +867,26 @@ export function compileBootstrapRuntime(source, { filename = "<domjet:bootstrap>
         ),
         configurable: true,
       });
+      // Like the DOM and platform ops, fetch and cookie callbacks answer with
+      // an inert envelope: a host-realm error object must never reach page
+      // code, whose constructor chain would lead to the host Function.
       Object.defineProperty(context, HOST_FETCH_OP_BINDING, {
-        value: (...args) => {
+        value: (...args) => hostValueResponse(() => {
           if (typeof opFetch !== "function") {
             throw new Error("Portable network fetch is not configured for this page realm");
           }
-          return opFetch(...args);
-        },
+          const id = opFetch(...args);
+          if (!Number.isSafeInteger(id) || id < 1) throw new TypeError("Domjet fetch bridge returned an invalid request id");
+          return id;
+        }, "Failed to fetch"),
         configurable: true,
       });
       Object.defineProperty(context, HOST_COOKIE_OP_BINDING, {
-        value: (...args) => (typeof opCookie === "function" ? opCookie(...args) : ""),
+        value: (...args) => hostValueResponse(() => {
+          if (typeof opCookie !== "function") return "";
+          const value = opCookie(...args);
+          return typeof value === "string" ? value : "";
+        }, "Domjet cookie operation failed"),
         configurable: true,
       });
       Object.defineProperty(context, HOST_TASK_OP_BINDING, {

@@ -767,6 +767,14 @@ export class WasmV8Worker {
     return this.request("bridgeStatus");
   }
 
+  /** Scripts run in every later document of this Worker before its own scripts. */
+  setInitScripts(scripts, options = {}) {
+    if (!Array.isArray(scripts) || scripts.some((script) => typeof script !== "string")) {
+      return Promise.reject(new TypeError("init scripts must be an array of strings"));
+    }
+    return this.request("setInitScripts", { scripts }, options.requestTimeoutMs);
+  }
+
   portableCdpAbiVersion(options = {}) {
     return this.request("portableCdp", { operation: "abi" }, options.requestTimeoutMs);
   }
