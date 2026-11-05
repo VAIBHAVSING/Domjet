@@ -116,6 +116,48 @@ test("profile containers retain version-one encrypted profile compatibility", ()
   assert.deepEqual([...openProfile(legacy, { encryptionKey: key })], [...plain]);
 });
 
+test("an encrypted profile does not carry a fingerprint of its plaintext", () => {
+  const snapshot = new TextEncoder().encode("session=secret-cookie-value");
+  const key = new Uint8Array(32).fill(3);
+  const digest = createHash("sha256").update(snapshot).digest();
+  const first = Buffer.from(sealProfile(snapshot, { encryptionKey: key }));
+  const second = Buffer.from(sealProfile(snapshot, { encryptionKey: key }));
+  assert.equal(first.readUInt32LE("OBSCURA_PROFILE\0".length), 3);
+  // Unencrypted profiles keep the version-two layout older readers accept.
+  assert.equal(Buffer.from(sealProfile(snapshot)).readUInt32LE("OBSCURA_PROFILE\0".length), 2);
+  assert.equal(first.indexOf(digest), -1);
+  // Sealing the same profile twice gives unrelated bytes after the header.
+  const headerBytes = "OBSCURA_PROFILE\0".length + 8;
+  assert.notDeepEqual(first.subarray(headerBytes), second.subarray(headerBytes));
+  assert.deepEqual([...openProfile(first, { encryptionKey: key })], [...snapshot]);
+
+  // A damaged ciphertext or checksum is reported as corruption.
+  for (const index of [first.length - 1, headerBytes + 12 + 16]) {
+    const damaged = Buffer.from(first);
+    damaged[index] ^= 0x01;
+    assert.throws(() => openProfile(damaged, { encryptionKey: key }), ProfileCorruptError);
+  }
+});
+
+test("profile containers retain version-two encrypted profile compatibility", () => {
+  const magic = Buffer.from("OBSCURA_PROFILE\0", "ascii");
+  const plain = Buffer.from([1, 1, 2, 3, 5, 8]);
+  const key = Buffer.alloc(32, 6);
+  const nonce = Buffer.alloc(12, 9);
+  const header = Buffer.alloc(magic.length + 8);
+  magic.copy(header);
+  header.writeUInt32LE(2, magic.length);
+  header.writeUInt8(1, magic.length + 4);
+  header.writeUInt8(12, magic.length + 5);
+  header.writeUInt8(16, magic.length + 6);
+  const checksum = createHash("sha256").update(plain).digest();
+  const cipher = createCipheriv("aes-256-gcm", key, nonce);
+  cipher.setAAD(Buffer.concat([header, checksum]));
+  const body = Buffer.concat([cipher.update(plain), cipher.final()]);
+  const stored = Buffer.concat([header, nonce, cipher.getAuthTag(), checksum, body]);
+  assert.deepEqual([...openProfile(stored, { encryptionKey: key })], [...plain]);
+});
+
 function hmac(key: string | Buffer, value: string): Buffer {
   return createHmac("sha256", key).update(value).digest();
 }
@@ -238,4 +280,58 @@ test("S3-compatible storage signs, retries and applies optimistic conditions", a
   assert.ok(credentialCalls >= 5);
   assert.ok(seenPaths.every((path) => path.startsWith("/gateway/profile-bucket/team%20%21/")));
   assert.ok(seenPaths.every((path) => path.endsWith("?tenant=a%20b")));
+});
+
+test("a profile opened with an encryption key must be encrypted", () => {
+  const key = new Uint8Array(32).fill(7);
+  const planted = sealProfile(new TextEncoder().encode('{"cookies":[{"name":"sid","value":"attacker"}]}'));
+  assert.throws(() => openProfile(planted, { encryptionKey: key }), ProfileCorruptError);
+  assert.equal(new TextDecoder().decode(openProfile(planted)).includes("attacker"), true);
+  const sealed = sealProfile(new Uint8Array([1, 2, 3]), { encryptionKey: key });
+  assert.deepEqual([...openProfile(sealed, { encryptionKey: key })], [1, 2, 3]);
+  assert.throws(() => openProfile(sealed, { encryptionKey: new Uint8Array(31) }), TypeError);
+});
+
+test("S3 storage validates the region and refuses insecure or redirected endpoints", async (context) => {
+  const credentials = { accessKeyId: "a", secretAccessKey: "s" };
+  assert.throws(() => s3({ bucket: "b", region: "evil.example/x", credentials }), TypeError);
+  assert.throws(() => s3({ bucket: "b", region: "us-east-1@evil", credentials }), TypeError);
+  assert.doesNotThrow(() => s3({ bucket: "b", region: "eu-central-003", credentials }));
+  assert.throws(() => s3({ bucket: "b", endpoint: "http://minio.internal:9000", credentials }), /HTTPS/);
+  assert.doesNotThrow(() => s3({ bucket: "b", endpoint: "http://minio.internal:9000", allowInsecureHttp: true, credentials }));
+  assert.doesNotThrow(() => s3({ bucket: "b", endpoint: "http://localhost:9000", credentials }));
+  assert.throws(() => s3({ bucket: "b", requestTimeoutMs: 0, credentials }), RangeError);
+
+  const redirectedTo: string[] = [];
+  const target = createServer((request, response) => {
+    redirectedTo.push(request.url!);
+    response.writeHead(200, { etag: "\"t\"" });
+    response.end("stolen");
+  });
+  await new Promise<void>((resolveListen) => target.listen(0, "127.0.0.1", resolveListen));
+  context.after(() => new Promise<void>((resolveClose) => target.close(() => resolveClose())));
+  const targetAddress = target.address();
+  assert.ok(targetAddress && typeof targetAddress === "object");
+  const origin = createServer((_request, response) => {
+    response.writeHead(307, { location: `http://127.0.0.1:${targetAddress.port}/collect` });
+    response.end();
+  });
+  await new Promise<void>((resolveListen) => origin.listen(0, "127.0.0.1", resolveListen));
+  context.after(() => new Promise<void>((resolveClose) => origin.close(() => resolveClose())));
+  const originAddress = origin.address();
+  assert.ok(originAddress && typeof originAddress === "object");
+  const redirecting = s3({ bucket: "b", endpoint: `http://127.0.0.1:${originAddress.port}`, maxRetries: 0, credentials });
+  await assert.rejects(redirecting.save("k", new Uint8Array([1]), { expectedVersion: null }), /HTTP 307/);
+  await assert.rejects(redirecting.load("k"), /HTTP 307/);
+  assert.deepEqual(redirectedTo, []);
+
+  const hung = createServer(() => {});
+  await new Promise<void>((resolveListen) => hung.listen(0, "127.0.0.1", resolveListen));
+  context.after(() => new Promise<void>((resolveClose) => { hung.closeAllConnections(); hung.close(() => resolveClose()); }));
+  const hungAddress = hung.address();
+  assert.ok(hungAddress && typeof hungAddress === "object");
+  const slow = s3({ bucket: "b", endpoint: `http://127.0.0.1:${hungAddress.port}`, maxRetries: 0, requestTimeoutMs: 200, credentials });
+  const started = Date.now();
+  await assert.rejects(slow.load("k"), /S3 profile request failed/);
+  assert.ok(Date.now() - started < 5_000);
 });

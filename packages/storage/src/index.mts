@@ -13,7 +13,12 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 const PROFILE_MAGIC = Buffer.from("OBSCURA_PROFILE\0", "ascii");
-const PROFILE_FORMAT_VERSION = 2;
+// Version 3: an encrypted profile's checksum covers the ciphertext. Versions 1
+// and 2 stored SHA-256 of the plaintext next to the ciphertext, a stable
+// fingerprint of the profile contents readable without the key. Both remain
+// readable; new profiles are always written as version 3.
+const PROFILE_FORMAT_VERSION = 3;
+const PLAINTEXT_CHECKSUM_PROFILE_FORMAT_VERSION = 2;
 const LEGACY_PROFILE_FORMAT_VERSION = 1;
 const PROFILE_FIXED_HEADER_BYTES = PROFILE_MAGIC.length + 8;
 const PROFILE_CHECKSUM_BYTES = 32;
@@ -350,7 +355,9 @@ function encryptionKey(value: Uint8Array | undefined): Buffer | null {
 function profileHeader(encrypted: boolean): Buffer {
   const header = Buffer.alloc(PROFILE_FIXED_HEADER_BYTES);
   PROFILE_MAGIC.copy(header, 0);
-  header.writeUInt32LE(PROFILE_FORMAT_VERSION, PROFILE_MAGIC.length);
+  // Plaintext profiles did not change in version 3; they keep version 2 so
+  // earlier releases still read them.
+  header.writeUInt32LE(encrypted ? PROFILE_FORMAT_VERSION : PLAINTEXT_CHECKSUM_PROFILE_FORMAT_VERSION, PROFILE_MAGIC.length);
   header.writeUInt8(encrypted ? 1 : 0, PROFILE_MAGIC.length + 4);
   header.writeUInt8(encrypted ? PROFILE_NONCE_BYTES : 0, PROFILE_MAGIC.length + 5);
   header.writeUInt8(encrypted ? PROFILE_TAG_BYTES : 0, PROFILE_MAGIC.length + 6);
@@ -363,15 +370,22 @@ export function sealProfile(snapshot: Uint8Array, options: ProfileCodecOptions =
   const plain = Buffer.from(copySnapshotBytes(snapshot));
   const key = encryptionKey(options.encryptionKey);
   const header = profileHeader(key !== null);
-  const checksum = createHash("sha256").update(plain).digest();
-  if (!key) return new Uint8Array(Buffer.concat([header, checksum, plain]));
+  if (!key) {
+    const checksum = createHash("sha256").update(plain).digest();
+    return new Uint8Array(Buffer.concat([header, checksum, plain]));
+  }
 
+  // The checksum is taken over the random nonce and the ciphertext, so it
+  // says nothing about the plaintext; it detects a damaged file before
+  // decryption is attempted. GCM authenticates the header (AAD) and the
+  // ciphertext, which the checksum is computed from.
   const nonce = randomBytes(PROFILE_NONCE_BYTES);
   const cipher = createCipheriv("aes-256-gcm", key, nonce);
-  cipher.setAAD(Buffer.concat([header, checksum]));
-  const body = Buffer.concat([cipher.update(plain), cipher.final()]);
+  cipher.setAAD(header);
+  const ciphertext = Buffer.concat([cipher.update(plain), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return new Uint8Array(Buffer.concat([header, nonce, tag, checksum, body]));
+  const checksum = createHash("sha256").update(nonce).update(ciphertext).digest();
+  return new Uint8Array(Buffer.concat([header, nonce, tag, checksum, ciphertext]));
 }
 
 export function openProfile(value: Uint8Array, options: ProfileCodecOptions = {}): Uint8Array {
@@ -383,7 +397,8 @@ export function openProfile(value: Uint8Array, options: ProfileCodecOptions = {}
   }
 
   const version = bytes.readUInt32LE(PROFILE_MAGIC.length);
-  if (version !== PROFILE_FORMAT_VERSION && version !== LEGACY_PROFILE_FORMAT_VERSION) {
+  if (version !== PROFILE_FORMAT_VERSION && version !== PLAINTEXT_CHECKSUM_PROFILE_FORMAT_VERSION
+    && version !== LEGACY_PROFILE_FORMAT_VERSION) {
     throw new ProfileCorruptError(`unsupported stored profile version ${version}`);
   }
   const flags = bytes.readUInt8(PROFILE_MAGIC.length + 4);
@@ -392,6 +407,13 @@ export function openProfile(value: Uint8Array, options: ProfileCodecOptions = {}
   const reserved = bytes.readUInt8(PROFILE_MAGIC.length + 7);
   if (flags > 1 || reserved !== 0) throw new ProfileCorruptError("stored browser profile has invalid header flags");
   const encrypted = flags === 1;
+  const key = encryptionKey(options.encryptionKey);
+  // A key means the caller expects an encrypted profile. Accepting a plaintext
+  // one would let anyone who can write to the store substitute the profile
+  // (cookies included) without knowing the key.
+  if (key && !encrypted) {
+    throw new ProfileCorruptError("stored browser profile is not encrypted but an encryption key was supplied");
+  }
   if ((encrypted && (nonceLength !== PROFILE_NONCE_BYTES || tagLength !== PROFILE_TAG_BYTES))
     || (!encrypted && (nonceLength !== 0 || tagLength !== 0))) {
     throw new ProfileCorruptError("stored browser profile has invalid encryption metadata");
@@ -409,11 +431,16 @@ export function openProfile(value: Uint8Array, options: ProfileCodecOptions = {}
 
   let plain: Buffer;
   if (encrypted) {
-    const key = encryptionKey(options.encryptionKey);
     if (!key) throw new ProfileCorruptError("stored browser profile is encrypted but no encryption key was supplied");
+    if (version === PROFILE_FORMAT_VERSION) {
+      const actual = createHash("sha256").update(nonce).update(body).digest();
+      if (!timingSafeEqual(actual, checksum)) throw new ProfileCorruptError("stored browser profile checksum does not match");
+    }
     try {
       const decipher = createDecipheriv("aes-256-gcm", key, nonce);
       if (version === PROFILE_FORMAT_VERSION) {
+        decipher.setAAD(bytes.subarray(0, PROFILE_FIXED_HEADER_BYTES));
+      } else if (version === PLAINTEXT_CHECKSUM_PROFILE_FORMAT_VERSION) {
         decipher.setAAD(Buffer.concat([bytes.subarray(0, PROFILE_FIXED_HEADER_BYTES), checksum]));
       }
       decipher.setAuthTag(tag);
@@ -424,9 +451,13 @@ export function openProfile(value: Uint8Array, options: ProfileCodecOptions = {}
   } else {
     plain = body;
   }
-  const actualChecksum = createHash("sha256").update(plain).digest();
-  if (!timingSafeEqual(actualChecksum, checksum)) {
-    throw new ProfileCorruptError("stored browser profile checksum does not match");
+  // Plaintext profiles, and encrypted ones written before version 3, carry
+  // the checksum of the plaintext.
+  if (!encrypted || version !== PROFILE_FORMAT_VERSION) {
+    const actualChecksum = createHash("sha256").update(plain).digest();
+    if (!timingSafeEqual(actualChecksum, checksum)) {
+      throw new ProfileCorruptError("stored browser profile checksum does not match");
+    }
   }
   return new Uint8Array(plain);
 }
@@ -447,6 +478,18 @@ export interface S3StoreOptions {
   forcePathStyle?: boolean;
   credentials?: S3Credentials | S3CredentialProvider;
   maxRetries?: number;
+  /** Per-request timeout, including retries' individual attempts. Default 30 s. */
+  requestTimeoutMs?: number;
+  /**
+   * Allow a plain-HTTP endpoint that is not on loopback. Signed requests,
+   * session tokens and profile bytes then travel unencrypted.
+   */
+  allowInsecureHttp?: boolean;
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === "localhost" || host.endsWith(".localhost") || /^127\.\d+\.\d+\.\d+$/u.test(host) || host === "[::1]";
 }
 
 type BinaryLike = string | Buffer;
@@ -562,8 +605,17 @@ export function s3(options: S3StoreOptions): ProfileStore {
   const bucket = validateHeaderValue(options.bucket, "S3 bucket");
   if (bucket.includes("/")) throw new TypeError("S3 bucket must not contain a slash");
   const region = validateHeaderValue(options.region || "us-east-1", "S3 region");
+  // The region becomes part of the default endpoint host name.
+  if (!/^[A-Za-z0-9_-]{1,64}$/u.test(region)) throw new TypeError("S3 region must contain only letters, digits, '-' and '_'");
   const endpoint = new URL(options.endpoint || `https://s3.${region}.amazonaws.com`);
   if (endpoint.protocol !== "https:" && endpoint.protocol !== "http:") throw new TypeError("S3 endpoint must use HTTP or HTTPS");
+  if (endpoint.protocol === "http:" && options.allowInsecureHttp !== true && !isLoopbackHostname(endpoint.hostname)) {
+    throw new TypeError("S3 endpoint must use HTTPS; set allowInsecureHttp to use a trusted plain-HTTP endpoint");
+  }
+  const requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+  if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 600_000) {
+    throw new RangeError("S3 requestTimeoutMs must be an integer from 1 to 600000");
+  }
   if (endpoint.username || endpoint.password || endpoint.hash) throw new TypeError("S3 endpoint must not contain credentials or a fragment");
   const prefix = (options.prefix ?? "obscura/profiles").replace(/^\/+|\/+$/gu, "");
   if (Buffer.byteLength(prefix) > 1024) throw new RangeError("S3 prefix exceeds the 1024-byte limit");
@@ -636,11 +688,15 @@ export function s3(options: S3StoreOptions): ProfileStore {
       let response: Response | undefined;
       let requestError: unknown;
       try {
+        const timeout = AbortSignal.timeout(requestTimeoutMs);
         response = await fetch(url, {
           method,
           headers,
           body: body === undefined ? undefined : payload,
-          signal,
+          // Signed headers and the profile body must not follow a redirect to
+          // another host; a redirect surfaces as an HTTP error instead.
+          redirect: "manual",
+          signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
         });
       } catch (error) {
         if (signal?.aborted) throw abortReason(signal);
