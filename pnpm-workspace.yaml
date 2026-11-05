@@ -2,3 +2,7 @@ packages:
   - "packages/*"
 allowBuilds:
   esbuild: false
+overrides:
+  # The optional puppeteer-core peer is auto-installed for the adapter tests.
+  # 25.12 pulled zod 3 (GHSA-mrhx-c7xc-m3w5) through chromium-bidi.
+  puppeteer-core: 25.16.0
