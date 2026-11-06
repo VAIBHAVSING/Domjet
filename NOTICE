@@ -1,0 +1,8 @@
+Domjet
+
+Domjet is a fork of Obscura (https://github.com/h4ckf0r0day/obscura),
+licensed under the Apache License, Version 2.0.
+
+This fork adapts the browser engine to run as WebAssembly inside Node.js,
+adds the npm browser API and integrations, and uses the Domjet name.
+Upstream copyright and license notices are retained in the source.

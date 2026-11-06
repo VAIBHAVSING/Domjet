@@ -1,0 +1,26 @@
+{
+  "name": "@domjet/browser-storage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Versioned browser profile storage (local directory and S3) for Domjet",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs",
+      "default": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx --test ./test/*.test.mts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "Apache-2.0"
+}
