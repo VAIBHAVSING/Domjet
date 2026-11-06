@@ -1,0 +1,68 @@
+---
+title: Get started
+description: Install Domjet and run your first browser automation workflow in Node.js.
+sidebar:
+  order: 1
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+Domjet runs as a Node.js package. You do not need to install Chromium or launch a separate browser
+process.
+
+## Requirements
+
+- Node.js 22 or newer
+- An ESM project, or a CommonJS project using dynamic `import()`
+
+## Your first page
+
+<Steps>
+1. Install Domjet.
+
+   ```bash
+   npm install domjet
+   ```
+
+2. Create a browser and navigate to a page.
+
+   ```js title="example.mjs"
+   import { createBrowser } from 'domjet';
+
+   const browser = await createBrowser();
+   const page = await browser.newPage();
+
+   await page.goto('https://example.com');
+   const title = await page.evaluate(() => document.title);
+   console.log(title);
+
+   await browser.close();
+   ```
+
+3. Run the script.
+
+   ```bash
+   node example.mjs
+   ```
+</Steps>
+
+## Capture a screenshot
+
+The page API can return the image bytes and optionally write them to a path:
+
+```js
+const image = await page.screenshot({
+  path: 'page.png',
+  fullPage: true,
+});
+
+console.log(`Wrote ${image.byteLength} bytes`);
+```
+
+See [Compatibility](/docs/compatibility/) before choosing a Playwright or
+Puppeteer integration. The adapters currently have known limitations.
+
+## Where to go next
+
+Read [Architecture](/docs/architecture/) to understand which browser responsibilities live in Node
+and which live in the WebAssembly core.

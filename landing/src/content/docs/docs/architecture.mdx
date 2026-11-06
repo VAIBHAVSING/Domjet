@@ -1,0 +1,59 @@
+---
+title: Architecture
+description: Understand how Domjet divides browser work between Node.js and its Rust WebAssembly core.
+sidebar:
+  order: 2
+---
+
+Domjet is not a remote wrapper around a hidden browser binary. The engine is compiled from Rust to
+WebAssembly and loaded directly by Node.js.
+
+```text
+Your application
+  ├─ Direct Domjet API
+  ├─ Playwright adapter
+  └─ Puppeteer adapter
+           │
+           ▼
+Node host: V8 · fetch · workers · filesystem
+           │
+           ▼
+Domjet WASM core: DOM · CSS · layout · paint · CDP
+```
+
+## Node host
+
+Node provides the host capabilities that already work well in its runtime:
+
+- Real JavaScript execution through V8
+- Network access and streaming fetch
+- Worker threads and process lifecycle
+- Filesystem access for persistent profiles and output
+
+## WebAssembly core
+
+The Rust core owns browser state and rendering responsibilities:
+
+- DOM and HTML tree state
+- CSS cascade and computed styles
+- Layout, paint, screenshots, and PDF
+- Browser contexts, cookies, and protocol state
+- Chrome DevTools Protocol command handling
+
+## Control surfaces
+
+Use the direct API for the smallest integration. Use CDP adapters when an existing Playwright or
+Puppeteer workflow is more valuable than avoiding the protocol layer.
+
+
+## Open-source foundation
+
+Domjet is a fork of [Obscura](https://github.com/h4ckf0r0day/obscura), adapted to
+run inside Node.js as an npm package. The Rust crates and WASM ABI keep their
+original names for compatibility. See the [source repository](https://github.com/VAIBHAVSING/domjet)
+for the Apache-2.0 license and attribution.
+
+The Node package uses Node networking; the native Rust engine's optional
+wreq/BoringSSL stealth transport is a separate feature. Test your application's
+sites and automation methods before deployment: CDP and Web API coverage is
+not identical to Chromium.

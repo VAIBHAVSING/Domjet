@@ -1,0 +1,16 @@
+{
+  "name": "Domjet",
+  "short_name": "Domjet",
+  "description": "The lightweight headless browser for AI agents.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f2ed",
+  "theme_color": "#f4f2ed",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
